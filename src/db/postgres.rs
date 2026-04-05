@@ -126,6 +126,7 @@ impl BlobDatabase for PostgresDatabase {
                 mime_type: row.2,
                 pubkey: row.3,
                 created_at: row.4 as u64,
+                phash: None,
             })
         })
     }
@@ -149,6 +150,7 @@ impl BlobDatabase for PostgresDatabase {
                     mime_type: r.2,
                     pubkey: r.3,
                     created_at: r.4 as u64,
+                    phash: None,
                 })
                 .collect())
         })

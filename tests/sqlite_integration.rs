@@ -22,6 +22,7 @@ async fn test_sqlite_record_and_get_upload() {
         mime_type: "text/plain".into(),
         pubkey: "b".repeat(64),
         created_at: 1700000000,
+        phash: None,
     };
 
     db.record_upload(&record).unwrap();
@@ -42,6 +43,7 @@ async fn test_sqlite_list_by_pubkey() {
         mime_type: "text/plain".into(),
         pubkey: pubkey.clone(),
         created_at: 1000,
+        phash: None,
     };
     let r2 = UploadRecord {
         sha256: "2".repeat(64),
@@ -49,6 +51,7 @@ async fn test_sqlite_list_by_pubkey() {
         mime_type: "image/png".into(),
         pubkey: pubkey.clone(),
         created_at: 2000,
+        phash: None,
     };
     let r3 = UploadRecord {
         sha256: "3".repeat(64),
@@ -56,6 +59,7 @@ async fn test_sqlite_list_by_pubkey() {
         mime_type: "video/mp4".into(),
         pubkey: "d".repeat(64),
         created_at: 3000,
+        phash: None,
     };
 
     db.record_upload(&r1).unwrap();
@@ -78,6 +82,7 @@ async fn test_sqlite_delete_upload() {
         mime_type: "text/plain".into(),
         pubkey: "f".repeat(64),
         created_at: 1700000000,
+        phash: None,
     };
 
     db.record_upload(&record).unwrap();
@@ -149,6 +154,7 @@ async fn test_sqlite_upload_updates_used_bytes() {
         mime_type: "text/plain".into(),
         pubkey: pubkey.clone(),
         created_at: 1700000000,
+        phash: None,
     };
 
     db.record_upload(&record).unwrap();
@@ -170,6 +176,7 @@ async fn test_sqlite_dedup_upload() {
         mime_type: "text/plain".into(),
         pubkey: "a".repeat(64),
         created_at: 1700000000,
+        phash: None,
     };
 
     db.record_upload(&record).unwrap();
@@ -191,6 +198,7 @@ async fn test_sqlite_counts() {
         mime_type: "text/plain".into(),
         pubkey: "b".repeat(64),
         created_at: 1700000000,
+        phash: None,
     };
     db.record_upload(&record).unwrap();
 

@@ -18,9 +18,9 @@ use serde::{Deserialize, Serialize};
 
 use tracing::instrument;
 
+use super::verify_auth_event;
 use super::{error_json, extract_auth_event, SharedState};
 use crate::access::Action;
-use crate::auth::verify_blossom_auth;
 use crate::db::{DbError, UploadRecord};
 
 /// NIP-96 server info response (`.well-known/nostr/nip96.json`).
@@ -123,7 +123,7 @@ async fn handle_nip96_upload(
     // We support Blossom auth for simplicity.
     let pubkey = match extract_auth_event(&headers) {
         Ok(event) => {
-            if let Err(e) = verify_blossom_auth(&event, Some("upload")) {
+            if let Err(e) = verify_auth_event(&event, Some("upload")) {
                 return (StatusCode::UNAUTHORIZED, error_json(&e.to_string()));
             }
             event.pubkey
@@ -179,6 +179,7 @@ async fn handle_nip96_upload(
             .unwrap_or_else(|| "application/octet-stream".to_string()),
         pubkey,
         created_at: descriptor.uploaded.unwrap_or(0),
+        phash: None,
     };
     let _ = s.database.record_upload(&record);
 
@@ -222,7 +223,7 @@ async fn handle_nip96_list(
     // List requires auth to identify the user.
     let pubkey = match extract_auth_event(&headers) {
         Ok(event) => {
-            if let Err(e) = verify_blossom_auth(&event, Some("get")) {
+            if let Err(e) = verify_auth_event(&event, Some("get")) {
                 return (StatusCode::UNAUTHORIZED, error_json(&e.to_string()));
             }
             event.pubkey
@@ -285,7 +286,7 @@ async fn handle_nip96_delete(
 ) -> impl IntoResponse {
     let pubkey = match extract_auth_event(&headers) {
         Ok(event) => {
-            if let Err(e) = verify_blossom_auth(&event, Some("delete")) {
+            if let Err(e) = verify_auth_event(&event, Some("delete")) {
                 return (StatusCode::UNAUTHORIZED, error_json(&e.to_string()));
             }
             event.pubkey

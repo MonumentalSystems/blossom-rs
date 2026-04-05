@@ -3,8 +3,10 @@
 //! Implements kind:24242 Nostr event construction and verification for
 //! Blossom blob authorization.
 
+pub mod nip98;
 mod signer;
 
+pub use nip98::{build_nip98_auth, verify_nip98_auth};
 pub use signer::{BlossomSigner, Signer};
 
 use crate::protocol::{base64url_encode, compute_event_id, NostrEvent};

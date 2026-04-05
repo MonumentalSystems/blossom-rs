@@ -12,6 +12,7 @@
 //!
 //! NIP-96 endpoints are available via the [`nip96`] submodule.
 
+pub mod admin;
 pub mod nip96;
 
 use std::sync::Arc;
@@ -28,11 +29,13 @@ use tokio::sync::Mutex;
 use tracing::{info, instrument, warn};
 
 use crate::access::{AccessControl, Action, OpenAccess};
-use crate::auth::{verify_blossom_auth, AuthError};
+use crate::auth::{verify_blossom_auth, verify_nip98_auth, AuthError};
 use crate::db::{BlobDatabase, DbError, MemoryDatabase, UploadRecord};
 use crate::protocol::{base64url_decode, BlobDescriptor, NostrEvent};
+use crate::ratelimit::RateLimiter;
 use crate::stats::StatsAccumulator;
 use crate::storage::BlobBackend;
+use crate::webhooks::{self, EventType, NoopNotifier, WebhookNotifier};
 
 /// Shared server state wrapping a blob backend.
 pub type SharedState = Arc<Mutex<ServerState>>;
@@ -56,6 +59,8 @@ pub struct ServerState {
     database: Box<dyn BlobDatabase>,
     access: Box<dyn AccessControl>,
     stats: StatsAccumulator,
+    rate_limiter: Option<RateLimiter>,
+    notifier: Box<dyn WebhookNotifier>,
     base_url: String,
     requirements: UploadRequirements,
 }
@@ -85,6 +90,8 @@ pub struct BlobServerBuilder {
     access: Option<Box<dyn AccessControl>>,
     requirements: UploadRequirements,
     body_limit: usize,
+    rate_limiter: Option<RateLimiter>,
+    notifier: Option<Box<dyn WebhookNotifier>>,
 }
 
 impl BlobServerBuilder {
@@ -124,6 +131,18 @@ impl BlobServerBuilder {
         self
     }
 
+    /// Set a rate limiter for request throttling.
+    pub fn rate_limiter(mut self, limiter: RateLimiter) -> Self {
+        self.rate_limiter = Some(limiter);
+        self
+    }
+
+    /// Set a webhook notifier for blob lifecycle events.
+    pub fn webhook_notifier(mut self, notifier: impl WebhookNotifier + 'static) -> Self {
+        self.notifier = Some(Box::new(notifier));
+        self
+    }
+
     /// Build the BlobServer.
     pub fn build(self) -> BlobServer {
         let state = Arc::new(Mutex::new(ServerState {
@@ -133,6 +152,8 @@ impl BlobServerBuilder {
                 .unwrap_or_else(|| Box::new(MemoryDatabase::new())),
             access: self.access.unwrap_or_else(|| Box::new(OpenAccess)),
             stats: StatsAccumulator::new(),
+            rate_limiter: self.rate_limiter,
+            notifier: self.notifier.unwrap_or_else(|| Box::new(NoopNotifier)),
             base_url: self.base_url,
             requirements: self.requirements,
         }));
@@ -190,6 +211,8 @@ impl BlobServer {
             access: None,
             requirements: UploadRequirements::default(),
             body_limit: 256 * 1024 * 1024, // 256 MB default
+            rate_limiter: None,
+            notifier: None,
         }
     }
 
@@ -251,7 +274,9 @@ impl BlobServer {
     }
 }
 
-/// Extract and verify a Blossom auth event from the Authorization header.
+/// Extract a Nostr auth event from the `Authorization: Nostr <base64url>` header.
+///
+/// Supports both kind:24242 (Blossom/BUD-01) and kind:27235 (NIP-98) events.
 fn extract_auth_event(headers: &HeaderMap) -> Result<NostrEvent, AuthError> {
     let header = headers
         .get("authorization")
@@ -268,6 +293,15 @@ fn extract_auth_event(headers: &HeaderMap) -> Result<NostrEvent, AuthError> {
         serde_json::from_slice(&json_bytes).map_err(|_| AuthError::InvalidSignature)?;
 
     Ok(event)
+}
+
+/// Verify an auth event, accepting either kind:24242 (Blossom) or kind:27235 (NIP-98).
+fn verify_auth_event(event: &NostrEvent, expected_action: Option<&str>) -> Result<(), AuthError> {
+    match event.kind {
+        24242 => verify_blossom_auth(event, expected_action),
+        27235 => verify_nip98_auth(event, None, None),
+        other => Err(AuthError::WrongKind(other)),
+    }
 }
 
 fn error_json(msg: &str) -> Json<serde_json::Value> {
@@ -293,6 +327,20 @@ async fn handle_upload(
 
     let mut s = state.lock().await;
 
+    // Rate limit check (keyed by source IP placeholder — use pubkey if available).
+    if let Some(ref limiter) = s.rate_limiter {
+        let key = extract_auth_event(&headers)
+            .ok()
+            .map(|e| e.pubkey)
+            .unwrap_or_else(|| "anonymous".to_string());
+        if !limiter.check(&key) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                error_json("rate limit exceeded"),
+            );
+        }
+    }
+
     // BUD-06: Check upload requirements.
     if let Some(max) = s.requirements.max_size {
         if data.len() as u64 > max {
@@ -307,7 +355,7 @@ async fn handle_upload(
     let pubkey = if s.requirements.require_auth {
         match extract_auth_event(&headers) {
             Ok(event) => {
-                if let Err(e) = verify_blossom_auth(&event, Some("upload")) {
+                if let Err(e) = verify_auth_event(&event, Some("upload")) {
                     return (StatusCode::UNAUTHORIZED, error_json(&e.to_string()));
                 }
                 // Access control check.
@@ -361,8 +409,18 @@ async fn handle_upload(
             .unwrap_or_else(|| "application/octet-stream".to_string()),
         pubkey: upload_pubkey,
         created_at: descriptor.uploaded.unwrap_or(0),
+        phash: None,
     };
     let _ = s.database.record_upload(&record);
+
+    // Fire webhook.
+    s.notifier.notify(webhooks::make_payload(
+        EventType::Upload,
+        &descriptor.sha256,
+        descriptor.size,
+        &record.pubkey,
+        None,
+    ));
 
     info!(blob.sha256 = %descriptor.sha256, blob.size = descriptor.size, "blob uploaded");
 
@@ -420,7 +478,7 @@ async fn handle_delete_blob(
     // DELETE always requires auth.
     match extract_auth_event(&headers) {
         Ok(event) => {
-            if let Err(e) = verify_blossom_auth(&event, Some("delete")) {
+            if let Err(e) = verify_auth_event(&event, Some("delete")) {
                 return (StatusCode::UNAUTHORIZED, error_json(&e.to_string()));
             }
             let mut s = state.lock().await;
@@ -432,6 +490,13 @@ async fn handle_delete_blob(
             }
             if s.backend.delete(&sha256) {
                 let _ = s.database.delete_upload(&sha256);
+                s.notifier.notify(webhooks::make_payload(
+                    EventType::Delete,
+                    &sha256,
+                    0,
+                    &event.pubkey,
+                    None,
+                ));
                 (StatusCode::OK, Json(serde_json::json!({"deleted": true})))
             } else {
                 (StatusCode::NOT_FOUND, error_json("not found"))
@@ -499,7 +564,7 @@ async fn handle_mirror(
     // Mirror requires auth.
     let pubkey = match extract_auth_event(&headers) {
         Ok(event) => {
-            if let Err(e) = verify_blossom_auth(&event, Some("upload")) {
+            if let Err(e) = verify_auth_event(&event, Some("upload")) {
                 return (StatusCode::UNAUTHORIZED, error_json(&e.to_string()));
             }
             event.pubkey
@@ -597,8 +662,18 @@ async fn handle_mirror(
             .unwrap_or_else(|| "application/octet-stream".to_string()),
         pubkey,
         created_at: descriptor.uploaded.unwrap_or(0),
+        phash: None,
     };
     let _ = s.database.record_upload(&record);
+
+    // Fire webhook with source URL as metadata.
+    s.notifier.notify(webhooks::make_payload(
+        EventType::Mirror,
+        &descriptor.sha256,
+        descriptor.size,
+        &record.pubkey,
+        Some(serde_json::json!({"source_url": req.url})),
+    ));
 
     (
         StatusCode::OK,

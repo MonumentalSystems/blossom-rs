@@ -169,6 +169,7 @@ mod tests {
             mime_type: "application/octet-stream".into(),
             pubkey: pubkey.to_string(),
             created_at: 1700000000,
+            phash: None,
         }
     }
 

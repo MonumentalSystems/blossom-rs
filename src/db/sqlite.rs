@@ -30,7 +30,56 @@ impl SqliteDatabase {
         Ok(db)
     }
 
+    /// Current schema version. Bump this when adding new migrations.
+    const SCHEMA_VERSION: i64 = 2;
+
     async fn run_migrations(&self) -> Result<(), DbError> {
+        // Create version tracking table.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS schema_version (
+                version INTEGER NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DbError::Internal(format!("migration: {e}")))?;
+
+        let current: i64 =
+            sqlx::query_scalar("SELECT COALESCE(MAX(version), 0) FROM schema_version")
+                .fetch_one(&self.pool)
+                .await
+                .unwrap_or(0);
+
+        if current < 1 {
+            self.migrate_v1().await?;
+        }
+        if current < 2 {
+            self.migrate_v2().await?;
+        }
+
+        if current < Self::SCHEMA_VERSION {
+            sqlx::query("DELETE FROM schema_version")
+                .execute(&self.pool)
+                .await
+                .map_err(|e| DbError::Internal(format!("migration: {e}")))?;
+            sqlx::query("INSERT INTO schema_version (version) VALUES (?)")
+                .bind(Self::SCHEMA_VERSION)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| DbError::Internal(format!("migration: {e}")))?;
+
+            tracing::info!(
+                db.schema_version = Self::SCHEMA_VERSION,
+                db.previous_version = current,
+                "database migrated"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// V1: Initial schema — uploads, users, file_stats.
+    async fn migrate_v1(&self) -> Result<(), DbError> {
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS uploads (
                 sha256 TEXT PRIMARY KEY,
@@ -42,7 +91,7 @@ impl SqliteDatabase {
         )
         .execute(&self.pool)
         .await
-        .map_err(|e| DbError::Internal(format!("migration: {e}")))?;
+        .map_err(|e| DbError::Internal(format!("v1 migration: {e}")))?;
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS users (
@@ -53,7 +102,7 @@ impl SqliteDatabase {
         )
         .execute(&self.pool)
         .await
-        .map_err(|e| DbError::Internal(format!("migration: {e}")))?;
+        .map_err(|e| DbError::Internal(format!("v1 migration: {e}")))?;
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS file_stats (
@@ -64,12 +113,37 @@ impl SqliteDatabase {
         )
         .execute(&self.pool)
         .await
-        .map_err(|e| DbError::Internal(format!("migration: {e}")))?;
+        .map_err(|e| DbError::Internal(format!("v1 migration: {e}")))?;
 
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_uploads_pubkey ON uploads(pubkey)")
             .execute(&self.pool)
             .await
-            .map_err(|e| DbError::Internal(format!("migration: {e}")))?;
+            .map_err(|e| DbError::Internal(format!("v1 migration: {e}")))?;
+
+        Ok(())
+    }
+
+    /// V2: Add perceptual hash column for dedup.
+    async fn migrate_v2(&self) -> Result<(), DbError> {
+        // SQLite ALTER TABLE ADD COLUMN is idempotent-safe with IF NOT EXISTS check.
+        let has_phash: bool = sqlx::query_scalar(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('uploads') WHERE name = 'phash'",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(false);
+
+        if !has_phash {
+            sqlx::query("ALTER TABLE uploads ADD COLUMN phash INTEGER")
+                .execute(&self.pool)
+                .await
+                .map_err(|e| DbError::Internal(format!("v2 migration: {e}")))?;
+
+            sqlx::query("CREATE INDEX IF NOT EXISTS idx_uploads_phash ON uploads(phash)")
+                .execute(&self.pool)
+                .await
+                .map_err(|e| DbError::Internal(format!("v2 migration: {e}")))?;
+        }
 
         Ok(())
     }
@@ -130,6 +204,7 @@ impl BlobDatabase for SqliteDatabase {
                 mime_type: row.2,
                 pubkey: row.3,
                 created_at: row.4 as u64,
+                phash: None,
             })
         })
     }
@@ -153,6 +228,7 @@ impl BlobDatabase for SqliteDatabase {
                     mime_type: r.2,
                     pubkey: r.3,
                     created_at: r.4 as u64,
+                    phash: None,
                 })
                 .collect())
         })

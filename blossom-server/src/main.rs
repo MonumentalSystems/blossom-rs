@@ -9,11 +9,14 @@ use std::sync::Arc;
 
 use blossom_rs::access::Whitelist;
 use blossom_rs::db::MemoryDatabase;
+use blossom_rs::ratelimit::{RateLimitConfig, RateLimiter};
+use blossom_rs::server::admin::admin_router;
 use blossom_rs::server::nip96::nip96_router;
 use blossom_rs::server::SharedState;
+use blossom_rs::webhooks::HttpNotifier;
 use blossom_rs::{BlobServer, BlossomSigner, FilesystemBackend, MemoryBackend, Signer};
 use clap::Parser;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::CorsLayer;
 use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
@@ -80,6 +83,30 @@ struct Args {
     #[arg(long)]
     tls_key: Option<PathBuf>,
 
+    /// Rate limit: max requests per bucket.
+    #[arg(long, default_value = "60")]
+    rate_limit_max: u64,
+
+    /// Rate limit: token refill rate (tokens per second).
+    #[arg(long, default_value = "1.0")]
+    rate_limit_refill: f64,
+
+    /// Disable rate limiting.
+    #[arg(long)]
+    no_rate_limit: bool,
+
+    /// Webhook URLs (comma-separated). POST notifications on upload/delete/mirror.
+    #[arg(long, value_delimiter = ',')]
+    webhook_urls: Vec<String>,
+
+    /// CORS allowed origins (comma-separated). Default: * (all).
+    #[arg(long, value_delimiter = ',')]
+    cors_origins: Vec<String>,
+
+    /// Enable admin endpoints (requires --whitelist for access control).
+    #[arg(long)]
+    enable_admin: bool,
+
     /// Log level.
     #[arg(long, default_value = "info")]
     log_level: String,
@@ -142,6 +169,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     builder = builder.body_limit(args.body_limit);
 
+    // Rate limiter.
+    if !args.no_rate_limit {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            max_tokens: args.rate_limit_max,
+            refill_rate: args.rate_limit_refill,
+        });
+        builder = builder.rate_limiter(limiter);
+        info!(
+            max_tokens = args.rate_limit_max,
+            refill_rate = args.rate_limit_refill,
+            "rate limiting enabled"
+        );
+    }
+
+    // Webhooks.
+    if !args.webhook_urls.is_empty() {
+        let notifier = HttpNotifier::new(args.webhook_urls.clone());
+        builder = builder.webhook_notifier(notifier);
+        info!(urls = ?args.webhook_urls, "webhook notifications enabled");
+    }
+
     // Whitelist setup.
     let whitelist: Option<Arc<Whitelist>> = if let Some(ref wl_path) = args.whitelist {
         let wl = Whitelist::from_file(wl_path)?;
@@ -156,16 +204,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server = builder.build();
     let state = server.shared_state();
 
-    // Merge NIP-96 endpoints + CORS into the router.
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+    // CORS — configurable origins or allow all.
+    let cors = if args.cors_origins.is_empty() {
+        CorsLayer::new()
+            .allow_origin(tower_http::cors::Any)
+            .allow_methods(tower_http::cors::Any)
+            .allow_headers(tower_http::cors::Any)
+    } else {
+        let origins: Vec<axum::http::HeaderValue> = args
+            .cors_origins
+            .iter()
+            .filter_map(|o| o.parse().ok())
+            .collect();
+        CorsLayer::new()
+            .allow_origin(origins)
+            .allow_methods(tower_http::cors::Any)
+            .allow_headers(tower_http::cors::Any)
+    };
 
-    let app = server
-        .router()
-        .merge(nip96_router(state.clone()))
-        .layer(cors);
+    // Build router — main + NIP-96 + optional admin.
+    let mut app = server.router().merge(nip96_router(state.clone()));
+
+    if args.enable_admin {
+        app = app.merge(admin_router(state.clone()));
+        info!("admin endpoints enabled at /admin/*");
+    }
+
+    let app = app.layer(cors);
 
     // Spawn stats flush loop.
     if args.stats_flush_secs > 0 {

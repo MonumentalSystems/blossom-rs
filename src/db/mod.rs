@@ -35,6 +35,9 @@ pub struct UploadRecord {
     pub pubkey: String,
     /// Unix timestamp of upload.
     pub created_at: u64,
+    /// Perceptual hash for image deduplication (optional).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub phash: Option<u64>,
 }
 
 /// Per-user record for quota tracking.
@@ -121,4 +124,14 @@ pub trait BlobDatabase: Send + Sync {
 
     /// Total number of registered users.
     fn user_count(&self) -> usize;
+
+    // --- Perceptual hash dedup ---
+
+    /// Find uploads with a matching perceptual hash (for image dedup).
+    /// Returns uploads whose phash matches within a Hamming distance threshold.
+    fn find_by_phash(&self, phash: u64) -> Result<Vec<UploadRecord>, DbError> {
+        // Default implementation: no phash support.
+        let _ = phash;
+        Ok(vec![])
+    }
 }
