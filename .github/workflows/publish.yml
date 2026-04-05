@@ -9,7 +9,16 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  publish:
+  test:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo clean
+      - run: cargo test --workspace
+
+  publish-lib:
+    needs: test
     runs-on: self-hosted
     environment: crates-io
     permissions:
@@ -17,6 +26,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo clean
-      - run: cargo test
-      - run: cargo publish --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      - run: cargo publish -p blossom-rs --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  publish-server:
+    needs: publish-lib
+    runs-on: self-hosted
+    environment: crates-io
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sleep 30
+      - run: cargo publish -p blossom-server --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  publish-cli:
+    needs: publish-lib
+    runs-on: self-hosted
+    environment: crates-io
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sleep 30
+      - run: cargo publish -p blossom-cli --token ${{ secrets.CARGO_REGISTRY_TOKEN }}

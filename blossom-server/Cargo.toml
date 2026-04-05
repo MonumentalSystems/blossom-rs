@@ -2,12 +2,15 @@
 name = "blossom-server"
 version = "0.1.0"
 edition = "2021"
-description = "Example Blossom API server — showcases all blossom-rs features"
+description = "Blossom blob storage API server — BUD-01/02/04/06, NIP-96, BIP-340 auth, SQLite metadata"
 license = "MIT"
-publish = false
+readme = "README.md"
+repository = "https://github.com/MonumentalSystems/blossom-rs"
+keywords = ["blossom", "nostr", "server", "blob", "storage"]
+categories = ["command-line-utilities", "web-programming"]
 
 [dependencies]
-blossom-rs = { path = "..", features = ["server", "filesystem", "db-sqlite"] }
+blossom-rs = { path = "..", version = "0.1.0", features = ["server", "filesystem", "db-sqlite"] }
 axum = "0.7"
 clap = { version = "4", features = ["derive", "env"] }
 tokio = { version = "1", features = ["full"] }
@@ -16,6 +19,6 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 serde_json = "1.0"
 
 [dev-dependencies]
-blossom-rs = { path = "..", features = ["server", "client", "filesystem"] }
+blossom-rs = { path = "..", version = "0.1.0", features = ["server", "client", "filesystem"] }
 reqwest = { version = "0.12", features = ["json"] }
 tempfile = "3"
