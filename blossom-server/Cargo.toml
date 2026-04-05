@@ -14,3 +14,8 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 serde_json = "1.0"
+
+[dev-dependencies]
+blossom-rs = { path = "..", features = ["server", "client", "filesystem"] }
+reqwest = { version = "0.12", features = ["json"] }
+tempfile = "3"

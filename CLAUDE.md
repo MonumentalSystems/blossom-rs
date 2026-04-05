@@ -8,19 +8,35 @@ Nostr kind:24242 events. Targets crates.io publication.
 
 Repository: `MonumentalSystems/blossom-rs`
 
+## Workspace Structure
+
+```
+blossom-rs/          — Core library (crates.io: blossom-rs)
+blossom-server/      — Example API server binary (all features)
+blossom-cli/         — CLI client binary (upload/download/keygen/etc.)
+```
+
 ## Build & Test Commands
 
 ```bash
-cargo build                          # Build with default features (server, client, filesystem)
+cargo build --workspace              # Build all crates
 cargo build --all-features           # Build everything including s3, otel, media, etc.
-cargo test                           # Run all tests (96 tests)
-cargo test --all-features            # Run tests with all feature gates
-cargo clippy -- -D warnings          # Lint (CI enforces zero warnings)
-cargo fmt --check                    # Format check (CI enforces)
-cargo fmt                            # Auto-format
+cargo test --workspace               # Run all tests (101 tests)
+cargo clippy --workspace -- -D warnings  # Lint all crates
+cargo fmt --all --check              # Format check all crates
+cargo fmt --all                      # Auto-format all crates
 cargo doc --no-deps --open           # Generate and view docs
-cargo llvm-cov                       # Coverage report (~92% line coverage)
-cargo publish --dry-run              # Verify crates.io packaging
+cargo llvm-cov                       # Coverage report (~92-95% line coverage)
+cargo publish --dry-run              # Verify crates.io packaging (lib only)
+
+# Run example server
+cargo run -p blossom-server                           # Default: filesystem + SQLite
+cargo run -p blossom-server -- --memory               # In-memory mode
+
+# Run CLI client
+cargo run -p blossom-cli -- keygen                    # Generate keypair
+cargo run -p blossom-cli -- -k <key> upload file.txt  # Upload
+cargo run -p blossom-cli -- status                    # Server status
 ```
 
 ## Feature Flags
