@@ -385,4 +385,196 @@ mod tests {
         assert_eq!(body["status"], "success");
         assert!(!body["nip94_event"]["tags"].as_array().unwrap().is_empty());
     }
+
+    /// Helper to upload a blob via NIP-96 with auth, returning the sha256.
+    async fn nip96_upload(
+        http: &reqwest::Client,
+        url: &str,
+        signer: &crate::auth::Signer,
+        data: &[u8],
+    ) -> String {
+        let auth_event = crate::auth::build_blossom_auth(
+            signer,
+            "upload",
+            Some(&crate::protocol::sha256_hex(data)),
+            None,
+            "",
+        );
+        let auth_header = crate::auth::auth_header_value(&auth_event);
+
+        let resp = http
+            .post(format!("{}/n96", url))
+            .header("Authorization", &auth_header)
+            .body(data.to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        // Extract sha256 from the "x" tag.
+        let tags = body["nip94_event"]["tags"].as_array().unwrap();
+        tags.iter().find(|t| t[0] == "x").unwrap()[1]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn test_nip96_upload_list_delete_lifecycle() {
+        let url = spawn_nip96_server().await;
+        let http = reqwest::Client::new();
+        let signer = crate::auth::Signer::generate();
+
+        // Upload two blobs.
+        let sha1 = nip96_upload(&http, &url, &signer, b"blob one").await;
+        let sha2 = nip96_upload(&http, &url, &signer, b"blob two").await;
+        assert_ne!(sha1, sha2);
+
+        // List — requires auth with "get" action.
+        let list_event = crate::auth::build_blossom_auth(&signer, "get", None, None, "");
+        let list_header = crate::auth::auth_header_value(&list_event);
+
+        let resp = http
+            .get(format!("{}/n96", url))
+            .header("Authorization", &list_header)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["total"], 2);
+        assert_eq!(body["files"].as_array().unwrap().len(), 2);
+
+        // Delete one.
+        let del_event = crate::auth::build_blossom_auth(&signer, "delete", None, None, "");
+        let del_header = crate::auth::auth_header_value(&del_event);
+
+        let resp = http
+            .delete(format!("{}/n96/{}", url, sha1))
+            .header("Authorization", &del_header)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["status"], "success");
+
+        // Delete nonexistent.
+        let del_event2 = crate::auth::build_blossom_auth(&signer, "delete", None, None, "");
+        let del_header2 = crate::auth::auth_header_value(&del_event2);
+
+        let resp = http
+            .delete(format!("{}/n96/{}", url, "0".repeat(64)))
+            .header("Authorization", &del_header2)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+    }
+
+    #[tokio::test]
+    async fn test_nip96_empty_upload_rejected() {
+        let url = spawn_nip96_server().await;
+        let http = reqwest::Client::new();
+        let signer = crate::auth::Signer::generate();
+
+        let auth_event = crate::auth::build_blossom_auth(&signer, "upload", None, None, "");
+        let auth_header = crate::auth::auth_header_value(&auth_event);
+
+        let resp = http
+            .post(format!("{}/n96", url))
+            .header("Authorization", &auth_header)
+            .body(Vec::<u8>::new())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn test_nip96_list_requires_auth() {
+        let url = spawn_nip96_server().await;
+        let http = reqwest::Client::new();
+
+        let resp = http.get(format!("{}/n96", url)).send().await.unwrap();
+        assert_eq!(resp.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn test_nip96_delete_requires_auth() {
+        let url = spawn_nip96_server().await;
+        let http = reqwest::Client::new();
+
+        let resp = http
+            .delete(format!("{}/n96/{}", url, "a".repeat(64)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn test_nip96_list_pagination() {
+        let url = spawn_nip96_server().await;
+        let http = reqwest::Client::new();
+        let signer = crate::auth::Signer::generate();
+
+        // Upload 5 blobs.
+        for i in 0u8..5 {
+            nip96_upload(&http, &url, &signer, &[i; 20]).await;
+        }
+
+        let list_event = crate::auth::build_blossom_auth(&signer, "get", None, None, "");
+        let list_header = crate::auth::auth_header_value(&list_event);
+
+        // Page 1, count 2.
+        let resp = http
+            .get(format!("{}/n96?page=1&count=2", url))
+            .header("Authorization", &list_header)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["total"], 5);
+        assert_eq!(body["files"].as_array().unwrap().len(), 2);
+        assert_eq!(body["page"], 1);
+    }
+
+    #[tokio::test]
+    async fn test_nip96_size_limit() {
+        let server = BlobServer::builder(MemoryBackend::new(), "http://localhost:3000")
+            .max_upload_size(10)
+            .build();
+        let state = server.shared_state();
+        let app = server.router().merge(nip96_router(state));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{}", addr);
+        tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let http = reqwest::Client::new();
+        let signer = crate::auth::Signer::generate();
+
+        let data = b"this exceeds 10 bytes limit!";
+        let auth_event = crate::auth::build_blossom_auth(
+            &signer,
+            "upload",
+            Some(&crate::protocol::sha256_hex(data)),
+            None,
+            "",
+        );
+        let auth_header = crate::auth::auth_header_value(&auth_event);
+
+        let resp = http
+            .post(format!("{}/n96", url))
+            .header("Authorization", &auth_header)
+            .body(data.to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 413);
+    }
 }

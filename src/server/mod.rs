@@ -863,4 +863,225 @@ mod tests {
         let status: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(status["users"], 1);
     }
+
+    #[tokio::test]
+    async fn test_get_nonexistent_blob() {
+        let url = spawn_server(test_server()).await;
+        let http = reqwest::Client::new();
+
+        let resp = http
+            .get(format!("{}/{}", url, "0".repeat(64)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+    }
+
+    #[tokio::test]
+    async fn test_empty_upload_rejected() {
+        let url = spawn_server(test_server()).await;
+        let http = reqwest::Client::new();
+
+        let resp = http
+            .put(format!("{}/upload", url))
+            .body(Vec::<u8>::new())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn test_auth_with_wrong_action_rejected() {
+        let server = BlobServer::new_with_auth(MemoryBackend::new(), "http://localhost:3000");
+        let url = spawn_server(server).await;
+        let http = reqwest::Client::new();
+        let signer = crate::auth::Signer::generate();
+
+        // Sign with "delete" action, but try to upload.
+        let auth_event = crate::auth::build_blossom_auth(&signer, "delete", None, None, "");
+        let auth_header = crate::auth::auth_header_value(&auth_event);
+
+        let resp = http
+            .put(format!("{}/upload", url))
+            .header("Authorization", &auth_header)
+            .body(b"wrong action".to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn test_delete_nonexistent_with_auth() {
+        let url = spawn_server(test_server()).await;
+        let http = reqwest::Client::new();
+        let signer = crate::auth::Signer::generate();
+
+        let auth_event = crate::auth::build_blossom_auth(&signer, "delete", None, None, "");
+        let auth_header = crate::auth::auth_header_value(&auth_event);
+
+        let resp = http
+            .delete(format!("{}/{}", url, "0".repeat(64)))
+            .header("Authorization", &auth_header)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+    }
+
+    #[tokio::test]
+    async fn test_mirror_requires_auth() {
+        let url = spawn_server(test_server()).await;
+        let http = reqwest::Client::new();
+
+        let resp = http
+            .put(format!("{}/mirror", url))
+            .json(&serde_json::json!({"url": "http://example.com/blob"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn test_mirror_bad_remote_url() {
+        let url = spawn_server(test_server()).await;
+        let http = reqwest::Client::new();
+        let signer = crate::auth::Signer::generate();
+
+        let auth_event = crate::auth::build_blossom_auth(&signer, "upload", None, None, "");
+        let auth_header = crate::auth::auth_header_value(&auth_event);
+
+        let resp = http
+            .put(format!("{}/mirror", url))
+            .header("Authorization", &auth_header)
+            .json(&serde_json::json!({"url": "http://127.0.0.1:1/nonexistent"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 502);
+    }
+
+    #[tokio::test]
+    async fn test_mirror_success() {
+        // Spin up a source server with a blob.
+        let source = test_server();
+        let source_url = spawn_server(source).await;
+        let http = reqwest::Client::new();
+
+        let data = b"mirror me!";
+        let resp = http
+            .put(format!("{}/upload", source_url))
+            .body(data.to_vec())
+            .send()
+            .await
+            .unwrap();
+        let desc: BlobDescriptor = resp.json().await.unwrap();
+
+        // Spin up a destination server.
+        let dest = test_server();
+        let dest_url = spawn_server(dest).await;
+        let signer = crate::auth::Signer::generate();
+
+        let auth_event = crate::auth::build_blossom_auth(&signer, "upload", None, None, "");
+        let auth_header = crate::auth::auth_header_value(&auth_event);
+
+        // Mirror from source to dest.
+        let resp = http
+            .put(format!("{}/mirror", dest_url))
+            .header("Authorization", &auth_header)
+            .json(&serde_json::json!({"url": format!("{}/{}", source_url, desc.sha256)}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let mirrored: BlobDescriptor = serde_json::from_value(resp.json().await.unwrap()).unwrap();
+        assert_eq!(mirrored.sha256, desc.sha256);
+
+        // Verify it's on dest.
+        let resp = http
+            .get(format!("{}/{}", dest_url, desc.sha256))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.bytes().await.unwrap().as_ref(), data);
+    }
+
+    #[tokio::test]
+    async fn test_upload_with_invalid_auth_header() {
+        let server = BlobServer::new_with_auth(MemoryBackend::new(), "http://localhost:3000");
+        let url = spawn_server(server).await;
+        let http = reqwest::Client::new();
+
+        // Garbage auth header.
+        let resp = http
+            .put(format!("{}/upload", url))
+            .header("Authorization", "Nostr not-valid-base64!!!")
+            .body(b"test".to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+
+        // Wrong prefix.
+        let resp = http
+            .put(format!("{}/upload", url))
+            .header("Authorization", "Bearer token123")
+            .body(b"test".to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn test_head_existing_blob() {
+        let url = spawn_server(test_server()).await;
+        let http = reqwest::Client::new();
+
+        let data = b"head check";
+        let resp = http
+            .put(format!("{}/upload", url))
+            .body(data.to_vec())
+            .send()
+            .await
+            .unwrap();
+        let desc: BlobDescriptor = resp.json().await.unwrap();
+
+        let resp = http
+            .head(format!("{}/{}", url, desc.sha256))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn test_access_stats_tracked() {
+        let url = spawn_server(test_server()).await;
+        let http = reqwest::Client::new();
+
+        let data = b"track my downloads";
+        let resp = http
+            .put(format!("{}/upload", url))
+            .body(data.to_vec())
+            .send()
+            .await
+            .unwrap();
+        let desc: BlobDescriptor = resp.json().await.unwrap();
+
+        // Download 3 times.
+        for _ in 0..3 {
+            http.get(format!("{}/{}", url, desc.sha256))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        let resp = http.get(format!("{}/status", url)).send().await.unwrap();
+        let status: serde_json::Value = resp.json().await.unwrap();
+        assert!(status["tracked_stats"].as_u64().unwrap() >= 1);
+    }
 }
