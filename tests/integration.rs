@@ -356,3 +356,101 @@ async fn test_filesystem_backend_server() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// Client error paths
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_client_download_nonexistent() {
+    let signer = Signer::generate();
+    let server = BlobServer::new(MemoryBackend::new(), "http://localhost:3000");
+    let url = spawn_server(server).await;
+
+    let client = BlossomClient::new(vec![url], signer);
+    let result = client.download(&"0".repeat(64)).await;
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("not found"));
+}
+
+#[tokio::test]
+async fn test_client_upload_all_servers_fail() {
+    let signer = Signer::generate();
+    // Both servers unreachable.
+    let client = BlossomClient::new(
+        vec![
+            "http://127.0.0.1:1".to_string(),
+            "http://127.0.0.1:2".to_string(),
+        ],
+        signer,
+    );
+
+    let result = client.upload(b"data", "text/plain").await;
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("all Blossom servers failed"));
+}
+
+#[tokio::test]
+async fn test_client_download_all_servers_fail() {
+    let signer = Signer::generate();
+    let client = BlossomClient::new(vec!["http://127.0.0.1:1".to_string()], signer);
+
+    let result = client.download(&"a".repeat(64)).await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn test_client_exists_all_servers_fail() {
+    let signer = Signer::generate();
+    let client = BlossomClient::new(vec!["http://127.0.0.1:1".to_string()], signer);
+
+    // Should return false (not found), not error.
+    let result = client.exists(&"a".repeat(64)).await.unwrap();
+    assert!(!result);
+}
+
+#[tokio::test]
+async fn test_client_upload_failover_non_success() {
+    let signer = Signer::generate();
+
+    // First server returns 401 (requires auth), second is open.
+    let bad_server = BlobServer::new_with_auth(MemoryBackend::new(), "http://localhost:3000");
+    let bad_url = spawn_server(bad_server).await;
+
+    let good_server = BlobServer::new(MemoryBackend::new(), "http://localhost:3000");
+    let good_url = spawn_server(good_server).await;
+
+    let client = BlossomClient::new(vec![bad_url, good_url], signer);
+
+    let data = b"failover on 401";
+    let desc = client.upload(data, "text/plain").await.unwrap();
+    assert_eq!(desc.size, data.len() as u64);
+}
+
+#[tokio::test]
+async fn test_client_download_failover_across_servers() {
+    let signer = Signer::generate();
+
+    // Server 1 has nothing, server 2 has the blob.
+    let empty_server = BlobServer::new(MemoryBackend::new(), "http://localhost:3000");
+    let empty_url = spawn_server(empty_server).await;
+
+    let full_server = BlobServer::new(MemoryBackend::new(), "http://localhost:3000");
+    let full_url = spawn_server(full_server).await;
+
+    // Upload to server 2 directly.
+    let http = reqwest::Client::new();
+    let data = b"only on server 2";
+    let resp = http
+        .put(format!("{}/upload", full_url))
+        .body(data.to_vec())
+        .send()
+        .await
+        .unwrap();
+    let desc: blossom_rs::BlobDescriptor = resp.json().await.unwrap();
+
+    // Client tries server 1 (404), then server 2 (success).
+    let client = BlossomClient::new(vec![empty_url, full_url], signer);
+    let downloaded = client.download(&desc.sha256).await.unwrap();
+    assert_eq!(downloaded, data);
+}
