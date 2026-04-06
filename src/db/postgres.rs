@@ -27,7 +27,53 @@ impl PostgresDatabase {
         Ok(db)
     }
 
+    const SCHEMA_VERSION: i64 = 2;
+
     async fn run_migrations(&self) -> Result<(), DbError> {
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS schema_version (
+                version INTEGER NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DbError::Internal(format!("migration: {e}")))?;
+
+        let current: i64 =
+            sqlx::query_scalar("SELECT COALESCE(MAX(version), 0) FROM schema_version")
+                .fetch_one(&self.pool)
+                .await
+                .unwrap_or(0);
+
+        if current < 1 {
+            self.migrate_v1().await?;
+        }
+        if current < 2 {
+            self.migrate_v2().await?;
+        }
+
+        if current < Self::SCHEMA_VERSION {
+            sqlx::query("DELETE FROM schema_version")
+                .execute(&self.pool)
+                .await
+                .map_err(|e| DbError::Internal(format!("migration: {e}")))?;
+            sqlx::query("INSERT INTO schema_version (version) VALUES ($1)")
+                .bind(Self::SCHEMA_VERSION)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| DbError::Internal(format!("migration: {e}")))?;
+
+            tracing::info!(
+                db.schema_version = Self::SCHEMA_VERSION,
+                db.previous_version = current,
+                "postgres database migrated"
+            );
+        }
+
+        Ok(())
+    }
+
+    async fn migrate_v1(&self) -> Result<(), DbError> {
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS uploads (
                 sha256 TEXT PRIMARY KEY,
@@ -39,7 +85,7 @@ impl PostgresDatabase {
         )
         .execute(&self.pool)
         .await
-        .map_err(|e| DbError::Internal(format!("migration: {e}")))?;
+        .map_err(|e| DbError::Internal(format!("v1 migration: {e}")))?;
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS users (
@@ -50,7 +96,7 @@ impl PostgresDatabase {
         )
         .execute(&self.pool)
         .await
-        .map_err(|e| DbError::Internal(format!("migration: {e}")))?;
+        .map_err(|e| DbError::Internal(format!("v1 migration: {e}")))?;
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS file_stats (
@@ -61,12 +107,39 @@ impl PostgresDatabase {
         )
         .execute(&self.pool)
         .await
-        .map_err(|e| DbError::Internal(format!("migration: {e}")))?;
+        .map_err(|e| DbError::Internal(format!("v1 migration: {e}")))?;
 
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_uploads_pubkey ON uploads(pubkey)")
             .execute(&self.pool)
             .await
-            .map_err(|e| DbError::Internal(format!("migration: {e}")))?;
+            .map_err(|e| DbError::Internal(format!("v1 migration: {e}")))?;
+
+        Ok(())
+    }
+
+    async fn migrate_v2(&self) -> Result<(), DbError> {
+        // Add phash column if not present.
+        let has_phash: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'uploads' AND column_name = 'phash'
+            )",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(false);
+
+        if !has_phash {
+            sqlx::query("ALTER TABLE uploads ADD COLUMN phash BIGINT")
+                .execute(&self.pool)
+                .await
+                .map_err(|e| DbError::Internal(format!("v2 migration: {e}")))?;
+
+            sqlx::query("CREATE INDEX IF NOT EXISTS idx_uploads_phash ON uploads(phash)")
+                .execute(&self.pool)
+                .await
+                .map_err(|e| DbError::Internal(format!("v2 migration: {e}")))?;
+        }
 
         Ok(())
     }

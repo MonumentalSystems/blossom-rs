@@ -19,9 +19,20 @@ pub struct BlossomClient {
 
 impl BlossomClient {
     /// Create a new client with the given server URLs and signer.
+    /// Create a new client with the given server URLs and signer.
+    /// Default timeout: 30 seconds.
     pub fn new(servers: Vec<String>, signer: impl BlossomSigner + 'static) -> Self {
+        Self::with_timeout(servers, signer, std::time::Duration::from_secs(30))
+    }
+
+    /// Create a new client with a custom timeout.
+    pub fn with_timeout(
+        servers: Vec<String>,
+        signer: impl BlossomSigner + 'static,
+        timeout: std::time::Duration,
+    ) -> Self {
         let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
+            .timeout(timeout)
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self {

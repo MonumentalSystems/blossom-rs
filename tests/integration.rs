@@ -454,3 +454,85 @@ async fn test_client_download_failover_across_servers() {
     let downloaded = client.download(&desc.sha256).await.unwrap();
     assert_eq!(downloaded, data);
 }
+
+// ---------------------------------------------------------------------------
+// Concurrent uploads
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_concurrent_uploads() {
+    let server = BlobServer::new(MemoryBackend::new(), "http://localhost:3000");
+    let url = spawn_server(server).await;
+    let http = reqwest::Client::new();
+
+    // Spawn 20 concurrent uploads with different data.
+    let mut handles = Vec::new();
+    for i in 0u8..20 {
+        let http = http.clone();
+        let url = url.clone();
+        handles.push(tokio::spawn(async move {
+            let data = vec![i; 1000];
+            let resp = http
+                .put(format!("{}/upload", url))
+                .body(data.clone())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+            let desc: blossom_rs::BlobDescriptor = resp.json().await.unwrap();
+            assert_eq!(desc.size, 1000);
+            assert_eq!(desc.sha256, sha256_hex(&data));
+            desc.sha256
+        }));
+    }
+
+    let mut hashes = std::collections::HashSet::new();
+    for handle in handles {
+        hashes.insert(handle.await.unwrap());
+    }
+
+    // All 20 should be unique (different data).
+    assert_eq!(hashes.len(), 20);
+
+    // Status should show all blobs.
+    let resp = http.get(format!("{}/status", url)).send().await.unwrap();
+    let status: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(status["blobs"], 20);
+}
+
+#[tokio::test]
+async fn test_concurrent_upload_download() {
+    let signer = Signer::generate();
+    let server = BlobServer::new(MemoryBackend::new(), "http://localhost:3000");
+    let url = spawn_server(server).await;
+
+    let client = std::sync::Arc::new(BlossomClient::new(
+        vec![url],
+        Signer::from_secret_hex(&signer.secret_key_hex()).unwrap(),
+    ));
+
+    // Upload 10 blobs.
+    let mut descs = Vec::new();
+    for i in 0u8..10 {
+        let data = vec![i; 500];
+        let desc = client
+            .upload(&data, "application/octet-stream")
+            .await
+            .unwrap();
+        descs.push((desc.sha256.clone(), data));
+    }
+
+    // Download all 10 concurrently and verify.
+    let mut handles = Vec::new();
+    for (sha256, expected_data) in descs {
+        let client = client.clone();
+        handles.push(tokio::spawn(async move {
+            let downloaded = client.download(&sha256).await.unwrap();
+            assert_eq!(downloaded, expected_data);
+        }));
+    }
+
+    for handle in handles {
+        handle.await.unwrap();
+    }
+}

@@ -43,9 +43,31 @@ struct Args {
     #[arg(long)]
     memory: bool,
 
-    /// SQLite database path for metadata (ignored with --memory).
+    /// S3-compatible endpoint URL (e.g., https://account.r2.cloudflarestorage.com).
+    /// When set, uses S3 backend instead of filesystem.
+    #[arg(long)]
+    s3_endpoint: Option<String>,
+
+    /// S3 bucket name (required with --s3-endpoint).
+    #[arg(long, default_value = "blobs")]
+    s3_bucket: String,
+
+    /// S3 region (use "auto" for Cloudflare R2).
+    #[arg(long, default_value = "auto")]
+    s3_region: String,
+
+    /// S3 CDN/public URL prefix for blob URLs (optional).
+    #[arg(long)]
+    s3_public_url: Option<String>,
+
+    /// SQLite database path for metadata (default).
     #[arg(long, default_value = "./blossom.db")]
     db_path: String,
+
+    /// PostgreSQL connection URL (e.g., postgres://user:pass@localhost/blobs).
+    /// When set, uses Postgres instead of SQLite for metadata.
+    #[arg(long)]
+    db_postgres: Option<String>,
 
     /// Require BIP-340 Nostr auth for uploads.
     #[arg(long)]
@@ -163,19 +185,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    // Build the server with the configured backend and database.
+    // Build storage backend.
     let mut builder = if args.memory {
         info!("using in-memory storage (no persistence)");
-        BlobServer::builder(MemoryBackend::new(), &args.base_url).database(MemoryDatabase::new())
+        BlobServer::builder(MemoryBackend::new(), &args.base_url)
+    } else if let Some(ref s3_endpoint) = args.s3_endpoint {
+        let s3_config = blossom_rs::storage::S3Config {
+            endpoint: Some(s3_endpoint.clone()),
+            bucket: args.s3_bucket.clone(),
+            region: args.s3_region.clone(),
+            public_url: args.s3_public_url.clone(),
+        };
+        let backend = blossom_rs::storage::S3Backend::new(s3_config)
+            .await
+            .map_err(|e| format!("S3 backend: {e}"))?;
+        info!(
+            s3.endpoint = %s3_endpoint,
+            s3.bucket = %args.s3_bucket,
+            "using S3 blob storage"
+        );
+        BlobServer::builder(backend, &args.base_url)
     } else {
         let backend = FilesystemBackend::new(&args.data_dir)?;
         info!(data_dir = %args.data_dir, "using filesystem storage");
+        BlobServer::builder(backend, &args.base_url)
+    };
 
+    // Build metadata database.
+    if args.memory {
+        builder = builder.database(MemoryDatabase::new());
+    } else if let Some(ref pg_url) = args.db_postgres {
+        let db = blossom_rs::db::PostgresDatabase::new(pg_url)
+            .await
+            .map_err(|e| format!("Postgres: {e}"))?;
+        info!(db = "postgres", "using PostgreSQL metadata database");
+        builder = builder.database(db);
+    } else {
         let db_url = format!("sqlite:{}?mode=rwc", args.db_path);
         let db = blossom_rs::db::SqliteDatabase::new(&db_url).await?;
         info!(db_path = %args.db_path, "using SQLite metadata database");
-
-        BlobServer::builder(backend, &args.base_url).database(db)
+        builder = builder.database(db);
     };
 
     if args.require_auth {
@@ -306,10 +355,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             key
         };
 
-        // Build iroh state — shares the same storage backend type but separate instance.
-        // For a production server, you'd share the backend via Arc.
+        // Build iroh state — shares the same filesystem directory as HTTP.
+        // For MemoryBackend, creates a shared instance. For FilesystemBackend,
+        // both transports point at the same directory (content-addressed = shared).
         let iroh_state = StdArc::new(tokio::sync::Mutex::new(IrohState {
             backend: if args.memory {
+                // For memory mode, blobs uploaded via iroh won't be visible via HTTP
+                // and vice versa. Use filesystem mode for shared storage.
+                warn!("--memory mode: iroh and HTTP have separate blob stores. Use filesystem for shared storage.");
                 Box::new(MemoryBackend::new())
             } else {
                 Box::new(

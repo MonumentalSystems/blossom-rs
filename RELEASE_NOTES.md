@@ -1,5 +1,37 @@
 # Release Notes
 
+## v0.2.0
+
+### Breaking Changes
+
+- `BlossomClient::with_timeout()` — new constructor for custom timeout (default still 30s).
+- SHA256 path parameters are now validated (64-char hex) — invalid paths return 400 instead of 404.
+- Upload handler uses `Content-Type` request header instead of hardcoding `application/octet-stream`.
+- `GET /<sha256>.ext` — file extension is now stripped (BUD-01 compliance).
+
+### New Features
+
+- **Server `--s3-endpoint`** — S3/R2/MinIO blob storage backend from CLI (with `--s3-bucket`, `--s3-region`, `--s3-public-url`).
+- **Server `--db-postgres`** — PostgreSQL metadata backend from CLI.
+- **Postgres versioned migrations** — `schema_version` table with V1 (initial) and V2 (phash column), matching SQLite.
+- **Iroh connection caching** — `IrohBlossomClient` reuses QUIC connections per node ID.
+- **Concurrent upload tests** — 20 parallel uploads + 10 parallel download verification.
+- **Wire protocol fuzz tests** — proptest for request/response roundtrip.
+- **Dockerfile** — Multi-stage build for `blossom-server`.
+- **MSRV** — Minimum Supported Rust Version: 1.80.
+- **CI iroh tests** — `cargo test --features iroh-transport --test iroh_integration` in CI pipeline.
+
+### Improvements
+
+- Server warns when using `--memory` + `--iroh` (separate blob stores).
+- `to_json_response()` helper replaces remaining `unwrap()` in production HTTP handlers.
+- SHA256 parameter validation on GET/HEAD/DELETE endpoints.
+- `Content-Type` from upload request header recorded in database.
+- VitLabeler and LlmLabeler marked as TODO in source.
+- 207 total tests.
+
+---
+
 ## v0.1.5
 
 ### New Features

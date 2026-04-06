@@ -331,6 +331,20 @@ fn to_json_response(value: &impl serde::Serialize) -> (StatusCode, Json<serde_js
     }
 }
 
+/// Validate that a string is a valid SHA256 hex hash (64 lowercase hex chars).
+fn is_valid_sha256(s: &str) -> bool {
+    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Extract Content-Type from request headers, defaulting to octet-stream.
+fn extract_content_type(headers: &HeaderMap) -> String {
+    headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string()
+}
+
 // ---------------------------------------------------------------------------
 // BUD-01: Upload
 // ---------------------------------------------------------------------------
@@ -420,16 +434,14 @@ async fn handle_upload(
     // Record span fields now that we know the sha256.
     tracing::Span::current().record("blob.sha256", descriptor.sha256.as_str());
 
-    // Record in database.
+    // Record in database with Content-Type from request header.
     let upload_pubkey = pubkey.unwrap_or_else(|| "anonymous".to_string());
     tracing::Span::current().record("auth.pubkey", upload_pubkey.as_str());
+    let content_type = extract_content_type(&headers);
     let record = UploadRecord {
         sha256: descriptor.sha256.clone(),
         size: descriptor.size,
-        mime_type: descriptor
-            .content_type
-            .clone()
-            .unwrap_or_else(|| "application/octet-stream".to_string()),
+        mime_type: content_type,
         pubkey: upload_pubkey,
         created_at: descriptor.uploaded.unwrap_or(0),
         phash: None,
@@ -464,6 +476,11 @@ async fn handle_get_blob(
     State(state): State<SharedState>,
     Path(sha256): Path<String>,
 ) -> impl IntoResponse {
+    // Strip optional file extension (BUD-01: GET /<sha256>.ext).
+    let sha256 = sha256.split('.').next().unwrap_or(&sha256).to_string();
+    if !is_valid_sha256(&sha256) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     let s = state.lock().await;
     match s.backend.get(&sha256) {
         Some(data) => {
@@ -486,6 +503,10 @@ async fn handle_head_blob(
     State(state): State<SharedState>,
     Path(sha256): Path<String>,
 ) -> StatusCode {
+    let sha256 = sha256.split('.').next().unwrap_or(&sha256).to_string();
+    if !is_valid_sha256(&sha256) {
+        return StatusCode::BAD_REQUEST;
+    }
     let s = state.lock().await;
     if s.backend.exists(&sha256) {
         StatusCode::OK

@@ -1032,7 +1032,7 @@ dependencies = [
 
 [[package]]
 name = "blossom-cli"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "axum",
  "bech32",
@@ -1048,7 +1048,7 @@ dependencies = [
 
 [[package]]
 name = "blossom-rs"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -1087,7 +1087,7 @@ dependencies = [
 
 [[package]]
 name = "blossom-server"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "axum",
  "axum-server",

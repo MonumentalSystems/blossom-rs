@@ -11,7 +11,6 @@ env:
 
 jobs:
   # Trusted CI — runs on self-hosted runner for pushes to master.
-  # Only maintainers can push to master, so this is safe.
   ci-trusted:
     if: github.event_name == 'push'
     runs-on: self-hosted
@@ -24,10 +23,10 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo build --workspace --all-targets
       - run: cargo test --workspace
+      - run: cargo test --features iroh-transport --test iroh_integration
       - run: cargo clippy --workspace -- -D warnings
 
   # PR CI — runs on GitHub-hosted runner for pull requests.
-  # Safe for public repos: forks cannot access secrets or self-hosted infra.
   ci-pr:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
@@ -39,4 +38,5 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo build --workspace --all-targets
       - run: cargo test --workspace
+      - run: cargo test --features iroh-transport --test iroh_integration
       - run: cargo clippy --workspace -- -D warnings

@@ -3,8 +3,11 @@
 //! Connects to a Blossom peer by node ID and performs blob operations
 //! over the `/blossom/1` ALPN protocol.
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use iroh::endpoint::{Connection, Endpoint};
-use iroh::EndpointAddr;
+use iroh::{EndpointAddr, EndpointId};
 use tracing::{info, instrument};
 
 use super::iroh_transport::BLOSSOM_ALPN;
@@ -14,11 +17,13 @@ use crate::protocol::{sha256_hex, BlobDescriptor};
 
 /// Iroh-based Blossom client.
 ///
-/// Connects to peers by iroh node ID over QUIC. Supports the same
-/// operations as the HTTP `BlossomClient`: upload, download, exists, delete.
+/// Connects to peers by iroh node ID over QUIC. Caches connections
+/// per node ID for reuse across operations.
 pub struct IrohBlossomClient {
     endpoint: Endpoint,
     signer: Box<dyn BlossomSigner>,
+    /// Cached connections by node endpoint ID.
+    connections: Mutex<HashMap<EndpointId, Connection>>,
 }
 
 impl IrohBlossomClient {
@@ -27,15 +32,35 @@ impl IrohBlossomClient {
         Self {
             endpoint,
             signer: Box::new(signer),
+            connections: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Connect to a remote Blossom peer.
+    /// Connect to a remote Blossom peer, reusing cached connections.
     async fn connect(&self, addr: EndpointAddr) -> Result<Connection, String> {
-        self.endpoint
+        let node_id = addr.id;
+
+        // Check cache.
+        if let Some(conn) = self.connections.lock().unwrap().get(&node_id) {
+            // Verify connection is still alive.
+            if conn.close_reason().is_none() {
+                return Ok(conn.clone());
+            }
+        }
+
+        // New connection.
+        let conn = self
+            .endpoint
             .connect(addr, BLOSSOM_ALPN)
             .await
-            .map_err(|e| format!("iroh connect: {e}"))
+            .map_err(|e| format!("iroh connect: {e}"))?;
+
+        self.connections
+            .lock()
+            .unwrap()
+            .insert(node_id, conn.clone());
+
+        Ok(conn)
     }
 
     /// Upload a blob to a remote peer.

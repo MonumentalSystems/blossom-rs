@@ -3,8 +3,9 @@ members = [".", "blossom-server", "blossom-cli"]
 
 [package]
 name = "blossom-rs"
-version = "0.1.5"
+version = "0.2.0"
 edition = "2021"
+rust-version = "1.80"
 description = "Full-featured Blossom (BUD-01) blob storage library for Rust — embeddable server, async client, BIP-340 Nostr auth"
 license = "MIT"
 readme = "README.md"

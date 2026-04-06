@@ -49,4 +49,46 @@ proptest! {
         let h2 = sha256_hex(&data2);
         prop_assert_ne!(h1, h2);
     }
+
+    /// Wire protocol request roundtrip — encode then decode.
+    #[test]
+    fn wire_request_roundtrip(
+        sha256 in "[0-9a-f]{64}",
+        auth in "[a-zA-Z0-9]{0,100}",
+    ) {
+        use blossom_rs::transport::wire::{encode_request, decode_line, Request, Op};
+        let req = Request {
+            op: Op::Get,
+            sha256,
+            pubkey: String::new(),
+            auth,
+            content_type: String::new(),
+            body_len: 0,
+        };
+        let encoded = encode_request(&req);
+        let (decoded, consumed): (Request, usize) = decode_line(&encoded).unwrap();
+        prop_assert_eq!(decoded.sha256, req.sha256);
+        prop_assert_eq!(decoded.auth, req.auth);
+        prop_assert_eq!(consumed, encoded.len());
+    }
+
+    /// Wire protocol response roundtrip.
+    #[test]
+    fn wire_response_roundtrip(
+        body_len in 0u64..1_000_000,
+        error in "[a-zA-Z0-9 ]{0,50}",
+    ) {
+        use blossom_rs::transport::wire::{encode_response, decode_line, Response, Status};
+        let resp = Response {
+            status: Status::Ok,
+            body_len,
+            content_type: "application/octet-stream".into(),
+            error,
+            descriptor: None,
+        };
+        let encoded = encode_response(&resp);
+        let (decoded, _): (Response, usize) = decode_line(&encoded).unwrap();
+        prop_assert_eq!(decoded.body_len, resp.body_len);
+        prop_assert_eq!(decoded.error, resp.error);
+    }
 }
