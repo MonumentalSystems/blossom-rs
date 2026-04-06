@@ -1,0 +1,9 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+blossom-rs = { path = "..", features = [] }
+serde_json = "1.0"

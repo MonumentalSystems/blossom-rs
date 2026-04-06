@@ -40,6 +40,7 @@
 pub mod access;
 pub mod auth;
 pub mod db;
+pub mod integrity;
 pub mod labels;
 pub mod media;
 pub mod otel;
