@@ -2,9 +2,49 @@ name: build-artifact
 on:
   workflow_call:
   workflow_dispatch:
+    inputs:
+      os:
+        description: 'OS / target to build (select "all" to build every target)'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - linux-x64
+          - linux-x64-musl
+          - windows-x64
+          - macos-x64
+          - macos-arm64
 
 jobs:
+  setup:
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - id: set-matrix
+        shell: python3 {0}
+        run: |
+          import json, os
+
+          ALL_TARGETS = [
+            {"build": "linux-x64",      "os": "ubuntu-latest",  "target": "x86_64-unknown-linux-gnu",   "native": True},
+            {"build": "linux-x64-musl", "os": "ubuntu-latest",  "target": "x86_64-unknown-linux-musl",  "native": True},
+            {"build": "windows-x64",    "os": "windows-latest", "target": "x86_64-pc-windows-msvc",     "native": True},
+            {"build": "macos-x64",      "os": "macos-15-intel", "target": "x86_64-apple-darwin",        "native": True},
+            {"build": "macos-arm64",    "os": "macos-latest",   "target": "aarch64-apple-darwin",       "native": True},
+          ]
+
+          selected = "${{ inputs.os }}" or "all"
+          targets = ALL_TARGETS if selected == "all" else [t for t in ALL_TARGETS if t["build"] == selected]
+          matrix = {"build": [t["build"] for t in targets], "include": targets}
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+            f.write(f"matrix={json.dumps(matrix)}\n")
+
   build-artifacts:
+    needs: setup
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write
@@ -12,29 +52,7 @@ jobs:
       BUILD_NAME: "blossom-${{ github.ref_name }}-${{ matrix.target }}"
     strategy:
       fail-fast: false
-      matrix:
-        build: [linux-x64, linux-x64-musl, windows-x64, macos-x64, macos-arm64]
-        include:
-        - build: linux-x64
-          os: ubuntu-latest
-          target: x86_64-unknown-linux-gnu
-          native: true
-        - build: linux-x64-musl
-          os: ubuntu-latest
-          target: x86_64-unknown-linux-musl
-          native: true
-        - build: windows-x64
-          os: windows-latest
-          target: x86_64-pc-windows-msvc
-          native: true
-        - build: macos-x64
-          os: macos-15-intel
-          target: x86_64-apple-darwin
-          native: true
-        - build: macos-arm64
-          os: macos-latest
-          target: aarch64-apple-darwin
-          native: true
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
 
     steps:
     - name: Checkout repository
