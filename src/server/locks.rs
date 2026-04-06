@@ -173,7 +173,10 @@ fn lock_not_configured() -> (StatusCode, Json<serde_json::Value>) {
 
 pub fn locks_router(state: SharedState) -> Router {
     Router::new()
-        .route("/lfs/{repo_id}/locks", post(handle_create_lock).get(handle_list_locks))
+        .route(
+            "/lfs/{repo_id}/locks",
+            post(handle_create_lock).get(handle_list_locks),
+        )
         .route("/lfs/{repo_id}/locks/verify", post(handle_verify_locks))
         .route("/lfs/{repo_id}/locks/{lock_id}/unlock", post(handle_unlock))
         .with_state(state)
@@ -211,7 +214,9 @@ async fn handle_create_lock(
             let lfs_lock = lock_record_to_lfs(&record);
             (
                 StatusCode::CREATED,
-                Json(serde_json::to_value(CreateLockResponse { lock: lfs_lock }).unwrap_or_default()),
+                Json(
+                    serde_json::to_value(CreateLockResponse { lock: lfs_lock }).unwrap_or_default(),
+                ),
             )
         }
         Err(crate::locks::LockError::Conflict(existing_id)) => {
@@ -226,10 +231,7 @@ async fn handle_create_lock(
                     Json(serde_json::to_value(resp).unwrap_or_default()),
                 )
             } else {
-                (
-                    StatusCode::CONFLICT,
-                    error_json("path already locked"),
-                )
+                (StatusCode::CONFLICT, error_json("path already locked"))
             }
         }
         Err(e) => (
@@ -327,7 +329,11 @@ async fn handle_verify_locks(
                 }
             }
 
-            let resp = VerifyResponse { ours, theirs, next_cursor };
+            let resp = VerifyResponse {
+                ours,
+                theirs,
+                next_cursor,
+            };
             (
                 StatusCode::OK,
                 Json(serde_json::to_value(resp).unwrap_or_default()),
@@ -372,15 +378,15 @@ async fn handle_unlock(
             let lfs_lock = lock_record_to_lfs(&record);
             (
                 StatusCode::OK,
-                Json(serde_json::to_value(CreateLockResponse { lock: lfs_lock }).unwrap_or_default()),
+                Json(
+                    serde_json::to_value(CreateLockResponse { lock: lfs_lock }).unwrap_or_default(),
+                ),
             )
         }
         Err(crate::locks::LockError::NotFound) => {
             (StatusCode::NOT_FOUND, error_json("lock not found"))
         }
-        Err(crate::locks::LockError::Forbidden(msg)) => {
-            (StatusCode::FORBIDDEN, error_json(&msg))
-        }
+        Err(crate::locks::LockError::Forbidden(msg)) => (StatusCode::FORBIDDEN, error_json(&msg)),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             error_json(&e.to_string()),

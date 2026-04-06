@@ -439,7 +439,9 @@ impl crate::traits::BlobClient for IrohBlossomClient {
             lock_path: path.to_string(),
             ..Default::default()
         };
-        send.write_all(&wire::encode_request(&req)).await.map_err(|e| format!("send: {e}"))?;
+        send.write_all(&wire::encode_request(&req))
+            .await
+            .map_err(|e| format!("send: {e}"))?;
         send.finish().map_err(|e| format!("finish: {e}"))?;
 
         let (resp, _) = read_response(&mut recv).await?;
@@ -448,8 +450,7 @@ impl crate::traits::BlobClient for IrohBlossomClient {
                 .descriptor
                 .ok_or_else(|| "missing descriptor".to_string())
                 .and_then(|v| {
-                    serde_json::from_value::<LockRecord>(v)
-                        .map_err(|e| format!("parse lock: {e}"))
+                    serde_json::from_value::<LockRecord>(v).map_err(|e| format!("parse lock: {e}"))
                 }),
             Status::Conflict => Err("path already locked".to_string()),
             Status::Unauthorized => Err("unauthorized".to_string()),
@@ -480,7 +481,9 @@ impl crate::traits::BlobClient for IrohBlossomClient {
             force,
             ..Default::default()
         };
-        send.write_all(&wire::encode_request(&req)).await.map_err(|e| format!("send: {e}"))?;
+        send.write_all(&wire::encode_request(&req))
+            .await
+            .map_err(|e| format!("send: {e}"))?;
         send.finish().map_err(|e| format!("finish: {e}"))?;
 
         let (resp, _) = read_response(&mut recv).await?;
@@ -489,8 +492,7 @@ impl crate::traits::BlobClient for IrohBlossomClient {
                 .descriptor
                 .ok_or_else(|| "missing descriptor".to_string())
                 .and_then(|v| {
-                    serde_json::from_value::<LockRecord>(v)
-                        .map_err(|e| format!("parse lock: {e}"))
+                    serde_json::from_value::<LockRecord>(v).map_err(|e| format!("parse lock: {e}"))
                 }),
             Status::NotFound => Err("lock not found".to_string()),
             Status::Forbidden => Err(resp.error.clone()),
@@ -518,17 +520,23 @@ impl crate::traits::BlobClient for IrohBlossomClient {
         let conn = self.connect(addr.clone()).await?;
         let (mut send, mut recv) = conn.open_bi().await.map_err(|e| format!("open_bi: {e}"))?;
 
-        send.write_all(&wire::encode_request(&req)).await.map_err(|e| format!("send: {e}"))?;
+        send.write_all(&wire::encode_request(&req))
+            .await
+            .map_err(|e| format!("send: {e}"))?;
         send.finish().map_err(|e| format!("finish: {e}"))?;
 
         let (resp, _) = read_response(&mut recv).await?;
         match resp.status {
             Status::Ok => {
-                let desc = resp.descriptor.ok_or_else(|| "missing descriptor".to_string())?;
+                let desc = resp
+                    .descriptor
+                    .ok_or_else(|| "missing descriptor".to_string())?;
                 let locks: Vec<LockRecord> = desc
                     .get("locks")
                     .ok_or_else(|| "missing locks field".to_string())
-                    .and_then(|v| serde_json::from_value(v.clone()).map_err(|e| format!("parse: {e}")))?;
+                    .and_then(|v| {
+                        serde_json::from_value(v.clone()).map_err(|e| format!("parse: {e}"))
+                    })?;
                 let next_cursor = desc
                     .get("next_cursor")
                     .and_then(|v| v.as_str())
@@ -562,7 +570,9 @@ impl crate::traits::BlobClient for IrohBlossomClient {
             limit: limit.unwrap_or(0),
             ..Default::default()
         };
-        send.write_all(&wire::encode_request(&req)).await.map_err(|e| format!("send: {e}"))?;
+        send.write_all(&wire::encode_request(&req))
+            .await
+            .map_err(|e| format!("send: {e}"))?;
         send.finish().map_err(|e| format!("finish: {e}"))?;
 
         let (resp, _) = read_response(&mut recv).await?;
@@ -570,9 +580,7 @@ impl crate::traits::BlobClient for IrohBlossomClient {
             Status::Ok => resp
                 .descriptor
                 .ok_or_else(|| "missing descriptor".to_string())
-                .and_then(|v| {
-                    serde_json::from_value(v).map_err(|e| format!("parse verify: {e}"))
-                }),
+                .and_then(|v| serde_json::from_value(v).map_err(|e| format!("parse verify: {e}"))),
             Status::NotFound => Err("lock support not configured".to_string()),
             Status::Unauthorized => Err("unauthorized".to_string()),
             Status::Error => Err(resp.error.clone()),

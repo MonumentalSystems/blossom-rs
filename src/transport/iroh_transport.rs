@@ -196,8 +196,6 @@ fn verify_auth(auth_header: &str, op: &Op) -> Result<String, String> {
         Op::Head => "get",
         Op::LockCreate | Op::LockDelete | Op::LockList | Op::LockVerify => "lock",
     };
-        Op::LockCreate | Op::LockDelete | Op::LockList | Op::LockVerify => "lock",
-    };
 
     match event.kind {
         24242 => verify_blossom_auth(&event, Some(action)).map_err(|e| e.to_string())?,
@@ -653,11 +651,7 @@ async fn handle_lock_delete(
     }
 }
 
-async fn handle_lock_list(
-    send: &mut iroh::endpoint::SendStream,
-    req: &Request,
-    state: &IrohState,
-) {
+async fn handle_lock_list(send: &mut iroh::endpoint::SendStream, req: &Request, state: &IrohState) {
     let lock_db = match state.lock_db.as_ref() {
         Some(db) => db,
         None => {
@@ -676,8 +670,16 @@ async fn handle_lock_list(
     let filters = LockFilters {
         path: None,
         id: None,
-        cursor: if req.cursor.is_empty() { None } else { Some(req.cursor.clone()) },
-        limit: if req.limit == 0 { None } else { Some(req.limit) },
+        cursor: if req.cursor.is_empty() {
+            None
+        } else {
+            Some(req.cursor.clone())
+        },
+        limit: if req.limit == 0 {
+            None
+        } else {
+            Some(req.limit)
+        },
     };
 
     match lock_db.list_locks(&req.repo_id, &filters) {
@@ -747,8 +749,16 @@ async fn handle_lock_verify(
     let filters = LockFilters {
         path: None,
         id: None,
-        cursor: if req.cursor.is_empty() { None } else { Some(req.cursor.clone()) },
-        limit: if req.limit == 0 { None } else { Some(req.limit) },
+        cursor: if req.cursor.is_empty() {
+            None
+        } else {
+            Some(req.cursor.clone())
+        },
+        limit: if req.limit == 0 {
+            None
+        } else {
+            Some(req.limit)
+        },
     };
 
     match lock_db.list_locks(&req.repo_id, &filters) {
