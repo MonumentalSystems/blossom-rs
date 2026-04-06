@@ -132,6 +132,12 @@ mod tests {
             auth: "Nostr abc123".into(),
             content_type: String::new(),
             body_len: 0,
+            repo_id: String::new(),
+            lock_id: String::new(),
+            lock_path: String::new(),
+            force: false,
+            cursor: String::new(),
+            limit: 0,
         };
         let encoded = encode_request(&req);
         assert!(encoded.ends_with(b"\n"));
@@ -166,6 +172,12 @@ mod tests {
             auth: "Nostr xyz".into(),
             content_type: "application/octet-stream".into(),
             body_len: 5000,
+            repo_id: String::new(),
+            lock_id: String::new(),
+            lock_path: String::new(),
+            force: false,
+            cursor: String::new(),
+            limit: 0,
         };
         let encoded = encode_request(&req);
         let (decoded, _): (Request, usize) = decode_line(&encoded).unwrap();
@@ -198,6 +210,12 @@ mod tests {
             auth: "Nostr list_auth".into(),
             content_type: String::new(),
             body_len: 0,
+            repo_id: String::new(),
+            lock_id: String::new(),
+            lock_path: String::new(),
+            force: false,
+            cursor: String::new(),
+            limit: 0,
         };
         let encoded = encode_request(&req);
         let (decoded, _): (Request, usize) = decode_line(&encoded).unwrap();
