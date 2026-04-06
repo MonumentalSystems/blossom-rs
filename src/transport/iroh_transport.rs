@@ -27,6 +27,10 @@ pub struct IrohState {
     pub database: Box<dyn BlobDatabase>,
     pub access: Box<dyn AccessControl>,
     pub base_url: String,
+    /// Maximum upload size in bytes. `None` = no limit.
+    pub max_upload_size: Option<u64>,
+    /// Require auth for uploads.
+    pub require_auth: bool,
 }
 
 impl std::fmt::Debug for IrohState {
@@ -257,6 +261,19 @@ async fn handle_upload(
         return;
     }
 
+    // Require auth if configured.
+    if state.require_auth && auth_pubkey.is_none() {
+        let resp = Response {
+            status: Status::Unauthorized,
+            body_len: 0,
+            content_type: String::new(),
+            error: "auth required for upload".into(),
+            descriptor: None,
+        };
+        let _ = send.write_all(&wire::encode_response(&resp)).await;
+        return;
+    }
+
     let pubkey = auth_pubkey.unwrap_or_else(|| "anonymous".to_string());
 
     // Check upload permission.
@@ -273,6 +290,35 @@ async fn handle_upload(
     }
 
     let size = data.len() as u64;
+
+    // Check max upload size.
+    if let Some(max) = state.max_upload_size {
+        if size > max {
+            let resp = Response {
+                status: Status::Error,
+                body_len: 0,
+                content_type: String::new(),
+                error: format!("exceeds max upload size of {max} bytes"),
+                descriptor: None,
+            };
+            let _ = send.write_all(&wire::encode_response(&resp)).await;
+            return;
+        }
+    }
+
+    // Check quota.
+    if let Err(e) = state.database.check_quota(&pubkey, size) {
+        let resp = Response {
+            status: Status::Forbidden,
+            body_len: 0,
+            content_type: String::new(),
+            error: e.to_string(),
+            descriptor: None,
+        };
+        let _ = send.write_all(&wire::encode_response(&resp)).await;
+        return;
+    }
+
     let mut cursor = std::io::Cursor::new(data);
     let descriptor = match state
         .backend

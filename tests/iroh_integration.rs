@@ -26,6 +26,8 @@ async fn spawn_iroh_server() -> (EndpointAddr, Router) {
         database: Box::new(MemoryDatabase::new()),
         access: Box::new(OpenAccess),
         base_url: "iroh://test".to_string(),
+        max_upload_size: None,
+        require_auth: false,
     }));
 
     let endpoint = iroh::Endpoint::builder(N0)
