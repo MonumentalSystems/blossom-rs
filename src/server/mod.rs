@@ -502,16 +502,28 @@ async fn handle_get_blob(
 async fn handle_head_blob(
     State(state): State<SharedState>,
     Path(sha256): Path<String>,
-) -> StatusCode {
+) -> impl IntoResponse {
     let sha256 = sha256.split('.').next().unwrap_or(&sha256).to_string();
     if !is_valid_sha256(&sha256) {
-        return StatusCode::BAD_REQUEST;
+        return StatusCode::BAD_REQUEST.into_response();
     }
     let s = state.lock().await;
-    if s.backend.exists(&sha256) {
-        StatusCode::OK
-    } else {
-        StatusCode::NOT_FOUND
+    match s.backend.get(&sha256) {
+        Some(data) => {
+            let size = data.len();
+            (
+                StatusCode::OK,
+                [
+                    (axum::http::header::CONTENT_LENGTH, size.to_string()),
+                    (
+                        axum::http::header::CONTENT_TYPE,
+                        "application/octet-stream".to_string(),
+                    ),
+                ],
+            )
+                .into_response()
+        }
+        None => StatusCode::NOT_FOUND.into_response(),
     }
 }
 

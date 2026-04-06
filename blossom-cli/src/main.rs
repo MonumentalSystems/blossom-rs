@@ -41,6 +41,15 @@ enum Command {
     Upload {
         /// Path to the file to upload.
         file: PathBuf,
+        /// Override Content-Type (default: auto-detect from file extension).
+        #[arg(long)]
+        content_type: Option<String>,
+    },
+    /// Upload a file with server-side media processing (BUD-05).
+    /// Returns optimized blob with blurhash, dimensions, and perceptual hash.
+    Media {
+        /// Path to the file to upload.
+        file: PathBuf,
     },
     /// Download a blob by SHA256 hash.
     Download {
@@ -76,10 +85,38 @@ enum Command {
     Status,
     /// Generate a new keypair.
     Keygen,
+    /// Admin commands (requires auth + admin access).
+    #[command(subcommand)]
+    Admin(AdminCommand),
     /// Resolve a PKARR public key to blossom endpoints.
     Resolve {
         /// PKARR public key (z-base-32, e.g., pk:z...).
         public_key: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum AdminCommand {
+    /// Get server statistics.
+    Stats,
+    /// Get user info and quota.
+    GetUser {
+        /// Hex-encoded public key.
+        pubkey: String,
+    },
+    /// Set user quota.
+    SetQuota {
+        /// Hex-encoded public key.
+        pubkey: String,
+        /// Quota in bytes (omit for unlimited).
+        quota_bytes: Option<u64>,
+    },
+    /// List blob count and total size.
+    ListBlobs,
+    /// Admin delete a blob (no ownership check).
+    DeleteBlob {
+        /// SHA256 hash of the blob.
+        sha256: String,
     },
 }
 
@@ -175,9 +212,10 @@ async fn run(args: Args) -> Result<(), String> {
             Ok(())
         }
 
-        Command::Upload { file } => {
+        Command::Upload { file, content_type } => {
             let signer = get_signer(&args.key)?;
             let data = std::fs::read(&file).map_err(|e| format!("read {}: {e}", file.display()))?;
+            let mime = content_type.unwrap_or_else(|| mime_from_path(&file));
 
             let desc = if is_iroh_server(&args.server) {
                 let addr = parse_iroh_addr(&args.server)?;
@@ -185,7 +223,6 @@ async fn run(args: Args) -> Result<(), String> {
                     make_iroh_client(Signer::from_secret_hex(&signer.secret_key_hex())?).await?;
                 client.upload(addr, &data).await?
             } else {
-                let mime = mime_from_path(&file);
                 let client = BlossomClient::new(vec![args.server], signer);
                 client.upload(&data, &mime).await?
             };
@@ -351,6 +388,130 @@ async fn run(args: Args) -> Result<(), String> {
             } else {
                 let text = resp.text().await.unwrap_or_default();
                 return Err(format!("status failed: {text}"));
+            }
+            Ok(())
+        }
+
+        Command::Media { file } => {
+            let signer = get_signer(&args.key)?;
+            let data = std::fs::read(&file).map_err(|e| format!("read {}: {e}", file.display()))?;
+            let mime = mime_from_path(&file);
+
+            let http = reqwest::Client::new();
+            let auth = build_blossom_auth(&signer, "upload", None, None, "");
+            let auth_header = auth_header_value(&auth);
+
+            let url = format!("{}/media", args.server.trim_end_matches('/'));
+            let resp = http
+                .put(&url)
+                .header("Authorization", &auth_header)
+                .header("Content-Type", &mime)
+                .body(data)
+                .send()
+                .await
+                .map_err(|e| format!("request: {e}"))?;
+
+            if resp.status().is_success() {
+                let body: serde_json::Value =
+                    resp.json().await.map_err(|e| format!("parse: {e}"))?;
+                print_output(&args.format, &body);
+            } else {
+                let text = resp.text().await.unwrap_or_default();
+                return Err(format!("media upload failed: {text}"));
+            }
+            Ok(())
+        }
+
+        Command::Admin(admin_cmd) => {
+            let signer = get_signer(&args.key)?;
+            let http = reqwest::Client::new();
+            let auth = build_blossom_auth(&signer, "admin", None, None, "");
+            let auth_header = auth_header_value(&auth);
+            let base = args.server.trim_end_matches('/');
+
+            match admin_cmd {
+                AdminCommand::Stats => {
+                    let resp = http
+                        .get(format!("{}/admin/stats", base))
+                        .header("Authorization", &auth_header)
+                        .send()
+                        .await
+                        .map_err(|e| format!("request: {e}"))?;
+                    if resp.status().is_success() {
+                        let body: serde_json::Value =
+                            resp.json().await.map_err(|e| format!("parse: {e}"))?;
+                        print_output(&args.format, &body);
+                    } else {
+                        let text = resp.text().await.unwrap_or_default();
+                        return Err(format!("admin stats failed: {text}"));
+                    }
+                }
+                AdminCommand::GetUser { pubkey } => {
+                    let resp = http
+                        .get(format!("{}/admin/users/{}", base, pubkey))
+                        .header("Authorization", &auth_header)
+                        .send()
+                        .await
+                        .map_err(|e| format!("request: {e}"))?;
+                    if resp.status().is_success() {
+                        let body: serde_json::Value =
+                            resp.json().await.map_err(|e| format!("parse: {e}"))?;
+                        print_output(&args.format, &body);
+                    } else {
+                        let text = resp.text().await.unwrap_or_default();
+                        return Err(format!("admin get-user failed: {text}"));
+                    }
+                }
+                AdminCommand::SetQuota {
+                    pubkey,
+                    quota_bytes,
+                } => {
+                    let resp = http
+                        .put(format!("{}/admin/users/{}/quota", base, pubkey))
+                        .header("Authorization", &auth_header)
+                        .json(&serde_json::json!({"quota_bytes": quota_bytes}))
+                        .send()
+                        .await
+                        .map_err(|e| format!("request: {e}"))?;
+                    if resp.status().is_success() {
+                        let body: serde_json::Value =
+                            resp.json().await.map_err(|e| format!("parse: {e}"))?;
+                        print_output(&args.format, &body);
+                    } else {
+                        let text = resp.text().await.unwrap_or_default();
+                        return Err(format!("admin set-quota failed: {text}"));
+                    }
+                }
+                AdminCommand::ListBlobs => {
+                    let resp = http
+                        .get(format!("{}/admin/blobs", base))
+                        .header("Authorization", &auth_header)
+                        .send()
+                        .await
+                        .map_err(|e| format!("request: {e}"))?;
+                    if resp.status().is_success() {
+                        let body: serde_json::Value =
+                            resp.json().await.map_err(|e| format!("parse: {e}"))?;
+                        print_output(&args.format, &body);
+                    } else {
+                        let text = resp.text().await.unwrap_or_default();
+                        return Err(format!("admin list-blobs failed: {text}"));
+                    }
+                }
+                AdminCommand::DeleteBlob { sha256 } => {
+                    let resp = http
+                        .delete(format!("{}/admin/blobs/{}", base, sha256))
+                        .header("Authorization", &auth_header)
+                        .send()
+                        .await
+                        .map_err(|e| format!("request: {e}"))?;
+                    if resp.status().is_success() {
+                        println!("deleted {sha256}");
+                    } else {
+                        let text = resp.text().await.unwrap_or_default();
+                        return Err(format!("admin delete failed: {text}"));
+                    }
+                }
             }
             Ok(())
         }

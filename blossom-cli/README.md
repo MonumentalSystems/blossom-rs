@@ -25,13 +25,15 @@ blossom-cli <COMMAND>
 
 Commands:
   keygen                     Generate a new BIP-340 keypair
-  upload <FILE>              Upload a file to the server
+  upload <FILE> [--content-type <MIME>]  Upload a file (auto-detects MIME type)
+  media <FILE>               Upload with server-side processing (BUD-05)
   download <SHA256> [OUTPUT] Download a blob (to file or stdout)
   exists <SHA256>            Check if a blob exists (exit 0 = yes, 1 = no)
   delete <SHA256> [--yes]    Delete a blob (requires auth, prompts for confirmation)
   list <PUBKEY>              List blobs uploaded by a pubkey
   mirror <URL>               Mirror a remote blob to the server (requires auth)
   status                     Get server status
+  admin <SUBCOMMAND>         Admin commands (stats, get-user, set-quota, list-blobs, delete-blob)
   resolve <PUBLIC_KEY>       Resolve a PKARR public key to blossom endpoints
 
 Global Options:
