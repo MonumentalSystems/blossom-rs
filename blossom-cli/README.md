@@ -28,14 +28,16 @@ Commands:
   upload <FILE>              Upload a file to the server
   download <SHA256> [OUTPUT] Download a blob (to file or stdout)
   exists <SHA256>            Check if a blob exists (exit 0 = yes, 1 = no)
-  delete <SHA256>            Delete a blob (requires auth)
+  delete <SHA256> [--yes]    Delete a blob (requires auth, prompts for confirmation)
   list <PUBKEY>              List blobs uploaded by a pubkey
   mirror <URL>               Mirror a remote blob to the server (requires auth)
   status                     Get server status
+  resolve <PUBLIC_KEY>       Resolve a PKARR public key to blossom endpoints
 
 Global Options:
-  -s, --server <URL>   Server URL [default: http://localhost:3000]
-  -k, --key <KEY>      Secret key — hex or nsec1 bech32 [env: BLOSSOM_SECRET_KEY]
+  -s, --server <URL>     Server URL or iroh://node-id [default: http://localhost:3000]
+  -k, --key <KEY>        Secret key — hex or nsec1 bech32 [env: BLOSSOM_SECRET_KEY]
+  -f, --format <FORMAT>  Output format: json or text [default: text]
 ```
 
 ## Key Formats

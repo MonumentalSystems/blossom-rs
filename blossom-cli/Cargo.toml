@@ -1,6 +1,6 @@
 [package]
 name = "blossom-cli"
-version = "0.1.2"
+version = "0.1.4"
 edition = "2021"
 description = "CLI client for Blossom blob storage — upload, download, mirror, keygen with BIP-340 Nostr auth"
 license = "MIT"
@@ -10,7 +10,7 @@ keywords = ["blossom", "nostr", "cli", "blob", "storage"]
 categories = ["command-line-utilities"]
 
 [dependencies]
-blossom-rs = { path = "..", version = "0.1.2", features = ["client", "iroh-transport"] }
+blossom-rs = { path = "..", version = "0.1.4", features = ["client", "iroh-transport"] }
 clap = { version = "4", features = ["derive", "env"] }
 tokio = { version = "1", features = ["full"] }
 serde_json = "1.0"
