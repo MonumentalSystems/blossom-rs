@@ -42,7 +42,9 @@
 //! | `otel.kind` | Span kind (server/client) |
 
 #[cfg(feature = "otel")]
-use opentelemetry::trace::TracerProvider;
+use opentelemetry::trace::TracerProvider as _;
+#[cfg(feature = "otel")]
+use opentelemetry::KeyValue;
 #[cfg(feature = "otel")]
 use opentelemetry_sdk::runtime::Tokio;
 #[cfg(feature = "otel")]
@@ -52,7 +54,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 /// lifetime of your application.
 #[cfg(feature = "otel")]
 pub struct TracingGuard {
-    _provider: opentelemetry_sdk::trace::SdkTracerProvider,
+    _provider: opentelemetry_sdk::trace::TracerProvider,
 }
 
 #[cfg(feature = "otel")]
@@ -80,13 +82,12 @@ pub fn init_tracing(
         .with_tonic()
         .build()?;
 
-    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+    let provider = opentelemetry_sdk::trace::TracerProvider::builder()
         .with_batch_exporter(exporter, Tokio)
-        .with_resource(
-            opentelemetry_sdk::Resource::builder()
-                .with_service_name(service_name.to_string())
-                .build(),
-        )
+        .with_resource(opentelemetry_sdk::Resource::new(vec![KeyValue::new(
+            "service.name",
+            service_name.to_string(),
+        )]))
         .build();
 
     let tracer = provider.tracer(service_name.to_string());

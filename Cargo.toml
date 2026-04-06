@@ -42,7 +42,7 @@ iroh-transport = ["dep:iroh", "dep:anyhow"]
 pkarr-discovery = ["dep:pkarr", "iroh-transport"]
 
 # Observability — opt-in OTEL export support for consumers
-otel = ["dep:tracing-opentelemetry", "dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
+otel = ["dep:tracing-opentelemetry", "dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-subscriber"]
 
 [dependencies]
 # Crypto
@@ -92,6 +92,7 @@ candle-transformers = { version = "0.8", optional = true }
 
 # OpenTelemetry (optional)
 tracing-opentelemetry = { version = "0.28", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"], optional = true }
 opentelemetry = { version = "0.27", optional = true }
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"], optional = true }
 opentelemetry-otlp = { version = "0.27", optional = true }
