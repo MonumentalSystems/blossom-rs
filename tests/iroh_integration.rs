@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use blossom_rs::access::OpenAccess;
 use blossom_rs::auth::Signer;
+use blossom_rs::BlossomSigner;
 use blossom_rs::db::MemoryDatabase;
 use blossom_rs::protocol::sha256_hex;
 use blossom_rs::storage::MemoryBackend;
@@ -143,4 +144,30 @@ async fn test_iroh_sha256_integrity() {
 
     let downloaded = client.download(server_addr, &expected).await.unwrap();
     assert_eq!(sha256_hex(&downloaded), expected);
+}
+
+#[tokio::test]
+async fn test_iroh_list() {
+    let (server_addr, _router) = spawn_iroh_server().await;
+    let signer = Signer::generate();
+    let pubkey = signer.public_key_hex();
+    let client = make_client(signer).await;
+
+    // Upload two blobs.
+    let data1 = b"list test blob one";
+    let data2 = b"list test blob two";
+    let desc1 = client.upload(server_addr.clone(), data1).await.unwrap();
+    let desc2 = client.upload(server_addr.clone(), data2).await.unwrap();
+
+    // List by pubkey.
+    let list = client.list(server_addr.clone(), &pubkey).await.unwrap();
+    assert_eq!(list.len(), 2);
+
+    let hashes: Vec<&str> = list.iter().map(|d| d.sha256.as_str()).collect();
+    assert!(hashes.contains(&desc1.sha256.as_str()));
+    assert!(hashes.contains(&desc2.sha256.as_str()));
+
+    // List for unknown pubkey returns empty.
+    let empty = client.list(server_addr, &"0".repeat(64)).await.unwrap();
+    assert!(empty.is_empty());
 }

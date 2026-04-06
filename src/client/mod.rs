@@ -207,6 +207,89 @@ impl BlossomClient {
         }
         Ok(false)
     }
+
+    /// Delete a blob by SHA256 hash (requires auth).
+    ///
+    /// Returns `Ok(true)` if deleted, `Ok(false)` if not found.
+    #[instrument(name = "blossom.client.delete", skip_all, fields(blob.sha256 = %sha256))]
+    pub async fn delete(&self, sha256: &str) -> Result<bool, String> {
+        let auth_event = build_blossom_auth(self.signer.as_ref(), "delete", None, None, "");
+        let auth_header = auth_header_value(&auth_event);
+
+        for server in &self.servers {
+            let url = format!("{}/{}", server.trim_end_matches('/'), sha256);
+            let result = self
+                .http
+                .delete(&url)
+                .header("Authorization", &auth_header)
+                .send()
+                .await;
+
+            match result {
+                Ok(resp) if resp.status().is_success() => {
+                    info!(blob.sha256 = %sha256, server.url = %server, "blob deleted");
+                    return Ok(true);
+                }
+                Ok(resp) if resp.status().as_u16() == 404 => return Ok(false),
+                Ok(resp) => {
+                    warn!(
+                        server.url = %server,
+                        http.status_code = resp.status().as_u16(),
+                        "delete failed, trying next server"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    warn!(
+                        server.url = %server,
+                        error.message = %e,
+                        "delete request error, trying next server"
+                    );
+                    continue;
+                }
+            }
+        }
+
+        Err("all Blossom servers failed for delete".into())
+    }
+
+    /// List blobs uploaded by a pubkey.
+    #[instrument(name = "blossom.client.list", skip_all, fields(list.pubkey = %pubkey))]
+    pub async fn list(&self, pubkey: &str) -> Result<Vec<BlobDescriptor>, String> {
+        for server in &self.servers {
+            let url = format!("{}/list/{}", server.trim_end_matches('/'), pubkey);
+            let result = self.http.get(&url).send().await;
+
+            match result {
+                Ok(resp) if resp.status().is_success() => {
+                    let descs: Vec<BlobDescriptor> = resp
+                        .json()
+                        .await
+                        .map_err(|e| format!("parse list response: {e}"))?;
+                    info!(list.pubkey = %pubkey, server.url = %server, "list retrieved");
+                    return Ok(descs);
+                }
+                Ok(resp) => {
+                    warn!(
+                        server.url = %server,
+                        http.status_code = resp.status().as_u16(),
+                        "list failed, trying next server"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    warn!(
+                        server.url = %server,
+                        error.message = %e,
+                        "list request error, trying next server"
+                    );
+                    continue;
+                }
+            }
+        }
+
+        Err("all Blossom servers failed for list".into())
+    }
 }
 
 #[cfg(test)]

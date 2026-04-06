@@ -224,6 +224,52 @@ impl IrohBlossomClient {
         let (resp, _leftover) = read_response(&mut recv).await?;
         Ok(resp.status == Status::Ok)
     }
+
+    /// List blobs uploaded by a pubkey on a remote peer.
+    #[instrument(name = "blossom.iroh.client.list", skip_all, fields(list.pubkey = %pubkey))]
+    pub async fn list(
+        &self,
+        addr: EndpointAddr,
+        pubkey: &str,
+    ) -> Result<Vec<BlobDescriptor>, String> {
+        let conn = self.connect(addr).await?;
+        let (mut send, mut recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| format!("open stream: {e}"))?;
+
+        let req = Request {
+            op: Op::List,
+            sha256: String::new(),
+            pubkey: pubkey.to_string(),
+            auth: String::new(),
+            content_type: String::new(),
+            body_len: 0,
+        };
+        send.write_all(&wire::encode_request(&req))
+            .await
+            .map_err(|e| format!("write: {e}"))?;
+        send.finish().map_err(|e| format!("finish: {e}"))?;
+
+        let (resp, leftover) = read_response(&mut recv).await?;
+        if resp.status != Status::Ok {
+            return Err(format!("list failed: {}", resp.error));
+        }
+
+        let mut data = leftover;
+        let remaining = (resp.body_len as usize).saturating_sub(data.len());
+        if remaining > 0 {
+            let mut rest = vec![0u8; remaining];
+            recv.read_exact(&mut rest)
+                .await
+                .map_err(|e| format!("read body: {e}"))?;
+            data.extend_from_slice(&rest);
+        }
+        data.truncate(resp.body_len as usize);
+
+        info!(list.pubkey = %pubkey, "list via iroh");
+        serde_json::from_slice(&data).map_err(|e| format!("parse list: {e}"))
+    }
 }
 
 /// Read a response from a QUIC recv stream.
