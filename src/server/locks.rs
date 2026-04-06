@@ -1,4 +1,4 @@
-//! LFS Lock API endpoints (BUD-08).
+//! LFS Lock API endpoints (BUD-19).
 //!
 //! Implements the Git LFS lock protocol over HTTP:
 //! - `POST /lfs/{repo_id}/locks` — create lock

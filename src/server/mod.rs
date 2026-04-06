@@ -180,7 +180,7 @@ impl BlobServerBuilder {
         self
     }
 
-    /// Set a lock database for LFS file locking (BUD-08).
+    /// Set a lock database for LFS file locking (BUD-19).
     /// When set, lock API endpoints are mounted. When unset, lock endpoints
     /// return 404 (Git LFS treats this as "locking unsupported").
     pub fn lock_database(mut self, db: impl LockDatabase + 'static) -> Self {

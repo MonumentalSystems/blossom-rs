@@ -1,4 +1,4 @@
-//! LFS file locking database (BUD-08).
+//! LFS file locking database (BUD-19).
 //!
 //! Provides lock storage for Git LFS file locking support. Locks are scoped
 //! by repo ID and owned by Nostr pubkeys. Includes an in-memory

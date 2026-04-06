@@ -1,4 +1,4 @@
-# BUD-08: LFS File Locking
+# BUD-19: LFS File Locking
 
 **Status:** Draft
 **Version:** 1.0

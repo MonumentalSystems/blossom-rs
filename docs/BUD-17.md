@@ -1,4 +1,4 @@
-# BUD-07: Chunked Blob Storage with Merkle Integrity
+# BUD-17: Chunked Blob Storage with Merkle Integrity
 
 **Status:** Draft
 **Version:** 1.0
@@ -143,8 +143,8 @@ A client MAY verify integrity by:
 
 ## Backward Compatibility
 
-Servers that do not implement BUD-07 treat manifests as ordinary blobs.
-Clients that do not implement BUD-07 download the manifest JSON instead
+Servers that do not implement BUD-17 treat manifests as ordinary blobs.
+Clients that do not implement BUD-17 download the manifest JSON instead
 of the original file — they will see a JSON document rather than binary
 data. Implementors SHOULD check for the manifest content type or version
 field before attempting to use the data as a file.
