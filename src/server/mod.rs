@@ -932,13 +932,20 @@ async fn handle_upload_requirements(State(state): State<SharedState>) -> impl In
 #[instrument(name = "blossom.status", skip_all)]
 async fn handle_status(State(state): State<SharedState>) -> impl IntoResponse {
     let s = state.lock().await;
-    Json(serde_json::json!({
+    let mut status = serde_json::json!({
         "blobs": s.backend.len(),
         "total_bytes": s.backend.total_bytes(),
         "uploads": s.database.upload_count(),
         "users": s.database.user_count(),
         "tracked_stats": s.stats.tracked_count(),
-    }))
+    });
+    // Include build integrity info if available.
+    let integrity = crate::integrity::runtime_integrity_info(
+        option_env!("BLOSSOM_SOURCE_BUILD_HASH"),
+        option_env!("BLOSSOM_BUILD_TARGET"),
+    );
+    status["integrity"] = serde_json::to_value(&integrity).unwrap_or_default();
+    Json(status)
 }
 
 // ---------------------------------------------------------------------------
