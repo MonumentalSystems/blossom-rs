@@ -3,6 +3,8 @@
 //! Uploads/downloads content-addressed blobs with BIP-340 Schnorr
 //! authorization and multi-server failover.
 
+pub mod batch;
+
 use crate::auth::{auth_header_value, build_blossom_auth, BlossomSigner};
 use crate::protocol::{sha256_hex, BlobDescriptor, STREAM_CHUNK_SIZE};
 use tracing::{info, instrument, warn};
