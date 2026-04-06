@@ -76,6 +76,11 @@ enum Command {
     Status,
     /// Generate a new keypair.
     Keygen,
+    /// Resolve a PKARR public key to blossom endpoints.
+    Resolve {
+        /// PKARR public key (z-base-32, e.g., pk:z...).
+        public_key: String,
+    },
 }
 
 /// Decode a secret key from hex or nsec1 bech32 format.
@@ -347,6 +352,26 @@ async fn run(args: Args) -> Result<(), String> {
                 let text = resp.text().await.unwrap_or_default();
                 return Err(format!("status failed: {text}"));
             }
+            Ok(())
+        }
+
+        Command::Resolve { public_key } => {
+            use blossom_rs::transport::pkarr_discovery::resolve_blossom_endpoints;
+
+            let pk_str = public_key.strip_prefix("pk:").unwrap_or(&public_key);
+            let pk: pkarr::PublicKey = pk_str
+                .parse()
+                .map_err(|e| format!("invalid pkarr public key: {e}"))?;
+
+            let (http_url, iroh_node_id) = resolve_blossom_endpoints(&pk).await?;
+
+            let result = serde_json::json!({
+                "public_key": pk.to_string(),
+                "http_url": http_url,
+                "iroh_node_id": iroh_node_id,
+                "iroh_url": iroh_node_id.as_ref().map(|id| format!("iroh://{}", id)),
+            });
+            print_output(&args.format, &result);
             Ok(())
         }
     }

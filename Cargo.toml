@@ -3,7 +3,7 @@ members = [".", "blossom-server", "blossom-cli"]
 
 [package]
 name = "blossom-rs"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "Full-featured Blossom (BUD-01) blob storage library for Rust — embeddable server, async client, BIP-340 Nostr auth"
 license = "MIT"
@@ -36,6 +36,9 @@ labels = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers"]
 
 # P2P transport via iroh QUIC
 iroh-transport = ["dep:iroh", "dep:anyhow"]
+
+# PKARR discovery — publish/resolve blossom endpoints via Mainline DHT
+pkarr-discovery = ["dep:pkarr", "iroh-transport"]
 
 # Observability — opt-in OTEL export support for consumers
 otel = ["dep:tracing-opentelemetry", "dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
@@ -94,6 +97,9 @@ opentelemetry-otlp = { version = "0.27", optional = true }
 # P2P transport (optional)
 iroh = { version = "0.97", optional = true }
 anyhow = { version = "1", optional = true }
+
+# PKARR discovery (optional)
+pkarr = { version = "6.0.0-rc.0", default-features = false, features = ["relays", "signed_packet"], optional = true }
 
 # Statistics
 dashmap = "6"

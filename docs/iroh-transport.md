@@ -194,3 +194,57 @@ functions as the HTTP handler — zero duplication.
 
 4. **Feature flag** — `iroh-transport` is opt-in. Without it, the transport module
    only contains the wire protocol codec (no iroh dependency).
+
+## PKARR Discovery
+
+Enable with `features = ["pkarr-discovery"]` (implies `iroh-transport`).
+
+Uses the **same Ed25519 secret key** as iroh — one keypair, dual identity:
+
+```mermaid
+graph LR
+    SK[Ed25519 Secret Key<br/>32 bytes] --> IK[iroh Node ID]
+    SK --> PK[pkarr Public Key]
+    IK --> |"iroh://<node-id>"| QUIC[QUIC P2P]
+    PK --> |"pk:z<pubkey>"| DHT[Relay / DHT]
+    DHT --> |resolves to| IK
+    DHT --> |resolves to| HTTP["https://blobs.example.com"]
+```
+
+### Published DNS records
+
+```
+_blossom  TXT  "https://blobs.example.com"
+_iroh     TXT  "<iroh-node-id>"
+```
+
+### Usage
+
+```rust
+use blossom_rs::transport::pkarr_discovery::{PkarrPublisher, PkarrConfig};
+
+let publisher = PkarrPublisher::new(&secret_key_bytes, PkarrConfig {
+    http_url: Some("https://blobs.example.com".into()),
+    iroh_node_id: Some(node_id.to_string()),
+    ..Default::default()
+});
+
+// Publish once
+publisher.publish().await?;
+
+// Or spawn background republish loop (every 60min)
+Arc::new(publisher).spawn_republish_loop();
+
+// Resolve someone else's endpoints
+let pk: pkarr::PublicKey = "z...".parse()?;
+let (http_url, iroh_id) = resolve_blossom_endpoints(&pk).await?;
+```
+
+### DHT vs Relay
+
+Currently uses **pkarr relays** (HTTP-based) rather than direct Mainline DHT.
+The relays forward records to DHT peers, so records are still globally
+discoverable. Direct DHT support (`pkarr` `dht` feature) is blocked by a
+transitive `digest` crate version conflict between pkarr's `mainline` dep
+and iroh 0.97. This is a one-line fix once both crates align on the same
+`digest` pre-release version.

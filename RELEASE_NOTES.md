@@ -1,5 +1,22 @@
 # Release Notes
 
+## v0.1.5
+
+### New Features
+
+- **PKARR discovery** merged to master (`pkarr-discovery` feature flag). Publish blossom endpoints (`_blossom` + `_iroh` TXT records) to Mainline DHT via PKARR relays. Unified Ed25519 identity with iroh transport.
+- **`blossom-cli resolve`** — Resolve a PKARR public key (`pk:z<base32>`) to HTTP URL + iroh node ID.
+- **Server `--pkarr` flag** — Auto-publish endpoints with background republish loop.
+
+### Improvements
+
+- **CLI integration tests** — 15 new tests covering all commands, key formats, output formatting, webhook delivery, admin endpoints, error handling.
+- **Unwrap cleanup** — Replaced 8 `serde_json::to_value().unwrap()` calls in HTTP handlers with `to_json_response()` helper (returns 500 instead of panicking).
+- Removed unused imports across test files.
+- 184 total tests.
+
+---
+
 ## v0.1.4
 
 ### New Features

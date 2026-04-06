@@ -13,6 +13,11 @@ cargo run -p blossom-server -- --memory
 
 # Custom bind address and base URL
 cargo run -p blossom-server -- --bind 0.0.0.0:8080 --base-url https://blobs.example.com
+
+# With iroh P2P transport + PKARR discovery
+cargo run -p blossom-server -- --iroh --pkarr
+# Prints: iroh P2P transport enabled — connect with: iroh://<node-id>
+# Prints: PKARR discovery enabled — pk:<public-key>
 ```
 
 ## Options

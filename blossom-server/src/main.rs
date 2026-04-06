@@ -124,6 +124,15 @@ struct Args {
     #[arg(long, default_value = "./iroh_secret.key")]
     iroh_key_file: PathBuf,
 
+    /// Enable PKARR endpoint discovery (requires --iroh).
+    /// Publishes _blossom and _iroh TXT records to PKARR relays.
+    #[arg(long)]
+    pkarr: bool,
+
+    /// PKARR republish interval in seconds.
+    #[arg(long, default_value = "3600")]
+    pkarr_republish_secs: u64,
+
     /// Log level.
     #[arg(long, default_value = "info")]
     log_level: String,
@@ -333,6 +342,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+
+    // Start PKARR endpoint discovery if enabled.
+    if args.pkarr {
+        if !args.iroh {
+            warn!("--pkarr requires --iroh to be enabled; skipping PKARR");
+        } else {
+            // Read the iroh secret key for unified identity.
+            let key_bytes: [u8; 32] = std::fs::read(&args.iroh_key_file)
+                .map_err(|e| format!("read iroh key for pkarr: {e}"))?
+                .try_into()
+                .map_err(|_| "iroh key file must be 32 bytes")?;
+
+            let iroh_key = iroh::SecretKey::from_bytes(&key_bytes);
+            let node_id = iroh_key.public();
+
+            use blossom_rs::transport::pkarr_discovery::{PkarrConfig, PkarrPublisher};
+            let publisher = StdArc::new(PkarrPublisher::new(
+                &key_bytes,
+                PkarrConfig {
+                    http_url: Some(args.base_url.clone()),
+                    iroh_node_id: Some(node_id.to_string()),
+                    republish_interval: std::time::Duration::from_secs(args.pkarr_republish_secs),
+                    ttl: 3600,
+                },
+            ));
+
+            info!(
+                pkarr.public_key = %publisher.public_key(),
+                "PKARR discovery enabled — pk:{}",
+                publisher.public_key(),
+            );
+            publisher.spawn_republish_loop();
+        }
+    }
 
     info!(bind = %args.bind, base_url = %args.base_url, "starting blossom server");
 

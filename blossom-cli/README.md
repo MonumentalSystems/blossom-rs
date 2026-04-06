@@ -81,4 +81,13 @@ blossom-cli list <pubkey-hex>
 
 # Download to stdout and pipe
 blossom-cli -k $KEY download $SHA | sha256sum
+
+# Upload via iroh P2P (no DNS/IP needed)
+blossom-cli -s iroh://<node-id> -k $KEY upload photo.jpg
+
+# Resolve a PKARR public key to endpoints
+blossom-cli resolve pk:z<base32-pubkey>
+
+# JSON output for scripting
+blossom-cli -f json status
 ```
