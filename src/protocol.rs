@@ -137,6 +137,27 @@ pub fn sha256_hex(data: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Stream chunk size for hashing and I/O (256 KB).
+pub const STREAM_CHUNK_SIZE: usize = 256 * 1024;
+
+/// Compute SHA256 incrementally from a reader in 256 KB chunks.
+///
+/// Returns `(hex_hash, bytes_read)`. Never buffers the full content.
+pub fn sha256_stream(reader: &mut dyn std::io::Read) -> std::io::Result<(String, u64)> {
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; STREAM_CHUNK_SIZE];
+    let mut total = 0u64;
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        total += n as u64;
+    }
+    Ok((hex::encode(hasher.finalize()), total))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,6 +190,24 @@ mod tests {
             hash,
             "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
         );
+    }
+
+    #[test]
+    fn test_sha256_stream_matches_hex() {
+        let data = b"streaming hash test with multiple chunks of data that we want to verify";
+        let expected = sha256_hex(data);
+        let mut cursor = std::io::Cursor::new(data);
+        let (hash, size) = sha256_stream(&mut cursor).unwrap();
+        assert_eq!(hash, expected);
+        assert_eq!(size, data.len() as u64);
+    }
+
+    #[test]
+    fn test_sha256_stream_empty() {
+        let mut cursor = std::io::Cursor::new(b"");
+        let (hash, size) = sha256_stream(&mut cursor).unwrap();
+        assert_eq!(hash, sha256_hex(b""));
+        assert_eq!(size, 0);
     }
 
     #[test]
