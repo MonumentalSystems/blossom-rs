@@ -536,3 +536,75 @@ async fn test_concurrent_upload_download() {
         handle.await.unwrap();
     }
 }
+
+// ---------------------------------------------------------------------------
+// Streaming upload tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_streaming_file_upload() {
+    let signer = Signer::generate();
+    let server = BlobServer::new(MemoryBackend::new(), "http://localhost:3000");
+    let url = spawn_server(server).await;
+
+    let client = BlossomClient::new(vec![url], signer);
+
+    // Write a temp file.
+    let tmp_dir =
+        std::env::temp_dir().join(format!("blossom_stream_test_{}", rand::random::<u32>()));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let tmp_file = tmp_dir.join("test_data.bin");
+    let data: Vec<u8> = (0..50_000u32).map(|i| (i % 256) as u8).collect();
+    let expected_hash = sha256_hex(&data);
+    std::fs::write(&tmp_file, &data).unwrap();
+
+    // Upload via streaming.
+    let desc = client
+        .upload_file(&tmp_file, "application/octet-stream")
+        .await
+        .unwrap();
+
+    assert_eq!(desc.sha256, expected_hash);
+    assert_eq!(desc.size, data.len() as u64);
+
+    // Download and verify.
+    let downloaded = client.download(&desc.sha256).await.unwrap();
+    assert_eq!(downloaded, data);
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_batch_upload() {
+    use std::sync::Arc;
+
+    let signer = Signer::generate();
+    let server = BlobServer::new(MemoryBackend::new(), "http://localhost:3000");
+    let url = spawn_server(server).await;
+
+    let client = Arc::new(BlossomClient::new(vec![url], signer));
+
+    let tmp_dir =
+        std::env::temp_dir().join(format!("blossom_batch_test_{}", rand::random::<u32>()));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+
+    let mut files = Vec::new();
+    let mut expected_hashes = Vec::new();
+    for i in 0..5 {
+        let file = tmp_dir.join(format!("file_{i}.txt"));
+        let data = format!("batch file {i} content");
+        expected_hashes.push(sha256_hex(data.as_bytes()));
+        std::fs::write(&file, &data).unwrap();
+        files.push(file);
+    }
+
+    let results = blossom_rs::upload_batch_concurrent(client, &(), files, 3).await;
+
+    assert_eq!(results.len(), 5);
+    for (i, result) in results.iter().enumerate() {
+        let desc = result.as_ref().unwrap();
+        assert_eq!(desc.sha256, expected_hashes[i]);
+    }
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
