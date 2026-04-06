@@ -155,6 +155,7 @@ BlobServer::builder(backend, "http://localhost:3000")
     .body_limit(50_000_000)     // HTTP body size limit
     .rate_limiter(limiter)      // Token-bucket rate limiting
     .webhook_notifier(notifier) // Lifecycle event webhooks
+    .media_processor(processor) // BUD-05 image processing on PUT /media
     .build();
 ```
 
@@ -186,9 +187,13 @@ let _guard = blossom_rs::otel::init_tracing("my-server", "info")?;
 ## Testing
 
 ```bash
-cargo test --workspace                          # 134 tests
+cargo test --workspace                          # 157 tests
 cargo test --workspace --features db-sqlite     # Include SQLite backend tests
-cargo llvm-cov --features db-sqlite             # Coverage report
+cargo llvm-cov --workspace --features db-sqlite # Coverage report
+
+# Optional integration tests (require external services):
+R2_ENDPOINT=... cargo test --features s3 --test s3_integration
+RUN_POSTGRES_TESTS=1 cargo test --features db-postgres --test postgres_integration
 ```
 
 ## CI/CD

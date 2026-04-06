@@ -42,6 +42,7 @@ Options:
       --webhook-urls <URLS>      Webhook URLs (comma-separated)
       --cors-origins <ORIGINS>   CORS allowed origins (comma-separated, default: all)
       --enable-admin             Enable admin endpoints at /admin/*
+      --media                    Enable media processing on PUT /media (BUD-05)
       --log-level <LEVEL>        Log level [default: info]
 ```
 
@@ -55,6 +56,7 @@ Options:
 | `DELETE` | `/:sha256` | Delete a blob (auth required) | BUD-01 |
 | `GET` | `/list/:pubkey` | List blobs by uploader | BUD-02 |
 | `PUT` | `/mirror` | Mirror from remote URL (auth required) | BUD-04 |
+| `PUT` | `/media` | Upload with server-side processing (auth required, --media) | BUD-05 |
 | `GET` | `/upload-requirements` | Server constraints | BUD-06 |
 | `GET` | `/status` | Server statistics | - |
 | `GET` | `/health` | Health check (200 OK) | - |
@@ -113,16 +115,12 @@ cargo run -p blossom-server -- \
   --whitelist-reload-secs 30
 ```
 
-## Roadmap — Not Yet Exposed
+## Roadmap
 
 | Item | Status | Notes |
 |------|--------|-------|
-| **S3Backend** | Implemented, untested e2e | Full `BlobBackend` impl — needs real S3/MinIO to verify |
-| **PostgresDatabase** | Implemented, untested | Full `BlobDatabase` impl — needs real Postgres to verify |
-| **ImageProcessor** | Stub behind `media` feature | Compiles but not exercised (WebP, thumbnails, blurhash, EXIF) |
-| **VitLabeler** | Not implemented | `labels` feature has `NoopLabeler` + `BlockAllLabeler` only |
-| **LlmLabeler** | Not implemented | No OpenAI-compatible API labeler yet |
-| **BUD-05** (Media optimization) | Not implemented | `PUT /media` for server-side compression/conversion |
+| **VitLabeler** | Not implemented | Vision Transformer inference via Candle |
+| **LlmLabeler** | Not implemented | OpenAI-compatible API classification |
 | **File-watch whitelist reload** | Timer-based only | Polling interval, not `inotify`/`kqueue` |
-| **Blurhash in responses** | Not integrated | `blurhash()` method exists but not called during upload |
-| **Phash in upload flow** | Schema ready | `phash` column exists in DB, not yet computed on upload |
+| **Server --db-postgres flag** | Not wired | PostgresDatabase works but server binary only supports SQLite |
+| **Server --s3 flag** | Not wired | S3Backend works but server binary only supports filesystem |

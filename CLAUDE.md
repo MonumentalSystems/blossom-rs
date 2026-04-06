@@ -21,7 +21,7 @@ blossom-cli/         — CLI client binary (crates.io: blossom-cli)
 ```bash
 cargo build --workspace              # Build all crates
 cargo build --all-features           # Build everything including s3, otel, media, etc.
-cargo test --workspace               # Run all tests (134 tests)
+cargo test --workspace               # Run all tests (157 tests)
 cargo clippy --workspace -- -D warnings  # Lint all crates
 cargo fmt --all --check              # Format check all crates
 cargo fmt --all                      # Auto-format all crates
@@ -132,7 +132,7 @@ All key functions instrumented with `#[tracing::instrument]`. OTEL field naming:
 
 ## Testing Conventions
 
-- 134 tests: 90 lib unit + 18 lib integration + 5 property + 10 SQLite + 11 server e2e
+- 157 tests: 108 lib unit + 18 lib integration + 5 property + 10 SQLite + 16 server e2e
 - Unit tests in `#[cfg(test)] mod tests` at bottom of each module
 - Async integration tests use `#[tokio::test]` with ephemeral TCP listeners
 - SQLite tests use `#[tokio::test(flavor = "multi_thread")]` for block_in_place

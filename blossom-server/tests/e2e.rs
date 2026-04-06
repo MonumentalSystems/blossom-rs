@@ -5,10 +5,14 @@
 
 use std::collections::HashSet;
 
+use std::sync::Arc;
+
 use blossom_rs::access::Whitelist;
 use blossom_rs::auth::{auth_header_value, build_blossom_auth};
 use blossom_rs::db::{MemoryDatabase, SqliteDatabase};
+use blossom_rs::media::PassthroughProcessor;
 use blossom_rs::protocol::BlobDescriptor;
+use blossom_rs::ratelimit::{RateLimitConfig, RateLimiter};
 use blossom_rs::server::nip96::nip96_router;
 use blossom_rs::{BlobServer, BlossomClient, BlossomSigner, MemoryBackend, Signer};
 
@@ -523,4 +527,151 @@ async fn test_whitelist_access_control() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 403);
+}
+
+#[tokio::test]
+async fn test_media_upload_without_processor() {
+    // Server without media processor should return 501.
+    let (url, signer) = spawn_test_server().await;
+    let http = reqwest::Client::new();
+
+    let auth_event = build_blossom_auth(&signer, "upload", None, None, "");
+    let auth_header = auth_header_value(&auth_event);
+
+    let resp = http
+        .put(format!("{}/media", url))
+        .header("Authorization", &auth_header)
+        .body(b"some data".to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 501);
+}
+
+#[tokio::test]
+async fn test_media_upload_with_processor() {
+    let server = BlobServer::builder(MemoryBackend::new(), "http://localhost:3000")
+        .media_processor(PassthroughProcessor)
+        .build();
+    let state = server.shared_state();
+    let app = server.router().merge(nip96_router(state));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let url = format!("http://{}", addr);
+    tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let http = reqwest::Client::new();
+    let signer = Signer::generate();
+
+    let auth_event = build_blossom_auth(&signer, "upload", None, None, "");
+    let auth_header = auth_header_value(&auth_event);
+
+    let resp = http
+        .put(format!("{}/media", url))
+        .header("Authorization", &auth_header)
+        .body(b"media content".to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["sha256"].is_string());
+}
+
+#[tokio::test]
+async fn test_media_upload_requires_auth() {
+    let server = BlobServer::builder(MemoryBackend::new(), "http://localhost:3000")
+        .media_processor(PassthroughProcessor)
+        .build();
+    let state = server.shared_state();
+    let app = server.router().merge(nip96_router(state));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let url = format!("http://{}", addr);
+    tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let http = reqwest::Client::new();
+    let resp = http
+        .put(format!("{}/media", url))
+        .body(b"no auth".to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+#[tokio::test]
+async fn test_rate_limiting() {
+    let server = BlobServer::builder(MemoryBackend::new(), "http://localhost:3000")
+        .rate_limiter(RateLimiter::new(RateLimitConfig {
+            max_tokens: 2,
+            refill_rate: 0.0, // No refill.
+        }))
+        .build();
+    let state = server.shared_state();
+    let app = server.router().merge(nip96_router(state));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let url = format!("http://{}", addr);
+    tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let http = reqwest::Client::new();
+
+    // First two should succeed.
+    for _ in 0..2 {
+        let resp = http
+            .put(format!("{}/upload", url))
+            .body(b"rate test".to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    // Third should be rate limited.
+    let resp = http
+        .put(format!("{}/upload", url))
+        .body(b"rate test 3".to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 429);
+}
+
+#[tokio::test]
+async fn test_nip98_auth_accepted() {
+    let server = BlobServer::new_with_auth(MemoryBackend::new(), "http://localhost:3000");
+    let state = server.shared_state();
+    let app = server.router().merge(nip96_router(state));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let url = format!("http://{}", addr);
+    tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let http = reqwest::Client::new();
+    let signer = Signer::generate();
+
+    // Use NIP-98 auth (kind:27235) instead of Blossom auth.
+    let nip98_event =
+        blossom_rs::auth::build_nip98_auth(&signer, &format!("{}/upload", url), "PUT");
+    let auth_header = auth_header_value(&nip98_event);
+
+    let resp = http
+        .put(format!("{}/upload", url))
+        .header("Authorization", &auth_header)
+        .body(b"nip98 upload".to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["sha256"].is_string());
 }
