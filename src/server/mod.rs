@@ -1490,4 +1490,77 @@ mod tests {
         let status: serde_json::Value = resp.json().await.unwrap();
         assert!(status["tracked_stats"].as_u64().unwrap() >= 1);
     }
+
+    // --- Ownership-enforced delete tests ---
+
+    #[tokio::test]
+    async fn test_member_cannot_delete_others_blob() {
+        let server = BlobServer::new(MemoryBackend::new(), "http://localhost:3000");
+        let url = spawn_server(server).await;
+        let http = reqwest::Client::new();
+
+        // Alice uploads a blob.
+        let alice = crate::auth::Signer::generate();
+        let auth = crate::auth::build_blossom_auth(&alice, "upload", None, None, "");
+        let resp = http
+            .put(format!("{}/upload", url))
+            .header("Authorization", crate::auth::auth_header_value(&auth))
+            .body(b"alice's data".to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let desc: serde_json::Value = resp.json().await.unwrap();
+        let sha = desc["sha256"].as_str().unwrap().to_string();
+
+        // Bob tries to delete Alice's blob — should fail.
+        let bob = crate::auth::Signer::generate();
+        let del_auth = crate::auth::build_blossom_auth(&bob, "delete", None, None, "");
+        let resp = http
+            .delete(format!("{}/{}", url, sha))
+            .header("Authorization", crate::auth::auth_header_value(&del_auth))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403);
+
+        // Alice can delete her own blob.
+        let del_auth = crate::auth::build_blossom_auth(&alice, "delete", None, None, "");
+        let resp = http
+            .delete(format!("{}/{}", url, sha))
+            .header("Authorization", crate::auth::auth_header_value(&del_auth))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn test_anyone_can_delete_anonymous_blob() {
+        let server = BlobServer::new(MemoryBackend::new(), "http://localhost:3000");
+        let url = spawn_server(server).await;
+        let http = reqwest::Client::new();
+
+        // Anonymous upload (no auth).
+        let resp = http
+            .put(format!("{}/upload", url))
+            .body(b"anonymous data".to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let desc: serde_json::Value = resp.json().await.unwrap();
+        let sha = desc["sha256"].as_str().unwrap().to_string();
+
+        // Anyone with auth can delete anonymous blobs.
+        let signer = crate::auth::Signer::generate();
+        let del_auth = crate::auth::build_blossom_auth(&signer, "delete", None, None, "");
+        let resp = http
+            .delete(format!("{}/{}", url, sha))
+            .header("Authorization", crate::auth::auth_header_value(&del_auth))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
 }

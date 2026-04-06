@@ -312,7 +312,7 @@ async fn run(args: Args) -> Result<(), String> {
             let data = client.download(&(), sha256).await?;
 
             if let Some(path) = output {
-                std::fs::write(&path, &data)
+                std::fs::write(path, &data)
                     .map_err(|e| format!("write {}: {e}", path.display()))?;
                 println!("downloaded {} bytes to {}", data.len(), path.display());
             } else {
