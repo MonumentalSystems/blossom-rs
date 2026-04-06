@@ -303,18 +303,13 @@ async fn run(args: Args) -> Result<(), String> {
             Ok(())
         }
 
-        Command::Download { sha256, output } => {
+        Command::Download {
+            ref sha256,
+            ref output,
+        } => {
             let signer = get_signer(&args.key)?;
-
-            let data = if is_iroh_server(&args.server) {
-                let addr = parse_iroh_addr(&args.server)?;
-                let client =
-                    make_iroh_client(Signer::from_secret_hex(&signer.secret_key_hex())?).await?;
-                client.download(addr, &sha256).await?
-            } else {
-                let client = BlossomClient::new(vec![args.server], signer);
-                client.download(&sha256).await?
-            };
+            let client = build_client(&args, signer).await?;
+            let data = client.download(&(), sha256).await?;
 
             if let Some(path) = output {
                 std::fs::write(&path, &data)
@@ -329,20 +324,11 @@ async fn run(args: Args) -> Result<(), String> {
             Ok(())
         }
 
-        Command::Exists { sha256 } => {
+        Command::Exists { ref sha256 } => {
             let signer = get_signer(&args.key)?;
+            let client = build_client(&args, signer).await?;
 
-            let exists = if is_iroh_server(&args.server) {
-                let addr = parse_iroh_addr(&args.server)?;
-                let client =
-                    make_iroh_client(Signer::from_secret_hex(&signer.secret_key_hex())?).await?;
-                client.exists(addr, &sha256).await?
-            } else {
-                let client = BlossomClient::new(vec![args.server], signer);
-                client.exists(&sha256).await?
-            };
-
-            if exists {
+            if client.exists(&(), sha256).await? {
                 println!("exists");
             } else {
                 println!("not found");
@@ -351,7 +337,7 @@ async fn run(args: Args) -> Result<(), String> {
             Ok(())
         }
 
-        Command::Delete { sha256, yes } => {
+        Command::Delete { ref sha256, yes } => {
             if !yes {
                 eprint!("Delete blob {}? [y/N] ", &sha256[..12]);
                 let mut input = String::new();
@@ -364,56 +350,24 @@ async fn run(args: Args) -> Result<(), String> {
             }
 
             let signer = get_signer(&args.key)?;
+            let client = build_client(&args, signer).await?;
 
-            if is_iroh_server(&args.server) {
-                let addr = parse_iroh_addr(&args.server)?;
-                let client =
-                    make_iroh_client(Signer::from_secret_hex(&signer.secret_key_hex())?).await?;
-                if client.delete(addr, &sha256).await? {
-                    println!("deleted {sha256}");
-                } else {
-                    return Err("delete failed: not found".into());
-                }
+            if client.delete(&(), sha256).await? {
+                println!("deleted {sha256}");
             } else {
-                let http = reqwest::Client::new();
-                let auth_event = build_blossom_auth(&signer, "delete", None, None, "");
-                let auth_header = auth_header_value(&auth_event);
-
-                let url = format!("{}/{}", args.server.trim_end_matches('/'), sha256);
-                let resp = http
-                    .delete(&url)
-                    .header("Authorization", &auth_header)
-                    .send()
-                    .await
-                    .map_err(|e| format!("request: {e}"))?;
-
-                if resp.status().is_success() {
-                    println!("deleted {sha256}");
-                } else {
-                    let text = resp.text().await.unwrap_or_default();
-                    return Err(format!("delete failed: {text}"));
-                }
+                return Err("delete failed: not found".into());
             }
             Ok(())
         }
 
-        Command::List { pubkey } => {
-            let http = reqwest::Client::new();
-            let url = format!("{}/list/{}", args.server.trim_end_matches('/'), pubkey);
-            let resp = http
-                .get(&url)
-                .send()
-                .await
-                .map_err(|e| format!("request: {e}"))?;
-
-            if resp.status().is_success() {
-                let body: serde_json::Value =
-                    resp.json().await.map_err(|e| format!("parse: {e}"))?;
-                print_output(&args.format, &body);
-            } else {
-                let text = resp.text().await.unwrap_or_default();
-                return Err(format!("list failed: {text}"));
-            }
+        Command::List { ref pubkey } => {
+            let signer = get_signer(&args.key)?;
+            let client = build_client(&args, signer).await?;
+            let blobs = client.list(&(), pubkey).await?;
+            print_output(
+                &args.format,
+                &serde_json::to_value(&blobs).unwrap_or_default(),
+            );
             Ok(())
         }
 
