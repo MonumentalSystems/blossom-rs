@@ -242,6 +242,88 @@ impl BlobBackend for S3Backend {
     fn total_bytes(&self) -> u64 {
         self.index.values().sum()
     }
+
+    fn insert_stream(
+        &mut self,
+        reader: &mut dyn std::io::Read,
+        _size: u64,
+        base_url: &str,
+    ) -> Result<BlobDescriptor, String> {
+        use crate::protocol::STREAM_CHUNK_SIZE;
+        use sha2::{Digest, Sha256};
+        use std::io::Write;
+
+        // Write to temp file while computing SHA256 (can't rewind dyn Read).
+        let tmp_path = std::env::temp_dir().join(format!(
+            "blossom_s3_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+
+        let result = (|| -> Result<BlobDescriptor, String> {
+            let mut file =
+                std::fs::File::create(&tmp_path).map_err(|e| format!("create temp: {e}"))?;
+            let mut hasher = Sha256::new();
+            let mut buf = [0u8; STREAM_CHUNK_SIZE];
+            let mut total = 0u64;
+
+            loop {
+                let n = reader
+                    .read(&mut buf)
+                    .map_err(|e| format!("read stream: {e}"))?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+                file.write_all(&buf[..n])
+                    .map_err(|e| format!("write temp: {e}"))?;
+                total += n as u64;
+            }
+            file.flush().map_err(|e| format!("flush temp: {e}"))?;
+            drop(file);
+
+            let hash = hex::encode(hasher.finalize());
+            let key = Self::object_key(&hash);
+
+            // Stream from temp file to S3.
+            let upload_result = Self::block_on(async {
+                let body = ByteStream::from_path(&tmp_path)
+                    .await
+                    .map_err(|e| format!("read temp for s3: {e}"))?;
+                self.client
+                    .put_object()
+                    .bucket(&self.config.bucket)
+                    .key(&key)
+                    .content_type("application/octet-stream")
+                    .body(body)
+                    .send()
+                    .await
+                    .map_err(|e| format!("s3 upload: {e}"))
+            });
+            upload_result?;
+
+            self.index.insert(hash.clone(), total);
+
+            let url = self.blob_url(&hash, base_url);
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+
+            Ok(BlobDescriptor {
+                sha256: hash,
+                size: total,
+                content_type: Some("application/octet-stream".into()),
+                url: Some(url),
+                uploaded: Some(ts),
+            })
+        })();
+
+        let _ = std::fs::remove_file(&tmp_path);
+        result
+    }
 }
 
 #[cfg(test)]
