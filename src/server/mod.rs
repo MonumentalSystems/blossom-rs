@@ -476,7 +476,14 @@ async fn handle_upload(
     let content_type = extract_content_type(&headers).unwrap_or_else(|| detect_mime(&data));
 
     let base_url = s.base_url.clone();
-    let descriptor = s.backend.insert(data, &base_url);
+    let size = data.len() as u64;
+    let descriptor = {
+        let mut cursor = std::io::Cursor::new(data);
+        match s.backend.insert_stream(&mut cursor, size, &base_url) {
+            Ok(desc) => desc,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, error_json(&e)),
+        }
+    };
 
     // Record span fields now that we know the sha256.
     tracing::Span::current().record("blob.sha256", descriptor.sha256.as_str());
