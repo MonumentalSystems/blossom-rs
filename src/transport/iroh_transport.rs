@@ -15,6 +15,7 @@ use super::wire::{self, Op, Request, Response, Status};
 use crate::access::{AccessControl, Action, Role};
 use crate::auth::{verify_blossom_auth, verify_nip98_auth};
 use crate::db::{BlobDatabase, UploadRecord};
+use crate::locks::{LockDatabase, LockFilters};
 use crate::protocol::{base64url_decode, BlobDescriptor, NostrEvent};
 use crate::storage::BlobBackend;
 
@@ -27,10 +28,9 @@ pub struct IrohState {
     pub database: Box<dyn BlobDatabase>,
     pub access: Box<dyn AccessControl>,
     pub base_url: String,
-    /// Maximum upload size in bytes. `None` = no limit.
     pub max_upload_size: Option<u64>,
-    /// Require auth for uploads.
     pub require_auth: bool,
+    pub lock_db: Option<Box<dyn LockDatabase>>,
 }
 
 impl std::fmt::Debug for IrohState {
@@ -171,6 +171,10 @@ async fn handle_stream(
         }
         Op::Delete => handle_delete(&mut send, &req.sha256, auth_pubkey, &mut s).await,
         Op::List => handle_list(&mut send, &req.pubkey, &s).await,
+        Op::LockCreate => handle_lock_create(&mut send, &req, auth_pubkey, &mut s).await,
+        Op::LockDelete => handle_lock_delete(&mut send, &req, auth_pubkey, &mut s).await,
+        Op::LockList => handle_lock_list(&mut send, &req, &s).await,
+        Op::LockVerify => handle_lock_verify(&mut send, &req, auth_pubkey, &s).await,
     }
 
     let _ = send.finish();
@@ -190,6 +194,9 @@ fn verify_auth(auth_header: &str, op: &Op) -> Result<String, String> {
         Op::Get => "get",
         Op::List => "get",
         Op::Head => "get",
+        Op::LockCreate | Op::LockDelete | Op::LockList | Op::LockVerify => "lock",
+    };
+        Op::LockCreate | Op::LockDelete | Op::LockList | Op::LockVerify => "lock",
     };
 
     match event.kind {
@@ -464,6 +471,310 @@ async fn handle_list(send: &mut iroh::endpoint::SendStream, pubkey: &str, state:
             };
             let _ = send.write_all(&wire::encode_response(&resp)).await;
             let _ = send.write_all(&body).await;
+        }
+        Err(e) => {
+            let resp = Response {
+                status: Status::Error,
+                body_len: 0,
+                content_type: String::new(),
+                error: e.to_string(),
+                descriptor: None,
+            };
+            let _ = send.write_all(&wire::encode_response(&resp)).await;
+        }
+    }
+}
+
+async fn handle_lock_create(
+    send: &mut iroh::endpoint::SendStream,
+    req: &Request,
+    auth_pubkey: Option<String>,
+    state: &mut IrohState,
+) {
+    let pubkey = match auth_pubkey {
+        Some(pk) => pk,
+        None => {
+            let resp = Response {
+                status: Status::Unauthorized,
+                body_len: 0,
+                content_type: String::new(),
+                error: "auth required for lock".into(),
+                descriptor: None,
+            };
+            let _ = send.write_all(&wire::encode_response(&resp)).await;
+            return;
+        }
+    };
+
+    if !state.access.is_allowed(&pubkey, Action::Lock) {
+        let resp = Response {
+            status: Status::Forbidden,
+            body_len: 0,
+            content_type: String::new(),
+            error: "lock not allowed".into(),
+            descriptor: None,
+        };
+        let _ = send.write_all(&wire::encode_response(&resp)).await;
+        return;
+    }
+
+    let lock_db = match state.lock_db.as_mut() {
+        Some(db) => db,
+        None => {
+            let resp = Response {
+                status: Status::NotFound,
+                body_len: 0,
+                content_type: String::new(),
+                error: "lock support not configured".into(),
+                descriptor: None,
+            };
+            let _ = send.write_all(&wire::encode_response(&resp)).await;
+            return;
+        }
+    };
+
+    match lock_db.create_lock(&req.repo_id, &req.lock_path, &pubkey) {
+        Ok(record) => {
+            let desc = serde_json::to_value(&record).unwrap_or_default();
+            let resp = Response {
+                status: Status::Ok,
+                body_len: 0,
+                content_type: String::new(),
+                error: String::new(),
+                descriptor: Some(desc),
+            };
+            let _ = send.write_all(&wire::encode_response(&resp)).await;
+        }
+        Err(crate::locks::LockError::Conflict(_)) => {
+            let resp = Response {
+                status: Status::Conflict,
+                body_len: 0,
+                content_type: String::new(),
+                error: "path already locked".into(),
+                descriptor: None,
+            };
+            let _ = send.write_all(&wire::encode_response(&resp)).await;
+        }
+        Err(e) => {
+            let resp = Response {
+                status: Status::Error,
+                body_len: 0,
+                content_type: String::new(),
+                error: e.to_string(),
+                descriptor: None,
+            };
+            let _ = send.write_all(&wire::encode_response(&resp)).await;
+        }
+    }
+}
+
+async fn handle_lock_delete(
+    send: &mut iroh::endpoint::SendStream,
+    req: &Request,
+    auth_pubkey: Option<String>,
+    state: &mut IrohState,
+) {
+    let pubkey = match auth_pubkey {
+        Some(pk) => pk,
+        None => {
+            let resp = Response {
+                status: Status::Unauthorized,
+                body_len: 0,
+                content_type: String::new(),
+                error: "auth required for unlock".into(),
+                descriptor: None,
+            };
+            let _ = send.write_all(&wire::encode_response(&resp)).await;
+            return;
+        }
+    };
+
+    let is_admin = state.access.role(&pubkey) == Role::Admin;
+
+    let lock_db = match state.lock_db.as_mut() {
+        Some(db) => db,
+        None => {
+            let resp = Response {
+                status: Status::NotFound,
+                body_len: 0,
+                content_type: String::new(),
+                error: "lock support not configured".into(),
+                descriptor: None,
+            };
+            let _ = send.write_all(&wire::encode_response(&resp)).await;
+            return;
+        }
+    };
+
+    let force = req.force || is_admin;
+
+    match lock_db.delete_lock(&req.repo_id, &req.lock_id, force, &pubkey) {
+        Ok(record) => {
+            let desc = serde_json::to_value(&record).unwrap_or_default();
+            let resp = Response {
+                status: Status::Ok,
+                body_len: 0,
+                content_type: String::new(),
+                error: String::new(),
+                descriptor: Some(desc),
+            };
+            let _ = send.write_all(&wire::encode_response(&resp)).await;
+        }
+        Err(crate::locks::LockError::NotFound) => {
+            let resp = Response {
+                status: Status::NotFound,
+                body_len: 0,
+                content_type: String::new(),
+                error: "lock not found".into(),
+                descriptor: None,
+            };
+            let _ = send.write_all(&wire::encode_response(&resp)).await;
+        }
+        Err(crate::locks::LockError::Forbidden(msg)) => {
+            let resp = Response {
+                status: Status::Forbidden,
+                body_len: 0,
+                content_type: String::new(),
+                error: msg,
+                descriptor: None,
+            };
+            let _ = send.write_all(&wire::encode_response(&resp)).await;
+        }
+        Err(e) => {
+            let resp = Response {
+                status: Status::Error,
+                body_len: 0,
+                content_type: String::new(),
+                error: e.to_string(),
+                descriptor: None,
+            };
+            let _ = send.write_all(&wire::encode_response(&resp)).await;
+        }
+    }
+}
+
+async fn handle_lock_list(
+    send: &mut iroh::endpoint::SendStream,
+    req: &Request,
+    state: &IrohState,
+) {
+    let lock_db = match state.lock_db.as_ref() {
+        Some(db) => db,
+        None => {
+            let resp = Response {
+                status: Status::NotFound,
+                body_len: 0,
+                content_type: String::new(),
+                error: "lock support not configured".into(),
+                descriptor: None,
+            };
+            let _ = send.write_all(&wire::encode_response(&resp)).await;
+            return;
+        }
+    };
+
+    let filters = LockFilters {
+        path: None,
+        id: None,
+        cursor: if req.cursor.is_empty() { None } else { Some(req.cursor.clone()) },
+        limit: if req.limit == 0 { None } else { Some(req.limit) },
+    };
+
+    match lock_db.list_locks(&req.repo_id, &filters) {
+        Ok((records, next_cursor)) => {
+            let result = serde_json::json!({
+                "locks": records,
+                "next_cursor": next_cursor,
+            });
+            let resp = Response {
+                status: Status::Ok,
+                body_len: 0,
+                content_type: String::new(),
+                error: String::new(),
+                descriptor: Some(result),
+            };
+            let _ = send.write_all(&wire::encode_response(&resp)).await;
+        }
+        Err(e) => {
+            let resp = Response {
+                status: Status::Error,
+                body_len: 0,
+                content_type: String::new(),
+                error: e.to_string(),
+                descriptor: None,
+            };
+            let _ = send.write_all(&wire::encode_response(&resp)).await;
+        }
+    }
+}
+
+async fn handle_lock_verify(
+    send: &mut iroh::endpoint::SendStream,
+    req: &Request,
+    auth_pubkey: Option<String>,
+    state: &IrohState,
+) {
+    let pubkey = match auth_pubkey {
+        Some(pk) => pk,
+        None => {
+            let resp = Response {
+                status: Status::Unauthorized,
+                body_len: 0,
+                content_type: String::new(),
+                error: "auth required for verify".into(),
+                descriptor: None,
+            };
+            let _ = send.write_all(&wire::encode_response(&resp)).await;
+            return;
+        }
+    };
+
+    let lock_db = match state.lock_db.as_ref() {
+        Some(db) => db,
+        None => {
+            let resp = Response {
+                status: Status::NotFound,
+                body_len: 0,
+                content_type: String::new(),
+                error: "lock support not configured".into(),
+                descriptor: None,
+            };
+            let _ = send.write_all(&wire::encode_response(&resp)).await;
+            return;
+        }
+    };
+
+    let filters = LockFilters {
+        path: None,
+        id: None,
+        cursor: if req.cursor.is_empty() { None } else { Some(req.cursor.clone()) },
+        limit: if req.limit == 0 { None } else { Some(req.limit) },
+    };
+
+    match lock_db.list_locks(&req.repo_id, &filters) {
+        Ok((records, next_cursor)) => {
+            let mut ours = Vec::new();
+            let mut theirs = Vec::new();
+            for record in records {
+                if record.pubkey == pubkey {
+                    ours.push(record);
+                } else {
+                    theirs.push(record);
+                }
+            }
+            let result = serde_json::json!({
+                "ours": ours,
+                "theirs": theirs,
+                "next_cursor": next_cursor,
+            });
+            let resp = Response {
+                status: Status::Ok,
+                body_len: 0,
+                content_type: String::new(),
+                error: String::new(),
+                descriptor: Some(result),
+            };
+            let _ = send.write_all(&wire::encode_response(&resp)).await;
         }
         Err(e) => {
             let resp = Response {

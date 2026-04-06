@@ -27,28 +27,38 @@ pub enum Op {
     Upload,
     Delete,
     List,
+    LockCreate,
+    LockDelete,
+    LockList,
+    LockVerify,
 }
 
 /// Request frame sent over a QUIC stream.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Request {
-    /// Operation type.
     pub op: Op,
-    /// SHA256 hash (for GET/HEAD/DELETE). Empty for UPLOAD.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub sha256: String,
-    /// Public key for LIST operations.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub pubkey: String,
-    /// Auth header value (e.g., "Nostr base64...").
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub auth: String,
-    /// Content type for UPLOAD.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub content_type: String,
-    /// Body length for UPLOAD (bytes following the JSON line).
     #[serde(default)]
     pub body_len: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub repo_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub lock_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub lock_path: String,
+    #[serde(default)]
+    pub force: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cursor: String,
+    #[serde(default)]
+    pub limit: u32,
 }
 
 /// Response status.
@@ -59,6 +69,7 @@ pub enum Status {
     NotFound,
     Unauthorized,
     Forbidden,
+    Conflict,
     Error,
 }
 
