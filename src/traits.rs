@@ -65,4 +65,16 @@ pub trait BlobClient {
         addr: &Self::Address,
         pubkey: &str,
     ) -> impl std::future::Future<Output = Result<Vec<BlobDescriptor>, String>> + Send;
+
+    /// Upload a file from disk without buffering the full content in memory.
+    ///
+    /// Two-pass approach: first pass computes SHA256 (for auth header),
+    /// second pass streams the file to the server. The second read hits
+    /// the OS page cache so overhead is minimal.
+    fn upload_file(
+        &self,
+        addr: &Self::Address,
+        path: &std::path::Path,
+        content_type: &str,
+    ) -> impl std::future::Future<Output = Result<BlobDescriptor, String>> + Send;
 }

@@ -282,6 +282,103 @@ impl IrohBlossomClient {
         info!(list.pubkey = %pubkey, "list via iroh");
         serde_json::from_slice(&data).map_err(|e| format!("parse list: {e}"))
     }
+
+    /// Upload a file from disk without buffering in memory.
+    ///
+    /// First pass computes SHA256. Second pass streams file to QUIC
+    /// in 256KB chunks.
+    #[instrument(name = "blossom.iroh.client.upload_file", skip_all, fields(
+        file.path = %path.display(),
+        blob.sha256,
+        blob.size,
+    ))]
+    pub async fn upload_file(
+        &self,
+        addr: EndpointAddr,
+        path: &std::path::Path,
+        content_type: &str,
+    ) -> Result<BlobDescriptor, String> {
+        use crate::protocol::STREAM_CHUNK_SIZE;
+        use tokio::io::AsyncReadExt;
+
+        let file_meta = tokio::fs::metadata(path)
+            .await
+            .map_err(|e| format!("stat file: {e}"))?;
+        let file_size = file_meta.len();
+
+        // First pass: compute SHA256.
+        let our_sha256 = tokio::task::block_in_place(|| {
+            let mut f = std::fs::File::open(path).map_err(|e| format!("open file: {e}"))?;
+            let (hash, _) =
+                crate::protocol::sha256_stream(&mut f).map_err(|e| format!("hash file: {e}"))?;
+            Ok::<_, String>(hash)
+        })?;
+
+        tracing::Span::current().record("blob.sha256", our_sha256.as_str());
+        tracing::Span::current().record("blob.size", file_size);
+
+        let auth_event =
+            build_blossom_auth(self.signer.as_ref(), "upload", Some(&our_sha256), None, "");
+        let auth_header = auth_header_value(&auth_event);
+
+        let conn = self.connect(addr).await?;
+        let (mut send, mut recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| format!("open stream: {e}"))?;
+
+        // Send request header.
+        let req = Request {
+            op: Op::Upload,
+            sha256: String::new(),
+            pubkey: String::new(),
+            auth: auth_header,
+            content_type: content_type.to_string(),
+            body_len: file_size,
+        };
+        send.write_all(&wire::encode_request(&req))
+            .await
+            .map_err(|e| format!("write request: {e}"))?;
+
+        // Second pass: stream file in chunks.
+        let mut file = tokio::fs::File::open(path)
+            .await
+            .map_err(|e| format!("open file: {e}"))?;
+        let mut buf = vec![0u8; STREAM_CHUNK_SIZE];
+        loop {
+            let n = file
+                .read(&mut buf)
+                .await
+                .map_err(|e| format!("read file: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            send.write_all(&buf[..n])
+                .await
+                .map_err(|e| format!("write body: {e}"))?;
+        }
+        send.finish().map_err(|e| format!("finish: {e}"))?;
+
+        // Read response.
+        let (resp, _leftover) = read_response(&mut recv).await?;
+        if resp.status != Status::Ok {
+            return Err(format!("upload failed: {}", resp.error));
+        }
+
+        let desc: BlobDescriptor =
+            serde_json::from_value(resp.descriptor.ok_or("no descriptor in upload response")?)
+                .map_err(|e| format!("parse descriptor: {e}"))?;
+
+        if desc.sha256 != our_sha256 {
+            return Err(format!(
+                "SHA256 mismatch: server={}, ours={}",
+                desc.sha256, our_sha256
+            ));
+        }
+
+        info!(blob.sha256 = %desc.sha256, blob.size = desc.size, "file uploaded via iroh (streaming)");
+        Ok(desc)
+    }
 }
 
 impl crate::traits::BlobClient for IrohBlossomClient {
@@ -311,6 +408,15 @@ impl crate::traits::BlobClient for IrohBlossomClient {
 
     async fn list(&self, addr: &EndpointAddr, pubkey: &str) -> Result<Vec<BlobDescriptor>, String> {
         self.list(addr.clone(), pubkey).await
+    }
+
+    async fn upload_file(
+        &self,
+        addr: &EndpointAddr,
+        path: &std::path::Path,
+        content_type: &str,
+    ) -> Result<BlobDescriptor, String> {
+        self.upload_file(addr.clone(), path, content_type).await
     }
 }
 
