@@ -272,7 +272,25 @@ async fn handle_upload(
         return;
     }
 
-    let descriptor = state.backend.insert(data, &state.base_url);
+    let size = data.len() as u64;
+    let mut cursor = std::io::Cursor::new(data);
+    let descriptor = match state
+        .backend
+        .insert_stream(&mut cursor, size, &state.base_url)
+    {
+        Ok(desc) => desc,
+        Err(e) => {
+            let resp = Response {
+                status: Status::Error,
+                body_len: 0,
+                content_type: String::new(),
+                error: format!("storage error: {e}"),
+                descriptor: None,
+            };
+            let _ = send.write_all(&wire::encode_response(&resp)).await;
+            return;
+        }
+    };
     let record = UploadRecord {
         sha256: descriptor.sha256.clone(),
         size: descriptor.size,
