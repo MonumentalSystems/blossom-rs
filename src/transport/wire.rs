@@ -19,9 +19,10 @@
 use serde::{Deserialize, Serialize};
 
 /// Wire protocol operation codes.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Op {
+    #[default]
     Get,
     Head,
     Upload,
@@ -34,7 +35,7 @@ pub enum Op {
 }
 
 /// Request frame sent over a QUIC stream.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Request {
     pub op: Op,
     #[serde(default, skip_serializing_if = "String::is_empty")]

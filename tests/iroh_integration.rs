@@ -28,6 +28,7 @@ async fn spawn_iroh_server() -> (EndpointAddr, Router) {
         base_url: "iroh://test".to_string(),
         max_upload_size: None,
         require_auth: false,
+        lock_db: None,
     }));
 
     let endpoint = iroh::Endpoint::builder(N0)

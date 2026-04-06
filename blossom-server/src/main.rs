@@ -408,6 +408,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             base_url: args.base_url.clone(),
             max_upload_size: args.max_upload_size,
             require_auth: args.require_auth,
+            lock_db: None,
         }));
 
         let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)

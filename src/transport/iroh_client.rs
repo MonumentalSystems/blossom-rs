@@ -98,6 +98,7 @@ impl IrohBlossomClient {
             auth: auth_header,
             content_type: content_type.to_string(),
             body_len: data.len() as u64,
+            ..Default::default()
         };
         send.write_all(&wire::encode_request(&req))
             .await
@@ -141,12 +142,13 @@ impl IrohBlossomClient {
             .map_err(|e| format!("open stream: {e}"))?;
 
         let req = Request {
-            op: Op::Get,
+            op: Op::Head,
             sha256: sha256.to_string(),
             pubkey: String::new(),
-            auth: auth_header,
+            auth: String::new(),
             content_type: String::new(),
             body_len: 0,
+            ..Default::default()
         };
         send.write_all(&wire::encode_request(&req))
             .await
@@ -199,6 +201,7 @@ impl IrohBlossomClient {
             auth: String::new(),
             content_type: String::new(),
             body_len: 0,
+            ..Default::default()
         };
         send.write_all(&wire::encode_request(&req))
             .await
@@ -228,6 +231,7 @@ impl IrohBlossomClient {
             auth: auth_header,
             content_type: String::new(),
             body_len: 0,
+            ..Default::default()
         };
         send.write_all(&wire::encode_request(&req))
             .await
@@ -258,6 +262,7 @@ impl IrohBlossomClient {
             auth: String::new(),
             content_type: String::new(),
             body_len: 0,
+            ..Default::default()
         };
         send.write_all(&wire::encode_request(&req))
             .await
@@ -336,6 +341,7 @@ impl IrohBlossomClient {
             auth: auth_header,
             content_type: content_type.to_string(),
             body_len: file_size,
+            ..Default::default()
         };
         send.write_all(&wire::encode_request(&req))
             .await
@@ -419,7 +425,9 @@ impl crate::traits::BlobClient for IrohBlossomClient {
     ) -> Result<BlobDescriptor, String> {
         self.upload_file(addr.clone(), path, content_type).await
     }
+}
 
+impl IrohBlossomClient {
     pub async fn create_lock(
         &self,
         addr: &EndpointAddr,
@@ -555,7 +563,7 @@ impl crate::traits::BlobClient for IrohBlossomClient {
         repo_id: &str,
         cursor: Option<&str>,
         limit: Option<u32>,
-    ) -> Result<crate::server::locks::VerifyResponse, String> {
+    ) -> Result<(Vec<LockRecord>, Vec<LockRecord>, Option<String>), String> {
         let auth_event = build_blossom_auth(self.signer.as_ref(), "lock", None, None, "");
         let auth_header = auth_header_value(&auth_event);
 
@@ -577,10 +585,28 @@ impl crate::traits::BlobClient for IrohBlossomClient {
 
         let (resp, _) = read_response(&mut recv).await?;
         match resp.status {
-            Status::Ok => resp
-                .descriptor
-                .ok_or_else(|| "missing descriptor".to_string())
-                .and_then(|v| serde_json::from_value(v).map_err(|e| format!("parse verify: {e}"))),
+            Status::Ok => {
+                let desc = resp
+                    .descriptor
+                    .ok_or_else(|| "missing descriptor".to_string())?;
+                let ours: Vec<LockRecord> = desc
+                    .get("ours")
+                    .ok_or_else(|| "missing ours field".to_string())
+                    .and_then(|v| {
+                        serde_json::from_value(v.clone()).map_err(|e| format!("parse ours: {e}"))
+                    })?;
+                let theirs: Vec<LockRecord> = desc
+                    .get("theirs")
+                    .ok_or_else(|| "missing theirs field".to_string())
+                    .and_then(|v| {
+                        serde_json::from_value(v.clone()).map_err(|e| format!("parse theirs: {e}"))
+                    })?;
+                let next_cursor = desc
+                    .get("next_cursor")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                Ok((ours, theirs, next_cursor))
+            }
             Status::NotFound => Err("lock support not configured".to_string()),
             Status::Unauthorized => Err("unauthorized".to_string()),
             Status::Error => Err(resp.error.clone()),

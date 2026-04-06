@@ -64,6 +64,7 @@ proptest! {
             auth,
             content_type: String::new(),
             body_len: 0,
+            ..Default::default()
         };
         let encoded = encode_request(&req);
         let (decoded, consumed): (Request, usize) = decode_line(&encoded).unwrap();
