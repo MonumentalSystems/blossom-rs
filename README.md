@@ -35,7 +35,7 @@ Content-addressed blob storage over HTTP with BIP-340 Schnorr authorization via 
 - **CORS** — configurable origins or allow-all for browser clients
 - **TLS** — optional rustls-based HTTPS via `axum-server`
 - **Graceful shutdown** — flushes stats to DB on Ctrl+C
-- **Media processing** ��� WebP conversion, thumbnails, blurhash, EXIF validation (feature-gated)
+- **Media processing** — WebP conversion, thumbnails, blurhash, EXIF validation (feature-gated)
 - **Content labeling** — pluggable classification traits for moderation (feature-gated)
 - **Perceptual hashing** — image dedup support via phash field in upload records
 - **Trait-based** — implement `BlossomSigner`, `BlobBackend`, `BlobDatabase`, `AccessControl`, `MediaProcessor`, `MediaLabeler`, or `WebhookNotifier` for your own types
@@ -111,6 +111,8 @@ let data = client.download(&desc.sha256).await?;
 | `db-postgres` | no | PostgreSQL metadata backend via SQLx |
 | `media` | no | Image processing (WebP, thumbnails, blurhash, EXIF) |
 | `labels` | no | Content classification (Vision Transformer, LLM API) |
+| `iroh-transport` | no | P2P QUIC transport via iroh (node-ID addressed, hole-punching) |
+| `pkarr-discovery` | no | Publish endpoints to Mainline DHT via PKARR (unified Ed25519 identity) |
 | `otel` | no | OpenTelemetry OTLP export (Jaeger, Tempo, Seq, Honeycomb) |
 
 ## Protocol Support
@@ -128,13 +130,15 @@ let data = client.download(&desc.sha256).await?;
 | **S3-compat** | Implemented | `PUT/GET/HEAD/DELETE /:bucket/*key` (feature-gated) |
 | **Health** | Implemented | `GET /health` |
 | **Status** | Implemented | `GET /status` |
+| **iroh** | Implemented | P2P QUIC via `/blossom/1` ALPN (feature-gated) |
+| **PKARR** | Implemented | DHT endpoint discovery via `_blossom` / `_iroh` TXT records (feature-gated) |
 
 ## Architecture
 
 All extension points are trait-based:
 
 ```
-BlossomSigner   ��� BIP-340 signing (bring your own identity)
+BlossomSigner   — BIP-340 signing (bring your own identity)
 BlobBackend     — blob storage (Memory, Filesystem, S3)
 BlobDatabase    — metadata persistence (Memory, SQLite, Postgres)
 AccessControl   — authorization (OpenAccess, Whitelist, custom)
@@ -187,7 +191,7 @@ let _guard = blossom_rs::otel::init_tracing("my-server", "info")?;
 ## Testing
 
 ```bash
-cargo test --workspace                          # 157 tests
+cargo test --workspace                          # 169 tests
 cargo test --workspace --features db-sqlite     # Include SQLite backend tests
 cargo llvm-cov --workspace --features db-sqlite # Coverage report
 
@@ -199,7 +203,7 @@ RUN_POSTGRES_TESTS=1 cargo test --features db-postgres --test postgres_integrati
 ## CI/CD
 
 - **CI**: On push/PR to master — `cargo fmt --all --check`, `cargo build --workspace`, `cargo test --workspace`, `cargo clippy --workspace`
-- **Publish**: On `v*` tags ��� test, then publish `blossom-rs` → `blossom-server` + `blossom-cli` to crates.io
+- **Publish**: On `v*` tags — test, then publish `blossom-rs` → `blossom-server` + `blossom-cli` to crates.io
 - Self-hosted runner for trusted pushes; GitHub-hosted for fork PRs
 
 ## Acknowledgments

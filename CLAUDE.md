@@ -21,7 +21,7 @@ blossom-cli/         — CLI client binary (crates.io: blossom-cli)
 ```bash
 cargo build --workspace              # Build all crates
 cargo build --all-features           # Build everything including s3, otel, media, etc.
-cargo test --workspace               # Run all tests (157 tests)
+cargo test --workspace               # Run all tests (169 tests)
 cargo clippy --workspace -- -D warnings  # Lint all crates
 cargo fmt --all --check              # Format check all crates
 cargo fmt --all                      # Auto-format all crates
@@ -53,6 +53,8 @@ cargo run -p blossom-cli -- status                    # Server status
 | `db-postgres` | no | PostgreSQL metadata backend via SQLx |
 | `media` | no | Image processing (WebP, thumbnails, blurhash, EXIF) |
 | `labels` | no | Content labeling (Vision Transformer, LLM API) |
+| `iroh-transport` | no | P2P QUIC transport via iroh (node-ID addressed) |
+| `pkarr-discovery` | no | PKARR endpoint publishing (implies iroh-transport) |
 | `otel` | no | OpenTelemetry OTLP export (Jaeger, Tempo, Seq) |
 
 ## Architecture
@@ -92,6 +94,12 @@ src/
 ├── media/
 │   ├── mod.rs          — MediaProcessor trait, PassthroughProcessor
 │   └── image_processor.rs — ImageProcessor (feature-gated)
+├── transport/
+│   ├── mod.rs          — Transport module re-exports
+│   ├── wire.rs         — Wire protocol codec (JSON-line + binary framing)
+│   ├── iroh_transport.rs — BlossomProtocol (iroh ProtocolHandler, feature-gated)
+│   ├── iroh_client.rs  — IrohBlossomClient (P2P client, feature-gated)
+│   └── pkarr_discovery.rs — PkarrPublisher, resolve (feature-gated)
 └── labels/
     └── mod.rs          — MediaLabeler trait, NoopLabeler, BlockAllLabeler
 ```
@@ -132,7 +140,7 @@ All key functions instrumented with `#[tracing::instrument]`. OTEL field naming:
 
 ## Testing Conventions
 
-- 157 tests: 108 lib unit + 18 lib integration + 5 property + 10 SQLite + 16 server e2e
+- 169 tests: 114 lib unit + 18 lib integration + 5 property + 10 SQLite + 16 server e2e + 6 iroh
 - Unit tests in `#[cfg(test)] mod tests` at bottom of each module
 - Async integration tests use `#[tokio::test]` with ephemeral TCP listeners
 - SQLite tests use `#[tokio::test(flavor = "multi_thread")]` for block_in_place

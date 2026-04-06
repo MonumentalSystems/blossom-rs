@@ -43,6 +43,10 @@ Options:
       --cors-origins <ORIGINS>   CORS allowed origins (comma-separated, default: all)
       --enable-admin             Enable admin endpoints at /admin/*
       --media                    Enable media processing on PUT /media (BUD-05)
+      --iroh                     Enable iroh P2P transport alongside HTTP
+      --iroh-key-file <PATH>     Iroh secret key file [default: ./iroh_secret.key]
+      --pkarr                    Enable PKARR endpoint discovery (requires --iroh)
+      --pkarr-republish-secs <N> PKARR republish interval [default: 3600]
       --log-level <LEVEL>        Log level [default: info]
 ```
 
