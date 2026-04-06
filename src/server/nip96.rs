@@ -20,7 +20,7 @@ use tracing::instrument;
 
 use super::verify_auth_event;
 use super::{error_json, extract_auth_event, SharedState};
-use crate::access::Action;
+use crate::access::{Action, Role};
 use crate::db::{DbError, UploadRecord};
 
 /// NIP-96 server info response (`.well-known/nostr/nip96.json`).
@@ -295,8 +295,21 @@ async fn handle_nip96_delete(
 
     let mut s = state.lock().await;
 
-    if !s.access.is_allowed(&pubkey, Action::Delete) {
+    let role = s.access.role(&pubkey);
+    if role == Role::Denied {
         return (StatusCode::FORBIDDEN, error_json("delete not allowed"));
+    }
+    // Members may only delete their own blobs. Anonymous uploads
+    // (pubkey "anonymous") have no owner, so anyone may delete them.
+    if role != Role::Admin {
+        if let Ok(record) = s.database.get_upload(&sha256) {
+            if record.pubkey != "anonymous" && record.pubkey != pubkey {
+                return (
+                    StatusCode::FORBIDDEN,
+                    error_json("not the blob owner"),
+                );
+            }
+        }
     }
 
     if s.backend.delete(&sha256) {

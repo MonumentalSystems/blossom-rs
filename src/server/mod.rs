@@ -28,7 +28,7 @@ use axum::{
 use tokio::sync::Mutex;
 use tracing::{info, instrument, warn};
 
-use crate::access::{AccessControl, Action, OpenAccess};
+use crate::access::{AccessControl, Action, OpenAccess, Role};
 use crate::auth::{verify_blossom_auth, verify_nip98_auth, AuthError};
 use crate::db::{BlobDatabase, DbError, MemoryDatabase, UploadRecord};
 use crate::media::MediaProcessor;
@@ -585,11 +585,24 @@ async fn handle_delete_blob(
                 return (StatusCode::UNAUTHORIZED, error_json(&e.to_string()));
             }
             let mut s = state.lock().await;
-            if !s.access.is_allowed(&event.pubkey, Action::Delete) {
+            let role = s.access.role(&event.pubkey);
+            if role == Role::Denied {
                 return (
                     StatusCode::FORBIDDEN,
                     error_json("delete not allowed for this pubkey"),
                 );
+            }
+            // Members may only delete their own blobs. Anonymous uploads
+            // (pubkey "anonymous") have no owner, so anyone may delete them.
+            if role != Role::Admin {
+                if let Ok(record) = s.database.get_upload(&sha256) {
+                    if record.pubkey != "anonymous" && record.pubkey != event.pubkey {
+                        return (
+                            StatusCode::FORBIDDEN,
+                            error_json("not the blob owner"),
+                        );
+                    }
+                }
             }
             if s.backend.delete(&sha256) {
                 let _ = s.database.delete_upload(&sha256);
