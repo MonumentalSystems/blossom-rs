@@ -107,6 +107,11 @@ struct Args {
     #[arg(long)]
     enable_admin: bool,
 
+    /// Enable media processing on PUT /media (BUD-05).
+    /// Processes images with thumbnails, blurhash, perceptual hashing.
+    #[arg(long)]
+    media: bool,
+
     /// Log level.
     #[arg(long, default_value = "info")]
     log_level: String,
@@ -188,6 +193,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let notifier = HttpNotifier::new(args.webhook_urls.clone());
         builder = builder.webhook_notifier(notifier);
         info!(urls = ?args.webhook_urls, "webhook notifications enabled");
+    }
+
+    // Media processing.
+    if args.media {
+        builder = builder.media_processor(blossom_rs::media::ImageProcessor::new());
+        info!("media processing enabled (PUT /media)");
     }
 
     // Whitelist setup.

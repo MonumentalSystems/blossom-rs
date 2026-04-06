@@ -20,8 +20,18 @@ struct Args {
     #[arg(short, long, env = "BLOSSOM_SECRET_KEY", global = true)]
     key: Option<String>,
 
+    /// Output format: json or text.
+    #[arg(short = 'f', long, default_value = "text", global = true)]
+    format: OutputFormat,
+
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Clone, clap::ValueEnum)]
+enum OutputFormat {
+    Json,
+    Text,
 }
 
 #[derive(Subcommand)]
@@ -47,6 +57,9 @@ enum Command {
     Delete {
         /// SHA256 hash of the blob.
         sha256: String,
+        /// Skip confirmation prompt.
+        #[arg(short, long)]
+        yes: bool,
     },
     /// List blobs uploaded by a pubkey.
     List {
@@ -98,6 +111,14 @@ fn get_signer(key: &Option<String>) -> Result<Signer, String> {
     }
 }
 
+/// Print a JSON value in the requested format.
+fn print_output(format: &OutputFormat, value: &serde_json::Value) {
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string(value).unwrap()),
+        OutputFormat::Text => println!("{}", serde_json::to_string_pretty(value).unwrap()),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
@@ -133,7 +154,7 @@ async fn run(args: Args) -> Result<(), String> {
             let mime = mime_from_path(&file);
 
             let desc = client.upload(&data, &mime).await?;
-            println!("{}", serde_json::to_string_pretty(&desc).unwrap());
+            print_output(&args.format, &serde_json::to_value(&desc).unwrap());
             Ok(())
         }
 
@@ -170,7 +191,18 @@ async fn run(args: Args) -> Result<(), String> {
             Ok(())
         }
 
-        Command::Delete { sha256 } => {
+        Command::Delete { sha256, yes } => {
+            if !yes {
+                eprint!("Delete blob {}? [y/N] ", &sha256[..12]);
+                let mut input = String::new();
+                std::io::stdin()
+                    .read_line(&mut input)
+                    .map_err(|e| format!("read stdin: {e}"))?;
+                if !input.trim().eq_ignore_ascii_case("y") {
+                    return Err("aborted".into());
+                }
+            }
+
             let signer = get_signer(&args.key)?;
             let http = reqwest::Client::new();
 
@@ -206,7 +238,7 @@ async fn run(args: Args) -> Result<(), String> {
             if resp.status().is_success() {
                 let body: serde_json::Value =
                     resp.json().await.map_err(|e| format!("parse: {e}"))?;
-                println!("{}", serde_json::to_string_pretty(&body).unwrap());
+                print_output(&args.format, &body);
             } else {
                 let text = resp.text().await.unwrap_or_default();
                 return Err(format!("list failed: {text}"));
@@ -233,7 +265,7 @@ async fn run(args: Args) -> Result<(), String> {
             if resp.status().is_success() {
                 let body: serde_json::Value =
                     resp.json().await.map_err(|e| format!("parse: {e}"))?;
-                println!("{}", serde_json::to_string_pretty(&body).unwrap());
+                print_output(&args.format, &body);
             } else {
                 let text = resp.text().await.unwrap_or_default();
                 return Err(format!("mirror failed: {text}"));
@@ -253,7 +285,7 @@ async fn run(args: Args) -> Result<(), String> {
             if resp.status().is_success() {
                 let body: serde_json::Value =
                     resp.json().await.map_err(|e| format!("parse: {e}"))?;
-                println!("{}", serde_json::to_string_pretty(&body).unwrap());
+                print_output(&args.format, &body);
             } else {
                 let text = resp.text().await.unwrap_or_default();
                 return Err(format!("status failed: {text}"));

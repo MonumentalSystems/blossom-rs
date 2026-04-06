@@ -31,6 +31,7 @@ use tracing::{info, instrument, warn};
 use crate::access::{AccessControl, Action, OpenAccess};
 use crate::auth::{verify_blossom_auth, verify_nip98_auth, AuthError};
 use crate::db::{BlobDatabase, DbError, MemoryDatabase, UploadRecord};
+use crate::media::MediaProcessor;
 use crate::protocol::{base64url_decode, BlobDescriptor, NostrEvent};
 use crate::ratelimit::RateLimiter;
 use crate::stats::StatsAccumulator;
@@ -61,6 +62,7 @@ pub struct ServerState {
     stats: StatsAccumulator,
     rate_limiter: Option<RateLimiter>,
     notifier: Box<dyn WebhookNotifier>,
+    media_processor: Option<Box<dyn MediaProcessor>>,
     base_url: String,
     requirements: UploadRequirements,
 }
@@ -92,6 +94,7 @@ pub struct BlobServerBuilder {
     body_limit: usize,
     rate_limiter: Option<RateLimiter>,
     notifier: Option<Box<dyn WebhookNotifier>>,
+    media_processor: Option<Box<dyn MediaProcessor>>,
 }
 
 impl BlobServerBuilder {
@@ -143,6 +146,12 @@ impl BlobServerBuilder {
         self
     }
 
+    /// Set a media processor for image/video handling on `PUT /media` (BUD-05).
+    pub fn media_processor(mut self, processor: impl MediaProcessor + 'static) -> Self {
+        self.media_processor = Some(Box::new(processor));
+        self
+    }
+
     /// Build the BlobServer.
     pub fn build(self) -> BlobServer {
         let state = Arc::new(Mutex::new(ServerState {
@@ -154,6 +163,7 @@ impl BlobServerBuilder {
             stats: StatsAccumulator::new(),
             rate_limiter: self.rate_limiter,
             notifier: self.notifier.unwrap_or_else(|| Box::new(NoopNotifier)),
+            media_processor: self.media_processor,
             base_url: self.base_url,
             requirements: self.requirements,
         }));
@@ -213,6 +223,7 @@ impl BlobServer {
             body_limit: 256 * 1024 * 1024, // 256 MB default
             rate_limiter: None,
             notifier: None,
+            media_processor: None,
         }
     }
 
@@ -240,6 +251,7 @@ impl BlobServer {
             )
             .route("/list/:pubkey", get(handle_list))
             .route("/mirror", put(handle_mirror))
+            .route("/media", put(handle_media_upload))
             .route("/upload-requirements", get(handle_upload_requirements))
             .route("/status", get(handle_status))
             .route("/health", get(handle_health))
@@ -679,6 +691,131 @@ async fn handle_mirror(
         StatusCode::OK,
         Json(serde_json::to_value(descriptor).unwrap()),
     )
+}
+
+// ---------------------------------------------------------------------------
+// BUD-05: Media upload (server-side processing)
+// ---------------------------------------------------------------------------
+
+#[instrument(name = "blossom.media_upload", skip_all, fields(blob.size, blob.sha256, auth.pubkey))]
+async fn handle_media_upload(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let data = body.to_vec();
+    tracing::Span::current().record("blob.size", data.len() as u64);
+    if data.is_empty() {
+        return (StatusCode::BAD_REQUEST, error_json("empty body"));
+    }
+
+    let mut s = state.lock().await;
+
+    // Media processor required.
+    let processor = match s.media_processor {
+        Some(ref p) => p,
+        None => {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                error_json("media processing not enabled on this server"),
+            );
+        }
+    };
+
+    // Auth required for media uploads.
+    let pubkey = match extract_auth_event(&headers) {
+        Ok(event) => {
+            if let Err(e) = verify_auth_event(&event, Some("upload")) {
+                return (StatusCode::UNAUTHORIZED, error_json(&e.to_string()));
+            }
+            if !s.access.is_allowed(&event.pubkey, Action::Upload) {
+                return (
+                    StatusCode::FORBIDDEN,
+                    error_json("upload not allowed for this pubkey"),
+                );
+            }
+            event.pubkey
+        }
+        Err(e) => {
+            return (StatusCode::UNAUTHORIZED, error_json(&e.to_string()));
+        }
+    };
+
+    // Detect MIME type from content (simple heuristic).
+    let mime = detect_mime(&data);
+
+    // Process the media.
+    let result = match processor.process(&data, &mime) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                error_json(&format!("media processing failed: {e}")),
+            );
+        }
+    };
+
+    // Store the processed data.
+    let base_url = s.base_url.clone();
+    let descriptor = s.backend.insert(result.data, &base_url);
+    tracing::Span::current().record("blob.sha256", descriptor.sha256.as_str());
+
+    // Record in database with phash.
+    let record = UploadRecord {
+        sha256: descriptor.sha256.clone(),
+        size: descriptor.size,
+        mime_type: result.mime_type,
+        pubkey: pubkey.clone(),
+        created_at: descriptor.uploaded.unwrap_or(0),
+        phash: result.phash,
+    };
+    let _ = s.database.record_upload(&record);
+
+    s.notifier.notify(webhooks::make_payload(
+        EventType::Upload,
+        &descriptor.sha256,
+        descriptor.size,
+        &pubkey,
+        None,
+    ));
+
+    // Build response with media metadata.
+    let mut response = serde_json::to_value(&descriptor).unwrap();
+    if let Some(bh) = result.blurhash {
+        response["blurhash"] = serde_json::Value::String(bh);
+    }
+    if let Some(w) = result.width {
+        response["width"] = serde_json::Value::Number(w.into());
+    }
+    if let Some(h) = result.height {
+        response["height"] = serde_json::Value::Number(h.into());
+    }
+    if let Some(ph) = result.phash {
+        response["phash"] = serde_json::Value::Number(ph.into());
+    }
+
+    info!(
+        blob.sha256 = %descriptor.sha256,
+        blob.size = descriptor.size,
+        "media blob processed and uploaded"
+    );
+
+    (StatusCode::OK, Json(response))
+}
+
+/// Simple MIME type detection from magic bytes.
+fn detect_mime(data: &[u8]) -> String {
+    if data.len() < 4 {
+        return "application/octet-stream".to_string();
+    }
+    match &data[..4] {
+        [0x89, b'P', b'N', b'G'] => "image/png",
+        [0xFF, 0xD8, 0xFF, _] => "image/jpeg",
+        [b'G', b'I', b'F', b'8'] => "image/gif",
+        [b'R', b'I', b'F', b'F'] if data.len() > 12 && &data[8..12] == b"WEBP" => "image/webp",
+        _ => "application/octet-stream",
+    }
+    .to_string()
 }
 
 // ---------------------------------------------------------------------------
