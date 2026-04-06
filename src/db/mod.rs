@@ -40,15 +40,22 @@ pub struct UploadRecord {
     pub phash: Option<u64>,
 }
 
-/// Per-user record for quota tracking.
+/// Per-user record with role and quota tracking.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserRecord {
     /// Hex-encoded x-only public key.
     pub pubkey: String,
+    /// Role: "admin", "member", or "denied". Default: "member".
+    #[serde(default = "default_role")]
+    pub role: String,
     /// Maximum bytes this user may store. `None` means unlimited.
     pub quota_bytes: Option<u64>,
     /// Current total bytes stored by this user.
     pub used_bytes: u64,
+}
+
+fn default_role() -> String {
+    "member".to_string()
 }
 
 /// Per-blob access statistics.
@@ -124,6 +131,18 @@ pub trait BlobDatabase: Send + Sync {
 
     /// Total number of registered users.
     fn user_count(&self) -> usize;
+
+    // --- Roles ---
+
+    /// Set a user's role ("admin", "member", or "denied").
+    /// Creates the user if they don't exist.
+    fn set_role(&mut self, pubkey: &str, role: &str) -> Result<(), DbError>;
+
+    /// Get a user's role. Returns "member" for unknown users.
+    fn get_role(&self, pubkey: &str) -> String;
+
+    /// List all users with a given role.
+    fn list_users_by_role(&self, role: &str) -> Result<Vec<UserRecord>, DbError>;
 
     // --- Perceptual hash dedup ---
 

@@ -78,6 +78,7 @@ impl BlobDatabase for MemoryDatabase {
             .entry(pubkey.to_string())
             .or_insert_with(|| UserRecord {
                 pubkey: pubkey.to_string(),
+                role: "member".to_string(),
                 quota_bytes: None,
                 used_bytes: 0,
             })
@@ -90,6 +91,7 @@ impl BlobDatabase for MemoryDatabase {
             .entry(pubkey.to_string())
             .or_insert_with(|| UserRecord {
                 pubkey: pubkey.to_string(),
+                role: "member".to_string(),
                 quota_bytes: None,
                 used_bytes: 0,
             });
@@ -119,6 +121,7 @@ impl BlobDatabase for MemoryDatabase {
             .entry(pubkey.to_string())
             .or_insert_with(|| UserRecord {
                 pubkey: pubkey.to_string(),
+                role: "member".to_string(),
                 quota_bytes: None,
                 used_bytes: 0,
             });
@@ -155,6 +158,36 @@ impl BlobDatabase for MemoryDatabase {
 
     fn user_count(&self) -> usize {
         self.users.len()
+    }
+
+    fn set_role(&mut self, pubkey: &str, role: &str) -> Result<(), DbError> {
+        let user = self
+            .users
+            .entry(pubkey.to_string())
+            .or_insert_with(|| UserRecord {
+                pubkey: pubkey.to_string(),
+                role: "member".to_string(),
+                quota_bytes: None,
+                used_bytes: 0,
+            });
+        user.role = role.to_string();
+        Ok(())
+    }
+
+    fn get_role(&self, pubkey: &str) -> String {
+        self.users
+            .get(pubkey)
+            .map(|u| u.role.clone())
+            .unwrap_or_else(|| "member".to_string())
+    }
+
+    fn list_users_by_role(&self, role: &str) -> Result<Vec<UserRecord>, DbError> {
+        Ok(self
+            .users
+            .values()
+            .filter(|u| u.role == role)
+            .cloned()
+            .collect())
     }
 }
 

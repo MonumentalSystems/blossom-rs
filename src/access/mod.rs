@@ -322,6 +322,57 @@ impl AccessControl for Arc<RoleBasedAccess> {
     }
 }
 
+impl RoleBasedAccess {
+    /// Load roles from a database, populating the admin and member sets
+    /// from persisted user records. Call at startup after DB migrations.
+    pub async fn load_from_database(db: &mut dyn crate::db::BlobDatabase) -> Self {
+        let admins: HashSet<String> = db
+            .list_users_by_role("admin")
+            .unwrap_or_default()
+            .into_iter()
+            .map(|u| u.pubkey)
+            .collect();
+        let members: HashSet<String> = db
+            .list_users_by_role("member")
+            .unwrap_or_default()
+            .into_iter()
+            .map(|u| u.pubkey)
+            .collect();
+        tracing::info!(
+            admins = admins.len(),
+            members = members.len(),
+            "loaded roles from database"
+        );
+        Self::new(admins, members)
+    }
+
+    /// Promote a pubkey to admin in both the in-memory set and the database.
+    pub async fn promote_admin(
+        &self,
+        pubkey: &str,
+        db: &mut dyn crate::db::BlobDatabase,
+    ) -> Result<(), crate::db::DbError> {
+        let normalized = normalize_pubkey(pubkey).unwrap_or_else(|| pubkey.to_string());
+        db.set_role(&normalized, "admin")?;
+        self.admins.write().await.insert(normalized.clone());
+        self.members.write().await.remove(&normalized);
+        Ok(())
+    }
+
+    /// Demote a pubkey to member in both the in-memory set and the database.
+    pub async fn demote_to_member(
+        &self,
+        pubkey: &str,
+        db: &mut dyn crate::db::BlobDatabase,
+    ) -> Result<(), crate::db::DbError> {
+        let normalized = normalize_pubkey(pubkey).unwrap_or_else(|| pubkey.to_string());
+        db.set_role(&normalized, "member")?;
+        self.admins.write().await.remove(&normalized);
+        self.members.write().await.insert(normalized);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

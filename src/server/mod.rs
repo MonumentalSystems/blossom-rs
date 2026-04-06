@@ -107,6 +107,12 @@ impl BlobServerBuilder {
         self
     }
 
+    /// Set a database backend from a boxed trait object.
+    pub fn database_boxed(mut self, db: Box<dyn BlobDatabase>) -> Self {
+        self.database = Some(db);
+        self
+    }
+
     /// Set an access control policy.
     pub fn access_control(mut self, ac: impl AccessControl + 'static) -> Self {
         self.access = Some(Box::new(ac));

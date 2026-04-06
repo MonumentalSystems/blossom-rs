@@ -27,7 +27,7 @@ impl PostgresDatabase {
         Ok(db)
     }
 
-    const SCHEMA_VERSION: i64 = 2;
+    const SCHEMA_VERSION: i64 = 3;
 
     async fn run_migrations(&self) -> Result<(), DbError> {
         sqlx::query(
@@ -50,6 +50,9 @@ impl PostgresDatabase {
         }
         if current < 2 {
             self.migrate_v2().await?;
+        }
+        if current < 3 {
+            self.migrate_v3().await?;
         }
 
         if current < Self::SCHEMA_VERSION {
@@ -139,6 +142,25 @@ impl PostgresDatabase {
                 .execute(&self.pool)
                 .await
                 .map_err(|e| DbError::Internal(format!("v2 migration: {e}")))?;
+        }
+
+        Ok(())
+    }
+
+    /// V3: Add role column to users table.
+    async fn migrate_v3(&self) -> Result<(), DbError> {
+        let has_role: bool = sqlx::query_scalar(
+            "SELECT COUNT(*) > 0 FROM information_schema.columns WHERE table_name = 'users' AND column_name = 'role'",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(false);
+
+        if !has_role {
+            sqlx::query("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'member'")
+                .execute(&self.pool)
+                .await
+                .map_err(|e| DbError::Internal(format!("v3 migration: {e}")))?;
         }
 
         Ok(())
@@ -267,7 +289,7 @@ impl BlobDatabase for PostgresDatabase {
     fn get_or_create_user(&mut self, pubkey: &str) -> Result<UserRecord, DbError> {
         Self::block_on(async {
             sqlx::query(
-                "INSERT INTO users (pubkey, used_bytes) VALUES ($1, 0)
+                "INSERT INTO users (pubkey, used_bytes, role) VALUES ($1, 0, 'member')
                  ON CONFLICT (pubkey) DO NOTHING",
             )
             .bind(pubkey)
@@ -275,8 +297,8 @@ impl BlobDatabase for PostgresDatabase {
             .await
             .map_err(|e| DbError::Internal(format!("create user: {e}")))?;
 
-            let row: (String, Option<i64>, i64) = sqlx::query_as(
-                "SELECT pubkey, quota_bytes, used_bytes FROM users WHERE pubkey = $1",
+            let row: (String, Option<i64>, i64, String) = sqlx::query_as(
+                "SELECT pubkey, quota_bytes, used_bytes, role FROM users WHERE pubkey = $1",
             )
             .bind(pubkey)
             .fetch_one(&self.pool)
@@ -287,6 +309,7 @@ impl BlobDatabase for PostgresDatabase {
                 pubkey: row.0,
                 quota_bytes: row.1.map(|v| v as u64),
                 used_bytes: row.2 as u64,
+                role: row.3,
             })
         })
     }
@@ -403,6 +426,54 @@ impl BlobDatabase for PostgresDatabase {
                 .await
                 .unwrap_or((0,));
             row.0 as usize
+        })
+    }
+
+    fn set_role(&mut self, pubkey: &str, role: &str) -> Result<(), DbError> {
+        Self::block_on(async {
+            sqlx::query(
+                "INSERT INTO users (pubkey, used_bytes, role) VALUES ($1, 0, $2)
+                 ON CONFLICT (pubkey) DO UPDATE SET role = $2",
+            )
+            .bind(pubkey)
+            .bind(role)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| DbError::Internal(format!("set role: {e}")))?;
+            Ok(())
+        })
+    }
+
+    fn get_role(&self, pubkey: &str) -> String {
+        Self::block_on(async {
+            let row: Option<(String,)> = sqlx::query_as("SELECT role FROM users WHERE pubkey = $1")
+                .bind(pubkey)
+                .fetch_optional(&self.pool)
+                .await
+                .unwrap_or(None);
+            row.map(|r| r.0).unwrap_or_else(|| "member".to_string())
+        })
+    }
+
+    fn list_users_by_role(&self, role: &str) -> Result<Vec<UserRecord>, DbError> {
+        Self::block_on(async {
+            let rows: Vec<(String, Option<i64>, i64, String)> = sqlx::query_as(
+                "SELECT pubkey, quota_bytes, used_bytes, role FROM users WHERE role = $1",
+            )
+            .bind(role)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DbError::Internal(format!("list by role: {e}")))?;
+
+            Ok(rows
+                .into_iter()
+                .map(|r| UserRecord {
+                    pubkey: r.0,
+                    quota_bytes: r.1.map(|v| v as u64),
+                    used_bytes: r.2 as u64,
+                    role: r.3,
+                })
+                .collect())
         })
     }
 }
