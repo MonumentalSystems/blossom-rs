@@ -79,6 +79,8 @@ pub use server::BlobServer;
 #[cfg(feature = "client")]
 pub use client::batch::{upload_batch, upload_batch_concurrent, DEFAULT_MAX_CONCURRENT};
 #[cfg(feature = "client")]
+pub use client::multi::{MultiTransportClient, Transport};
+#[cfg(feature = "client")]
 pub use client::BlossomClient;
 
 #[cfg(feature = "db-sqlite")]
