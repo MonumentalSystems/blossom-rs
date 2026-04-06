@@ -336,13 +336,37 @@ fn is_valid_sha256(s: &str) -> bool {
     s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-/// Extract Content-Type from request headers, defaulting to octet-stream.
-fn extract_content_type(headers: &HeaderMap) -> String {
-    headers
+/// Extract Content-Type from request headers. If missing or generic
+/// (`application/octet-stream`), returns `None` so the caller can
+/// fall back to magic byte detection.
+fn extract_content_type(headers: &HeaderMap) -> Option<String> {
+    let ct = headers
         .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/octet-stream")
-        .to_string()
+        .and_then(|v| v.to_str().ok())?;
+    if ct == "application/octet-stream" {
+        None
+    } else {
+        Some(ct.to_string())
+    }
+}
+
+/// Detect MIME type from magic bytes in the data.
+fn detect_mime(data: &[u8]) -> String {
+    if data.len() < 4 {
+        return "application/octet-stream".to_string();
+    }
+    match &data[..4] {
+        [0x89, b'P', b'N', b'G'] => "image/png",
+        [0xFF, 0xD8, 0xFF, _] => "image/jpeg",
+        [b'G', b'I', b'F', b'8'] => "image/gif",
+        [b'R', b'I', b'F', b'F'] if data.len() > 12 && &data[8..12] == b"WEBP" => "image/webp",
+        [0x25, b'P', b'D', b'F'] => "application/pdf",
+        [b'P', b'K', 0x03, 0x04] => "application/zip",
+        [0x1F, 0x8B, _, _] => "application/gzip",
+        _ if data.len() > 8 && &data[4..8] == b"ftyp" => "video/mp4",
+        _ => "application/octet-stream",
+    }
+    .to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -428,16 +452,17 @@ async fn handle_upload(
         extract_auth_event(&headers).ok().map(|e| e.pubkey)
     };
 
+    // Detect Content-Type before moving data into backend.
+    let content_type = extract_content_type(&headers).unwrap_or_else(|| detect_mime(&data));
+
     let base_url = s.base_url.clone();
     let descriptor = s.backend.insert(data, &base_url);
 
     // Record span fields now that we know the sha256.
     tracing::Span::current().record("blob.sha256", descriptor.sha256.as_str());
 
-    // Record in database with Content-Type from request header.
     let upload_pubkey = pubkey.unwrap_or_else(|| "anonymous".to_string());
     tracing::Span::current().record("auth.pubkey", upload_pubkey.as_str());
-    let content_type = extract_content_type(&headers);
     let record = UploadRecord {
         sha256: descriptor.sha256.clone(),
         size: descriptor.size,
@@ -843,20 +868,7 @@ async fn handle_media_upload(
     (StatusCode::OK, Json(response))
 }
 
-/// Simple MIME type detection from magic bytes.
-fn detect_mime(data: &[u8]) -> String {
-    if data.len() < 4 {
-        return "application/octet-stream".to_string();
-    }
-    match &data[..4] {
-        [0x89, b'P', b'N', b'G'] => "image/png",
-        [0xFF, 0xD8, 0xFF, _] => "image/jpeg",
-        [b'G', b'I', b'F', b'8'] => "image/gif",
-        [b'R', b'I', b'F', b'F'] if data.len() > 12 && &data[8..12] == b"WEBP" => "image/webp",
-        _ => "application/octet-stream",
-    }
-    .to_string()
-}
+// detect_mime is defined above, shared by upload and media handlers.
 
 // ---------------------------------------------------------------------------
 // BUD-06: Upload requirements

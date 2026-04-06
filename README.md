@@ -191,7 +191,7 @@ let _guard = blossom_rs::otel::init_tracing("my-server", "info")?;
 ## Testing
 
 ```bash
-cargo test --workspace                          # 169 tests
+cargo test --workspace                          # 207 tests
 cargo test --workspace --features db-sqlite     # Include SQLite backend tests
 cargo llvm-cov --workspace --features db-sqlite # Coverage report
 

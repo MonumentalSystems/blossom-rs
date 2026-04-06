@@ -1,5 +1,25 @@
 # Release Notes
 
+## v0.2.1
+
+### Bug Fixes
+
+- **HEAD `/:sha256` returns `Content-Length`** — was returning 0, now returns actual blob size.
+
+### New Features
+
+- **`blossom-cli media <FILE>`** — upload with server-side processing (BUD-05 `PUT /media`). Returns optimized blob descriptor with blurhash, dimensions, and perceptual hash.
+- **`blossom-cli admin` subcommand** — CLI interface for admin endpoints:
+  - `admin stats` — server statistics
+  - `admin get-user <PUBKEY>` — user info + quota
+  - `admin set-quota <PUBKEY> [BYTES]` — set user quota (omit for unlimited)
+  - `admin list-blobs` — blob count + total size
+  - `admin delete-blob <SHA256>` — admin delete (no ownership check)
+- **`blossom-cli upload --content-type <MIME>`** — override auto-detected Content-Type.
+- **Upload MIME auto-detection** — CLI detects Content-Type from file extension and sets the header (was always `application/octet-stream`).
+
+---
+
 ## v0.2.0
 
 ### Breaking Changes
