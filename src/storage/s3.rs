@@ -82,14 +82,12 @@ impl S3Backend {
                 .await
                 .map_err(|e| format!("s3 list objects: {e}"))?;
 
-            if let Some(contents) = resp.contents() {
-                for obj in contents {
-                    if let Some(key) = obj.key() {
-                        if let Some(hash) = key.strip_suffix(".blob") {
-                            if hash.len() == 64 {
-                                let size = obj.size().unwrap_or(0) as u64;
-                                self.index.insert(hash.to_string(), size);
-                            }
+            for obj in resp.contents() {
+                if let Some(key) = obj.key() {
+                    if let Some(hash) = key.strip_suffix(".blob") {
+                        if hash.len() == 64 {
+                            let size = obj.size.unwrap_or(0) as u64;
+                            self.index.insert(hash.to_string(), size);
                         }
                     }
                 }
