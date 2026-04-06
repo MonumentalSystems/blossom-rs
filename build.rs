@@ -117,7 +117,18 @@ fn ensure_openssl_linux(target_env: &str) {
 
     // Refresh package lists for apt-get.
     if installer == "apt-get" {
-        let _ = Command::new(installer).args(["update", "-qq"]).status();
+        match Command::new(installer).args(["update", "-qq"]).status() {
+            Ok(s) if !s.success() => {
+                println!("cargo:warning=apt-get update failed (exit {}); proceeding with possibly stale index.", s);
+            }
+            Err(e) => {
+                println!(
+                    "cargo:warning=apt-get update error: {}; proceeding anyway.",
+                    e
+                );
+            }
+            _ => {}
+        }
     }
 
     let mut pkgs: Vec<&str> = vec!["libssl-dev", "pkg-config"];
@@ -182,14 +193,19 @@ fn ensure_openssl_macos() {
         Ok(s) if s.success() => {
             println!("cargo:warning=Installed openssl@3 via Homebrew.");
 
-            // Expose the Homebrew prefix so pkg-config can find openssl.pc.
+            // Expose the Homebrew prefix so pkg-config can find openssl.pc
+            // during subsequent build steps in the same cargo invocation.
             if let Ok(output) = Command::new("brew")
                 .args(["--prefix", "openssl@3"])
                 .output()
             {
                 if let Ok(prefix) = String::from_utf8(output.stdout) {
                     let prefix = prefix.trim();
-                    println!("cargo:rustc-env=PKG_CONFIG_PATH={}/lib/pkgconfig", prefix);
+                    // Set the variable for the current build process so that
+                    // pkg-config launched by other build scripts can find it.
+                    let pkg_config_path = format!("{}/lib/pkgconfig", prefix);
+                    env::set_var("PKG_CONFIG_PATH", &pkg_config_path);
+                    println!("cargo:warning=Set PKG_CONFIG_PATH={}", pkg_config_path);
                 }
             }
         }
@@ -218,9 +234,9 @@ fn ensure_openssl_windows() {
     }
 
     if command_exists("scoop") {
-        install_windows_dep("scoop install openssl");
+        install_windows_dep("scoop", &["install", "openssl"]);
     } else if command_exists("winget") {
-        install_windows_dep("winget install --id=ShiningLight.OpenSSL -e");
+        install_windows_dep("winget", &["install", "--id=ShiningLight.OpenSSL", "-e"]);
     } else {
         println!(
             "cargo:warning=OpenSSL not found and neither Scoop nor Winget \
@@ -229,12 +245,13 @@ fn ensure_openssl_windows() {
     }
 }
 
-fn install_windows_dep(install_cmd: &str) {
+fn install_windows_dep(tool: &str, args: &[&str]) {
     println!(
-        "cargo:warning=OpenSSL not found on Windows. Attempting: {}",
-        install_cmd
+        "cargo:warning=OpenSSL not found on Windows. Attempting: {} {}",
+        tool,
+        args.join(" ")
     );
-    match Command::new("cmd").args(["/C", install_cmd]).status() {
+    match Command::new(tool).args(args).status() {
         Ok(s) if s.success() => {
             println!("cargo:warning=OpenSSL installed successfully.");
         }
@@ -247,9 +264,9 @@ fn install_windows_dep(install_cmd: &str) {
         }
         Err(e) => {
             println!(
-                "cargo:warning=Failed to run installer: {}. \
+                "cargo:warning=Failed to run '{}': {}. \
                  Install OpenSSL manually and set OPENSSL_DIR.",
-                e
+                tool, e
             );
         }
     }

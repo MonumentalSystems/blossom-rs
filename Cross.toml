@@ -3,12 +3,6 @@
 # before the Rust build begins, following the pattern used in gnostr/build.rs.
 # See: https://github.com/cross-rs/cross#configuration
 
-[build]
-pre-build = [
-    "apt-get update -qq",
-    "apt-get install -y --no-install-recommends pkg-config libssl-dev",
-]
-
 # GNU Linux x86_64 — dynamically linked OpenSSL is fine.
 [target.x86_64-unknown-linux-gnu]
 pre-build = [
@@ -24,7 +18,7 @@ pre-build = [
 ]
 
 [target.x86_64-unknown-linux-musl.env]
-# Pass through static-linking hints so openssl-sys uses static libs.
+# Pass through static-linking hints so openssl-sys uses static libs if needed.
 passthrough = [
     "OPENSSL_STATIC",
     "OPENSSL_LIB_DIR",
