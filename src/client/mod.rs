@@ -4,6 +4,7 @@
 //! authorization and multi-server failover.
 
 pub mod batch;
+pub mod multi;
 
 use crate::auth::{auth_header_value, build_blossom_auth, BlossomSigner};
 use crate::protocol::{sha256_hex, BlobDescriptor, STREAM_CHUNK_SIZE};
