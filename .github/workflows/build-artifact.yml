@@ -11,6 +11,7 @@ jobs:
     env:
       BUILD_NAME: "blossom-${{ github.ref_name }}-${{ matrix.target }}"
     strategy:
+      fail-fast: false
       matrix:
         build: [linux-x64, linux-x64-musl, windows-x64, macos-x64, macos-arm64]
         include:
@@ -52,6 +53,12 @@ jobs:
             ~/.cargo/git
             target
         key: ${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Install Linux system dependencies
+      if: runner.os == 'Linux'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libssl-dev pkg-config musl-tools
 
     - name: Install cross
       uses: taiki-e/install-action@v2
