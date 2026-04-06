@@ -5,7 +5,11 @@
 
 use std::path::PathBuf;
 
+use std::sync::Arc;
+
 use blossom_rs::auth::{auth_header_value, build_blossom_auth};
+use blossom_rs::client::multi::MultiTransportClient;
+use blossom_rs::traits::BlobClient;
 use blossom_rs::transport::IrohBlossomClient;
 use blossom_rs::{BlossomClient, BlossomSigner, Signer};
 use clap::{Parser, Subcommand};
@@ -13,9 +17,18 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(name = "blossom-cli", about = "CLI client for Blossom blob storage")]
 struct Args {
-    /// Blossom server URL.
+    /// Blossom server URL (HTTP).
     #[arg(short, long, default_value = "http://localhost:3000", global = true)]
     server: String,
+
+    /// Iroh endpoint address (iroh://<node-id>). When provided alongside
+    /// --server, uploads prefer iroh and downloads prefer HTTP.
+    #[arg(long, global = true)]
+    iroh: Option<String>,
+
+    /// Force all operations through iroh (no HTTP fallback).
+    #[arg(long, global = true)]
+    iroh_only: bool,
 
     /// Secret key (hex or nsec1 bech32).
     #[arg(short, long, env = "BLOSSOM_SECRET_KEY", global = true)]
@@ -88,6 +101,14 @@ enum Command {
     /// Admin commands (requires auth + admin access).
     #[command(subcommand)]
     Admin(AdminCommand),
+    /// Batch upload multiple files (streaming, concurrent).
+    BatchUpload {
+        /// Files to upload.
+        files: Vec<PathBuf>,
+        /// Maximum concurrent uploads.
+        #[arg(long, default_value = "8")]
+        concurrency: usize,
+    },
     /// Resolve a PKARR public key to blossom endpoints.
     Resolve {
         /// PKARR public key (z-base-32, e.g., pk:z...).
@@ -210,6 +231,42 @@ async fn main() {
     }
 }
 
+/// Build a MultiTransportClient based on CLI args.
+async fn build_client(args: &Args, signer: Signer) -> Result<MultiTransportClient, String> {
+    let iroh_url = args.iroh.as_deref().or_else(|| {
+        if is_iroh_server(&args.server) {
+            Some(args.server.as_str())
+        } else {
+            None
+        }
+    });
+
+    let http_server = if is_iroh_server(&args.server) {
+        // If --server is iroh:// and no HTTP server, HTTP client gets a dummy URL.
+        // It'll fail, and iroh will be used via fallback.
+        "http://localhost:3000".to_string()
+    } else {
+        args.server.clone()
+    };
+
+    let http = BlossomClient::new(
+        vec![http_server],
+        Signer::from_secret_hex(&signer.secret_key_hex())?,
+    );
+
+    if let Some(iroh_str) = iroh_url {
+        let addr = parse_iroh_addr(iroh_str)?;
+        let iroh = make_iroh_client(Signer::from_secret_hex(&signer.secret_key_hex())?).await?;
+        let mut client = MultiTransportClient::new(http, iroh, addr);
+        if args.iroh_only {
+            client = client.iroh_only();
+        }
+        Ok(client)
+    } else {
+        Ok(MultiTransportClient::http_only(http))
+    }
+}
+
 async fn run(args: Args) -> Result<(), String> {
     match args.command {
         Command::Keygen => {
@@ -224,20 +281,19 @@ async fn run(args: Args) -> Result<(), String> {
             Ok(())
         }
 
-        Command::Upload { file, content_type } => {
+        Command::Upload {
+            ref file,
+            ref content_type,
+        } => {
+            let file = file.clone();
+            let mime = content_type
+                .clone()
+                .unwrap_or_else(|| mime_from_path(&file));
             let signer = get_signer(&args.key)?;
-            let data = std::fs::read(&file).map_err(|e| format!("read {}: {e}", file.display()))?;
-            let mime = content_type.unwrap_or_else(|| mime_from_path(&file));
+            let client = build_client(&args, signer).await?;
 
-            let desc = if is_iroh_server(&args.server) {
-                let addr = parse_iroh_addr(&args.server)?;
-                let client =
-                    make_iroh_client(Signer::from_secret_hex(&signer.secret_key_hex())?).await?;
-                client.upload(addr, &data).await?
-            } else {
-                let client = BlossomClient::new(vec![args.server], signer);
-                client.upload(&data, &mime).await?
-            };
+            // Use streaming upload_file — never buffers full file in memory.
+            let desc = client.upload_file(&(), &file, &mime).await?;
 
             print_output(&args.format, &serde_json::to_value(&desc).unwrap());
             Ok(())
@@ -568,6 +624,38 @@ async fn run(args: Args) -> Result<(), String> {
                         return Err(format!("whitelist remove failed: {text}"));
                     }
                 }
+            }
+            Ok(())
+        }
+
+        Command::BatchUpload {
+            ref files,
+            concurrency,
+        } => {
+            let files = files.clone();
+            let signer = get_signer(&args.key)?;
+            let client = Arc::new(build_client(&args, signer).await?);
+
+            let results =
+                blossom_rs::upload_batch_concurrent(client, &(), files, concurrency).await;
+
+            let mut success = 0;
+            let mut failed = 0;
+            for result in &results {
+                match result {
+                    Ok(desc) => {
+                        println!("{} ({}B)", desc.sha256, desc.size);
+                        success += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        failed += 1;
+                    }
+                }
+            }
+            println!("\n{success} uploaded, {failed} failed");
+            if failed > 0 {
+                std::process::exit(1);
             }
             Ok(())
         }
