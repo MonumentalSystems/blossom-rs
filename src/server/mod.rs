@@ -13,6 +13,7 @@
 //! NIP-96 endpoints are available via the [`nip96`] submodule.
 
 pub mod admin;
+pub mod locks;
 pub mod nip96;
 
 use std::sync::Arc;
@@ -31,6 +32,7 @@ use tracing::{info, instrument, warn};
 use crate::access::{AccessControl, Action, OpenAccess, Role};
 use crate::auth::{verify_blossom_auth, verify_nip98_auth, AuthError};
 use crate::db::{BlobDatabase, DbError, MemoryDatabase, UploadRecord};
+use crate::locks::LockDatabase;
 use crate::media::MediaProcessor;
 use crate::protocol::{base64url_decode, BlobDescriptor, NostrEvent};
 use crate::ratelimit::RateLimiter;
@@ -67,6 +69,7 @@ pub struct ServerState {
     media_processor: Option<Box<dyn MediaProcessor>>,
     base_url: String,
     requirements: UploadRequirements,
+    pub lock_db: Option<Box<dyn LockDatabase>>,
 }
 
 impl ServerState {
@@ -98,6 +101,7 @@ pub struct BlobServerBuilder {
     rate_limiter: Option<RateLimiter>,
     notifier: Option<Box<dyn WebhookNotifier>>,
     media_processor: Option<Box<dyn MediaProcessor>>,
+    lock_db: Option<Box<dyn LockDatabase>>,
 }
 
 impl BlobServerBuilder {
@@ -176,8 +180,17 @@ impl BlobServerBuilder {
         self
     }
 
+    /// Set a lock database for LFS file locking (BUD-08).
+    /// When set, lock API endpoints are mounted. When unset, lock endpoints
+    /// return 404 (Git LFS treats this as "locking unsupported").
+    pub fn lock_database(mut self, db: impl LockDatabase + 'static) -> Self {
+        self.lock_db = Some(Box::new(db));
+        self
+    }
+
     /// Build the BlobServer.
     pub fn build(self) -> BlobServer {
+        let has_locks = self.lock_db.is_some();
         let state = Arc::new(Mutex::new(ServerState {
             backend: self.backend,
             database: self
@@ -191,10 +204,12 @@ impl BlobServerBuilder {
             media_processor: self.media_processor,
             base_url: self.base_url,
             requirements: self.requirements,
+            lock_db: self.lock_db,
         }));
         BlobServer {
             state,
             body_limit: self.body_limit,
+            has_locks,
         }
     }
 }
@@ -222,6 +237,7 @@ impl BlobServerBuilder {
 pub struct BlobServer {
     state: SharedState,
     body_limit: usize,
+    has_locks: bool,
 }
 
 impl BlobServer {
@@ -250,6 +266,7 @@ impl BlobServer {
             rate_limiter: None,
             notifier: None,
             media_processor: None,
+            lock_db: None,
         }
     }
 
@@ -267,7 +284,7 @@ impl BlobServer {
     /// spans with `http.method`, `http.route`, and `http.status_code` fields
     /// following OTEL semantic conventions.
     pub fn router(&self) -> Router {
-        Router::new()
+        let mut router = Router::new()
             .route("/upload", put(handle_upload))
             .route(
                 "/:sha256",
@@ -281,7 +298,13 @@ impl BlobServer {
             .route("/upload-requirements", get(handle_upload_requirements))
             .route("/status", get(handle_status))
             .route("/health", get(handle_health))
-            .with_state(self.state.clone())
+            .with_state(self.state.clone());
+
+        if self.has_locks {
+            router = router.merge(locks::locks_router(self.state.clone()));
+        }
+
+        router
             .layer(axum::extract::DefaultBodyLimit::max(self.body_limit))
             .layer(
                 tower_http::trace::TraceLayer::new_for_http()
