@@ -4,7 +4,7 @@
 //! authorization and multi-server failover.
 
 use crate::auth::{auth_header_value, build_blossom_auth, BlossomSigner};
-use crate::protocol::{sha256_hex, BlobDescriptor};
+use crate::protocol::{sha256_hex, BlobDescriptor, STREAM_CHUNK_SIZE};
 use tracing::{info, instrument, warn};
 
 /// Async HTTP client for Blossom blob servers.
@@ -290,6 +290,105 @@ impl BlossomClient {
 
         Err("all Blossom servers failed for list".into())
     }
+
+    /// Upload a file from disk without buffering in memory.
+    ///
+    /// First pass computes SHA256 for the auth header. Second pass
+    /// streams the file to the server via reqwest.
+    #[instrument(name = "blossom.client.upload_file", skip_all, fields(
+        file.path = %path.display(),
+        blob.sha256,
+        blob.size,
+    ))]
+    pub async fn upload_file(
+        &self,
+        path: &std::path::Path,
+        content_type: &str,
+    ) -> Result<BlobDescriptor, String> {
+        // First pass: compute SHA256 by streaming the file.
+        let file_meta = tokio::fs::metadata(path)
+            .await
+            .map_err(|e| format!("stat file: {e}"))?;
+        let file_size = file_meta.len();
+
+        let our_sha256 = tokio::task::block_in_place(|| {
+            let mut f = std::fs::File::open(path).map_err(|e| format!("open file: {e}"))?;
+            let (hash, _) =
+                crate::protocol::sha256_stream(&mut f).map_err(|e| format!("hash file: {e}"))?;
+            Ok::<_, String>(hash)
+        })?;
+
+        tracing::Span::current().record("blob.sha256", our_sha256.as_str());
+        tracing::Span::current().record("blob.size", file_size);
+
+        let auth_event =
+            build_blossom_auth(self.signer.as_ref(), "upload", Some(&our_sha256), None, "");
+        let auth_header = auth_header_value(&auth_event);
+
+        // Second pass: stream file to server.
+        for server in &self.servers {
+            let url = format!("{}/upload", server.trim_end_matches('/'));
+
+            let file = tokio::fs::File::open(path)
+                .await
+                .map_err(|e| format!("open file: {e}"))?;
+            let stream = tokio_util::io::ReaderStream::with_capacity(file, STREAM_CHUNK_SIZE);
+            let body = reqwest::Body::wrap_stream(stream);
+
+            let result = self
+                .http
+                .put(&url)
+                .header("Authorization", &auth_header)
+                .header("Content-Type", content_type)
+                .header("Content-Length", file_size)
+                .body(body)
+                .send()
+                .await;
+
+            match result {
+                Ok(resp) if resp.status().is_success() => {
+                    let desc: BlobDescriptor = resp
+                        .json()
+                        .await
+                        .map_err(|e| format!("parse upload response: {e}"))?;
+                    if desc.sha256 != our_sha256 {
+                        return Err(format!(
+                            "SHA256 mismatch: server={}, ours={}",
+                            desc.sha256, our_sha256
+                        ));
+                    }
+                    info!(
+                        blob.sha256 = %desc.sha256,
+                        blob.size = desc.size,
+                        server.url = %server,
+                        "file uploaded (streaming)"
+                    );
+                    return Ok(desc);
+                }
+                Ok(resp) => {
+                    let status = resp.status();
+                    let text = resp.text().await.unwrap_or_default();
+                    warn!(
+                        server.url = %server,
+                        http.status_code = status.as_u16(),
+                        error.message = %text,
+                        "upload_file failed, trying next server"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    warn!(
+                        server.url = %server,
+                        error.message = %e,
+                        "upload_file request error, trying next server"
+                    );
+                    continue;
+                }
+            }
+        }
+
+        Err("all Blossom servers failed for upload_file".into())
+    }
 }
 
 impl crate::traits::BlobClient for BlossomClient {
@@ -318,6 +417,15 @@ impl crate::traits::BlobClient for BlossomClient {
 
     async fn list(&self, _addr: &(), pubkey: &str) -> Result<Vec<BlobDescriptor>, String> {
         self.list(pubkey).await
+    }
+
+    async fn upload_file(
+        &self,
+        _addr: &(),
+        path: &std::path::Path,
+        content_type: &str,
+    ) -> Result<BlobDescriptor, String> {
+        self.upload_file(path, content_type).await
     }
 }
 
