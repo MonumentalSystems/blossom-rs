@@ -18,6 +18,7 @@ use blossom_rs::BlossomSigner;
 use iroh::endpoint::presets::N0;
 use iroh::protocol::Router;
 use iroh::EndpointAddr;
+use serial_test::serial;
 use tokio::sync::Mutex;
 
 /// Spawn an iroh server node and return its addr + router handle.
@@ -60,6 +61,7 @@ async fn make_client(signer: Signer) -> IrohBlossomClient {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_iroh_upload_and_download() {
     let (server_addr, _router) = spawn_iroh_server().await;
     let signer = Signer::generate();
@@ -75,6 +77,7 @@ async fn test_iroh_upload_and_download() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_iroh_exists() {
     let (server_addr, _router) = spawn_iroh_server().await;
     let signer = Signer::generate();
@@ -91,6 +94,7 @@ async fn test_iroh_exists() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_iroh_delete() {
     let (server_addr, _router) = spawn_iroh_server().await;
     let signer = Signer::generate();
@@ -107,6 +111,7 @@ async fn test_iroh_delete() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_iroh_download_nonexistent() {
     let (server_addr, _router) = spawn_iroh_server().await;
     let signer = Signer::generate();
@@ -117,6 +122,7 @@ async fn test_iroh_download_nonexistent() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_iroh_large_blob() {
     let (server_addr, _router) = spawn_iroh_server().await;
     let signer = Signer::generate();
@@ -135,6 +141,7 @@ async fn test_iroh_large_blob() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_iroh_sha256_integrity() {
     let (server_addr, _router) = spawn_iroh_server().await;
     let signer = Signer::generate();
@@ -151,6 +158,7 @@ async fn test_iroh_sha256_integrity() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_iroh_list() {
     let (server_addr, _router) = spawn_iroh_server().await;
     let signer = Signer::generate();
@@ -204,6 +212,7 @@ async fn spawn_iroh_lock_server() -> (EndpointAddr, Router) {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_iroh_create_lock() {
     let (server_addr, _router) = spawn_iroh_lock_server().await;
     let signer = Signer::generate();
@@ -218,6 +227,7 @@ async fn test_iroh_create_lock() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_iroh_create_lock_conflict() {
     let (server_addr, _router) = spawn_iroh_lock_server().await;
     let signer = Signer::generate();
@@ -236,6 +246,7 @@ async fn test_iroh_create_lock_conflict() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_iroh_create_lock_different_repos_same_path() {
     let (server_addr, _router) = spawn_iroh_lock_server().await;
     let signer = Signer::generate();
@@ -253,6 +264,7 @@ async fn test_iroh_create_lock_different_repos_same_path() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_iroh_delete_lock_by_owner() {
     let (server_addr, _router) = spawn_iroh_lock_server().await;
     let signer = Signer::generate();
@@ -271,6 +283,7 @@ async fn test_iroh_delete_lock_by_owner() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_iroh_delete_lock_by_non_owner_forbidden() {
     let (server_addr, _router) = spawn_iroh_lock_server().await;
     let owner = Signer::generate();
@@ -291,6 +304,7 @@ async fn test_iroh_delete_lock_by_non_owner_forbidden() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_iroh_delete_lock_not_found() {
     let (server_addr, _router) = spawn_iroh_lock_server().await;
     let signer = Signer::generate();
@@ -304,6 +318,7 @@ async fn test_iroh_delete_lock_not_found() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_iroh_list_locks() {
     let (server_addr, _router) = spawn_iroh_lock_server().await;
     let signer = Signer::generate();
@@ -326,6 +341,7 @@ async fn test_iroh_list_locks() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_iroh_list_locks_empty() {
     let (server_addr, _router) = spawn_iroh_lock_server().await;
     let signer = Signer::generate();
@@ -339,6 +355,7 @@ async fn test_iroh_list_locks_empty() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_iroh_verify_locks_splits_ours_and_theirs() {
     let (server_addr, _router) = spawn_iroh_lock_server().await;
     let owner = Signer::generate();
@@ -367,6 +384,7 @@ async fn test_iroh_verify_locks_splits_ours_and_theirs() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_iroh_lock_without_lock_db_returns_not_found() {
     let (server_addr, _router) = spawn_iroh_server().await;
     let signer = Signer::generate();
@@ -380,6 +398,7 @@ async fn test_iroh_lock_without_lock_db_returns_not_found() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_iroh_lock_lifecycle() {
     let (server_addr, _router) = spawn_iroh_lock_server().await;
     let signer = Signer::generate();
