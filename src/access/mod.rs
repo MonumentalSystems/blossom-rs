@@ -35,6 +35,7 @@ pub enum Action {
     List,
     Mirror,
     Admin,
+    Lock,
 }
 
 /// Role assigned to a pubkey for authorization decisions.

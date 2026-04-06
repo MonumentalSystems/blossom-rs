@@ -65,6 +65,9 @@ tracing = "0.1"
 # Error handling
 thiserror = "2"
 
+# UUID generation for lock IDs
+uuid = { version = "1", features = ["v4"] }
+
 # Server (optional)
 axum = { version = "0.7", features = ["ws"], optional = true }
 axum-extra = { version = "0.9", optional = true }
