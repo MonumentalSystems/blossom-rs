@@ -47,12 +47,35 @@ pub trait BlobBackend: Send + Sync {
 
     /// Total bytes stored.
     fn total_bytes(&self) -> u64;
+
+    /// Store a blob from a streaming reader without buffering the full
+    /// content in memory. Returns the blob descriptor with SHA256 hash.
+    ///
+    /// The default implementation reads everything into a `Vec` and calls
+    /// [`insert`](BlobBackend::insert). Override for backends that can
+    /// stream directly to storage (filesystem, S3).
+    fn insert_stream(
+        &mut self,
+        reader: &mut dyn std::io::Read,
+        size: u64,
+        base_url: &str,
+    ) -> Result<BlobDescriptor, String> {
+        let mut data = Vec::with_capacity(size as usize);
+        reader
+            .read_to_end(&mut data)
+            .map_err(|e| format!("read stream: {e}"))?;
+        Ok(self.insert(data, base_url))
+    }
 }
 
 /// Helper to compute SHA256 and build a BlobDescriptor.
 pub(crate) fn make_descriptor(data: &[u8], base_url: &str) -> BlobDescriptor {
     let hash = crate::protocol::sha256_hex(data);
-    let size = data.len() as u64;
+    make_descriptor_from_hash(&hash, data.len() as u64, base_url)
+}
+
+/// Build a BlobDescriptor from a pre-computed hash and size.
+pub(crate) fn make_descriptor_from_hash(hash: &str, size: u64, base_url: &str) -> BlobDescriptor {
     let url = format!("{}/{}", base_url, hash);
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -60,7 +83,7 @@ pub(crate) fn make_descriptor(data: &[u8], base_url: &str) -> BlobDescriptor {
         .as_secs();
 
     BlobDescriptor {
-        sha256: hash,
+        sha256: hash.to_string(),
         size,
         content_type: Some("application/octet-stream".into()),
         url: Some(url),
