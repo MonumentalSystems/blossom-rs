@@ -9,7 +9,7 @@
 
 #[cfg(feature = "iroh-transport")]
 use iroh::EndpointAddr;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::BlossomClient;
 use crate::protocol::BlobDescriptor;
@@ -98,6 +98,13 @@ impl BlobClient for MultiTransportClient {
         data: &[u8],
         content_type: &str,
     ) -> Result<BlobDescriptor, String> {
+        info!(
+            blob.size = data.len(),
+            blob.content_type = content_type,
+            transport = ?self.upload_transport,
+            "upload started"
+        );
+
         #[cfg(feature = "iroh-transport")]
         if self.upload_transport == Transport::Iroh {
             if let (Some(iroh), Some(addr)) = (&self.iroh, &self.iroh_addr) {
@@ -105,7 +112,10 @@ impl BlobClient for MultiTransportClient {
                     .upload_with_type(addr.clone(), data, content_type)
                     .await
                 {
-                    Ok(desc) => return Ok(desc),
+                    Ok(desc) => {
+                        info!(blob.sha256 = %desc.sha256, blob.size = desc.size, transport = "iroh", "upload succeeded");
+                        return Ok(desc);
+                    }
                     Err(e) => {
                         warn!(error.message = %e, "iroh upload failed, falling back to HTTP");
                     }
@@ -119,32 +129,52 @@ impl BlobClient for MultiTransportClient {
         if result.is_err() && self.upload_transport == Transport::Http && self.has_iroh() {
             if let (Some(iroh), Some(addr)) = (&self.iroh, &self.iroh_addr) {
                 info!("HTTP upload failed, trying iroh fallback");
-                return iroh
+                let r = iroh
                     .upload_with_type(addr.clone(), data, content_type)
                     .await;
+                if let Ok(ref desc) = r {
+                    info!(blob.sha256 = %desc.sha256, blob.size = desc.size, transport = "iroh-fallback", "upload succeeded");
+                }
+                return r;
             }
+        }
+
+        if let Ok(ref desc) = result {
+            info!(blob.sha256 = %desc.sha256, blob.size = desc.size, transport = "http", "upload succeeded");
         }
 
         result
     }
 
     async fn download(&self, _addr: &(), sha256: &str) -> Result<Vec<u8>, String> {
+        info!(blob.sha256 = %sha256, transport = ?self.download_transport, "download started");
+
         if self.download_transport == Transport::Http || !self.has_iroh() {
             let result = self.http.download(sha256).await;
+            if let Ok(ref data) = result {
+                debug!(blob.sha256 = %sha256, blob.size = data.len(), transport = "http", "download succeeded");
+            }
             if result.is_ok() || !self.has_iroh() {
                 return result;
             }
-            warn!("HTTP download failed, trying iroh fallback");
+            warn!(blob.sha256 = %sha256, "HTTP download failed, trying iroh fallback");
         }
 
         #[cfg(feature = "iroh-transport")]
         if let (Some(iroh), Some(addr)) = (&self.iroh, &self.iroh_addr) {
             let result = iroh.download(addr.clone(), sha256).await;
+            if let Ok(ref data) = result {
+                debug!(blob.sha256 = %sha256, blob.size = data.len(), transport = "iroh", "download succeeded");
+            }
             if result.is_ok() || self.download_transport == Transport::Iroh {
                 return result;
             }
-            warn!("iroh download failed, trying HTTP fallback");
-            return self.http.download(sha256).await;
+            warn!(blob.sha256 = %sha256, "iroh download failed, trying HTTP fallback");
+            let r = self.http.download(sha256).await;
+            if let Ok(ref data) = r {
+                debug!(blob.sha256 = %sha256, blob.size = data.len(), transport = "http-fallback", "download succeeded");
+            }
+            return r;
         }
 
         self.http.download(sha256).await
@@ -152,28 +182,50 @@ impl BlobClient for MultiTransportClient {
 
     async fn exists(&self, _addr: &(), sha256: &str) -> Result<bool, String> {
         // Prefer HTTP for exists (cache-friendly HEAD request).
-        self.http.exists(sha256).await
+        debug!(blob.sha256 = %sha256, transport = "http", "exists check");
+        let result = self.http.exists(sha256).await;
+        if let Ok(found) = result {
+            debug!(blob.sha256 = %sha256, found, "exists result");
+            return Ok(found);
+        }
+        result
     }
 
     async fn delete(&self, _addr: &(), sha256: &str) -> Result<bool, String> {
         // Prefer iroh for delete (direct to origin).
+        info!(blob.sha256 = %sha256, "delete started");
+
         #[cfg(feature = "iroh-transport")]
         if self.has_iroh() {
             if let (Some(iroh), Some(addr)) = (&self.iroh, &self.iroh_addr) {
                 match iroh.delete(addr.clone(), sha256).await {
-                    Ok(v) => return Ok(v),
+                    Ok(v) => {
+                        info!(blob.sha256 = %sha256, deleted = v, transport = "iroh", "delete succeeded");
+                        return Ok(v);
+                    }
                     Err(e) => {
-                        warn!(error.message = %e, "iroh delete failed, falling back to HTTP");
+                        warn!(error.message = %e, blob.sha256 = %sha256, "iroh delete failed, falling back to HTTP");
                     }
                 }
             }
         }
-        self.http.delete(sha256).await
+
+        let result = self.http.delete(sha256).await;
+        if let Ok(deleted) = result {
+            info!(blob.sha256 = %sha256, deleted, transport = "http", "delete succeeded");
+            return Ok(deleted);
+        }
+        result
     }
 
     async fn list(&self, _addr: &(), pubkey: &str) -> Result<Vec<BlobDescriptor>, String> {
         // Prefer HTTP for list (cacheable).
-        self.http.list(pubkey).await
+        debug!(auth.pubkey = %pubkey, transport = "http", "list started");
+        let result = self.http.list(pubkey).await;
+        if let Ok(ref blobs) = result {
+            debug!(auth.pubkey = %pubkey, count = blobs.len(), "list succeeded");
+        }
+        result
     }
 
     async fn upload_file(
@@ -182,11 +234,21 @@ impl BlobClient for MultiTransportClient {
         path: &std::path::Path,
         content_type: &str,
     ) -> Result<BlobDescriptor, String> {
+        info!(
+            path = %path.display(),
+            blob.content_type = content_type,
+            transport = ?self.upload_transport,
+            "upload_file started"
+        );
+
         #[cfg(feature = "iroh-transport")]
         if self.upload_transport == Transport::Iroh {
             if let (Some(iroh), Some(addr)) = (&self.iroh, &self.iroh_addr) {
                 match iroh.upload_file(addr.clone(), path, content_type).await {
-                    Ok(desc) => return Ok(desc),
+                    Ok(desc) => {
+                        info!(blob.sha256 = %desc.sha256, blob.size = desc.size, transport = "iroh", "upload_file succeeded");
+                        return Ok(desc);
+                    }
                     Err(e) => {
                         warn!(error.message = %e, "iroh upload_file failed, falling back to HTTP");
                     }
@@ -200,8 +262,16 @@ impl BlobClient for MultiTransportClient {
         if result.is_err() && self.upload_transport == Transport::Http && self.has_iroh() {
             if let (Some(iroh), Some(addr)) = (&self.iroh, &self.iroh_addr) {
                 info!("HTTP upload_file failed, trying iroh fallback");
-                return iroh.upload_file(addr.clone(), path, content_type).await;
+                let r = iroh.upload_file(addr.clone(), path, content_type).await;
+                if let Ok(ref desc) = r {
+                    info!(blob.sha256 = %desc.sha256, blob.size = desc.size, transport = "iroh-fallback", "upload_file succeeded");
+                }
+                return r;
             }
+        }
+
+        if let Ok(ref desc) = result {
+            info!(blob.sha256 = %desc.sha256, blob.size = desc.size, transport = "http", "upload_file succeeded");
         }
 
         result
