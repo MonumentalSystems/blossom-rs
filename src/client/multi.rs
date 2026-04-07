@@ -99,9 +99,53 @@ impl MultiTransportClient {
         base_sha256: Option<&str>,
         is_manifest: bool,
     ) -> Result<BlobDescriptor, String> {
-        self.http
+        #[cfg(feature = "iroh-transport")]
+        if self.upload_transport == Transport::Iroh {
+            if let (Some(iroh), Some(addr)) = (&self.iroh, &self.iroh_addr) {
+                match iroh
+                    .upload_lfs(
+                        addr.clone(),
+                        data,
+                        content_type,
+                        path,
+                        repo,
+                        base_sha256,
+                        is_manifest,
+                    )
+                    .await
+                {
+                    Ok(desc) => return Ok(desc),
+                    Err(e) => {
+                        warn!(error.message = %e, "iroh LFS upload failed, falling back to HTTP");
+                    }
+                }
+            }
+        }
+
+        let result = self
+            .http
             .upload_lfs(data, content_type, path, repo, base_sha256, is_manifest)
-            .await
+            .await;
+
+        #[cfg(feature = "iroh-transport")]
+        if result.is_err() && self.upload_transport == Transport::Http && self.has_iroh() {
+            if let (Some(iroh), Some(addr)) = (&self.iroh, &self.iroh_addr) {
+                info!("HTTP LFS upload failed, trying iroh fallback");
+                return iroh
+                    .upload_lfs(
+                        addr.clone(),
+                        data,
+                        content_type,
+                        path,
+                        repo,
+                        base_sha256,
+                        is_manifest,
+                    )
+                    .await;
+            }
+        }
+
+        result
     }
 
     #[cfg(feature = "iroh-transport")]
@@ -207,13 +251,31 @@ impl BlobClient for MultiTransportClient {
     }
 
     async fn exists(&self, _addr: &(), sha256: &str) -> Result<bool, String> {
-        // Prefer HTTP for exists (cache-friendly HEAD request).
+        #[cfg(feature = "iroh-transport")]
+        if self.download_transport == Transport::Iroh {
+            if let (Some(iroh), Some(addr)) = (&self.iroh, &self.iroh_addr) {
+                match iroh.exists(addr.clone(), sha256).await {
+                    Ok(v) => return Ok(v),
+                    Err(e) => {
+                        warn!(error.message = %e, "iroh exists failed, falling back to HTTP");
+                    }
+                }
+            }
+        }
+
         debug!(blob.sha256 = %sha256, transport = "http", "exists check");
         let result = self.http.exists(sha256).await;
-        if let Ok(found) = result {
+        if let Ok(found) = &result {
             debug!(blob.sha256 = %sha256, found, "exists result");
-            return Ok(found);
         }
+
+        #[cfg(feature = "iroh-transport")]
+        if result.is_err() && self.download_transport == Transport::Http && self.has_iroh() {
+            if let (Some(iroh), Some(addr)) = (&self.iroh, &self.iroh_addr) {
+                return iroh.exists(addr.clone(), sha256).await;
+            }
+        }
+
         result
     }
 
