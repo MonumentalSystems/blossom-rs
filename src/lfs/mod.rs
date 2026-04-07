@@ -6,6 +6,9 @@
 pub mod compress;
 
 use crate::protocol::NostrEvent;
+use crate::storage::BlobBackend;
+
+const MAX_DELTA_CHAIN_DEPTH: usize = 10;
 
 /// LFS context extracted from auth event tags.
 #[derive(Debug, Clone, Default)]
@@ -57,6 +60,74 @@ impl std::fmt::Display for LfsStorageType {
             Self::Delta => write!(f, "delta"),
         }
     }
+}
+
+/// Reconstruct the original blob data from a potentially compressed or
+/// delta-encoded storage form.
+///
+/// Walks the delta chain (up to [`MAX_DELTA_CHAIN_DEPTH`] hops), fetches
+/// base data from the backend, decompresses as needed, and applies deltas
+/// in order.
+pub fn reconstruct_blob(
+    version: &LfsFileVersion,
+    lfs_db: &dyn LfsVersionDatabase,
+    backend: &dyn BlobBackend,
+) -> Result<Vec<u8>, String> {
+    let mut chain: Vec<LfsFileVersion> = Vec::new();
+    let mut current_hash = version.sha256.clone();
+
+    for _ in 0..MAX_DELTA_CHAIN_DEPTH {
+        match lfs_db.get_by_sha256(&current_hash) {
+            Ok(Some(v)) => {
+                if v.storage == LfsStorageType::Delta {
+                    if let Some(ref base) = v.base_sha256 {
+                        let base_hash = base.clone();
+                        chain.push(v);
+                        current_hash = base_hash;
+                        continue;
+                    }
+                }
+                chain.push(v);
+                break;
+            }
+            _ => return Err("delta chain broken".into()),
+        }
+    }
+
+    chain.reverse();
+
+    let base_hash = chain
+        .first()
+        .and_then(|v| {
+            if v.storage != LfsStorageType::Delta {
+                Some(v.sha256.clone())
+            } else {
+                v.base_sha256.clone()
+            }
+        })
+        .ok_or("no base in chain")?;
+
+    let mut result = backend
+        .get(&base_hash)
+        .ok_or_else(|| format!("base blob {} not found", base_hash))?;
+
+    if let Ok(Some(base_v)) = lfs_db.get_by_sha256(&base_hash) {
+        if base_v.storage == LfsStorageType::Compressed {
+            result = compress::decompress(&result).unwrap_or(result);
+        }
+    }
+
+    for v in &chain {
+        if v.storage == LfsStorageType::Delta {
+            let delta_raw = backend
+                .get(&v.sha256)
+                .ok_or_else(|| format!("delta blob {} not found", v.sha256))?;
+            let delta_decoded = compress::decompress(&delta_raw).unwrap_or(delta_raw);
+            result = compress::decode_delta(&result, &delta_decoded)?;
+        }
+    }
+
+    Ok(result)
 }
 
 /// Record for a version of an LFS file.

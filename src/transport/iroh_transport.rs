@@ -15,7 +15,9 @@ use super::wire::{self, Op, Request, Response, Status};
 use crate::access::{AccessControl, Action, Role};
 use crate::auth::{verify_blossom_auth, verify_nip98_auth};
 use crate::db::{BlobDatabase, UploadRecord};
-use crate::lfs::{compress, LfsContext, LfsFileVersion, LfsStorageType, LfsVersionDatabase};
+use crate::lfs::{
+    compress, reconstruct_blob, LfsContext, LfsFileVersion, LfsStorageType, LfsVersionDatabase,
+};
 use crate::locks::{LockDatabase, LockFilters};
 use crate::protocol::{base64url_decode, BlobDescriptor, NostrEvent};
 use crate::storage::BlobBackend;
@@ -205,71 +207,6 @@ fn parse_lfs_from_request(req: &Request) -> LfsContext {
     }
 }
 
-const MAX_DELTA_CHAIN_DEPTH: usize = 10;
-
-fn reconstruct_blob_iroh(
-    _delta_data: &[u8],
-    version: &LfsFileVersion,
-    lfs_db: &dyn LfsVersionDatabase,
-    backend: &dyn BlobBackend,
-) -> Result<Vec<u8>, String> {
-    let mut chain: Vec<LfsFileVersion> = Vec::new();
-    let mut current_hash = version.sha256.clone();
-
-    for _ in 0..MAX_DELTA_CHAIN_DEPTH {
-        match lfs_db.get_by_sha256(&current_hash) {
-            Ok(Some(v)) => {
-                if v.storage == LfsStorageType::Delta {
-                    if let Some(ref base) = v.base_sha256 {
-                        let base_hash = base.clone();
-                        chain.push(v);
-                        current_hash = base_hash;
-                        continue;
-                    }
-                }
-                chain.push(v);
-                break;
-            }
-            _ => return Err("delta chain broken".into()),
-        }
-    }
-
-    chain.reverse();
-
-    let base_hash = chain
-        .first()
-        .and_then(|v| {
-            if v.storage != LfsStorageType::Delta {
-                Some(v.sha256.clone())
-            } else {
-                v.base_sha256.clone()
-            }
-        })
-        .ok_or("no base in chain")?;
-
-    let mut result = backend
-        .get(&base_hash)
-        .ok_or_else(|| format!("base blob {} not found", base_hash))?;
-
-    if let Ok(Some(base_v)) = lfs_db.get_by_sha256(&base_hash) {
-        if base_v.storage == LfsStorageType::Compressed {
-            result = compress::decompress(&result).unwrap_or(result);
-        }
-    }
-
-    for v in &chain {
-        if v.storage == LfsStorageType::Delta {
-            let delta_raw = backend
-                .get(&v.sha256)
-                .ok_or_else(|| format!("delta blob {} not found", v.sha256))?;
-            let delta_decoded = compress::decompress(&delta_raw).unwrap_or(delta_raw);
-            result = compress::decode_delta(&result, &delta_decoded)?;
-        }
-    }
-
-    Ok(result)
-}
-
 /// Verify auth from the wire protocol. Accepts both kind:24242 and kind:27235.
 fn verify_auth(auth_header: &str, op: &Op) -> Result<String, String> {
     let b64 = auth_header.strip_prefix("Nostr ").unwrap_or(auth_header);
@@ -306,12 +243,7 @@ async fn handle_get(send: &mut iroh::endpoint::SendStream, sha256: &str, state: 
                             compress::decompress(&raw_data).unwrap_or(raw_data)
                         }
                         LfsStorageType::Delta => {
-                            match reconstruct_blob_iroh(
-                                &raw_data,
-                                &version,
-                                &**lfs_db,
-                                &*state.backend,
-                            ) {
+                            match reconstruct_blob(&version, &**lfs_db, &*state.backend) {
                                 Ok(reconstructed) => reconstructed,
                                 Err(e) => {
                                     warn!(
@@ -470,13 +402,8 @@ async fn handle_upload(
                         }
                         LfsStorageType::Delta => {
                             let lfs_db_ref = state.lfs_version_db.as_ref().unwrap();
-                            reconstruct_blob_iroh(
-                                &base_data,
-                                &base_version,
-                                lfs_db_ref.as_ref(),
-                                &*state.backend,
-                            )
-                            .unwrap_or_else(|_| base_data.clone())
+                            reconstruct_blob(&base_version, lfs_db_ref.as_ref(), &*state.backend)
+                                .unwrap_or_else(|_| base_data.clone())
                         }
                         _ => base_data.clone(),
                     };
@@ -668,8 +595,7 @@ async fn handle_delete(
                     .backend
                     .get(&delta_version.sha256)
                     .and_then(|_delta_data| {
-                        reconstruct_blob_iroh(&[], delta_version, lfs_db.as_ref(), &*state.backend)
-                            .ok()
+                        reconstruct_blob(delta_version, lfs_db.as_ref(), &*state.backend).ok()
                     })
             };
 

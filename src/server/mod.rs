@@ -21,7 +21,9 @@ use std::sync::Arc;
 use crate::access::{AccessControl, Action, OpenAccess, Role};
 use crate::auth::{verify_blossom_auth, verify_nip98_auth, AuthError};
 use crate::db::{BlobDatabase, DbError, MemoryDatabase, UploadRecord};
-use crate::lfs::{compress, LfsContext, LfsFileVersion, LfsStorageType, LfsVersionDatabase};
+use crate::lfs::{
+    compress, reconstruct_blob, LfsContext, LfsFileVersion, LfsStorageType, LfsVersionDatabase,
+};
 use crate::locks::LockDatabase;
 use crate::media::MediaProcessor;
 use crate::protocol::{base64url_decode, BlobDescriptor, NostrEvent};
@@ -430,75 +432,6 @@ fn detect_mime(data: &[u8]) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// BUD-20: Delta reconstruction
-// ---------------------------------------------------------------------------
-
-const MAX_DELTA_CHAIN_DEPTH: usize = 10;
-
-fn reconstruct_blob(
-    _delta_data: &[u8],
-    version: &LfsFileVersion,
-    lfs_db: &dyn LfsVersionDatabase,
-    backend: &dyn BlobBackend,
-) -> Result<Vec<u8>, String> {
-    let mut chain: Vec<LfsFileVersion> = Vec::new();
-    let mut current_hash = version.sha256.clone();
-
-    for _ in 0..MAX_DELTA_CHAIN_DEPTH {
-        match lfs_db.get_by_sha256(&current_hash) {
-            Ok(Some(v)) => {
-                if v.storage == LfsStorageType::Delta {
-                    if let Some(ref base) = v.base_sha256 {
-                        let base_hash = base.clone();
-                        chain.push(v);
-                        current_hash = base_hash;
-                        continue;
-                    }
-                }
-                chain.push(v);
-                break;
-            }
-            _ => return Err("delta chain broken".into()),
-        }
-    }
-
-    chain.reverse();
-
-    let base_hash = chain
-        .first()
-        .and_then(|v| {
-            if v.storage != LfsStorageType::Delta {
-                Some(v.sha256.clone())
-            } else {
-                v.base_sha256.clone()
-            }
-        })
-        .ok_or("no base in chain")?;
-
-    let mut result = backend
-        .get(&base_hash)
-        .ok_or_else(|| format!("base blob {} not found", base_hash))?;
-
-    if let Ok(Some(base_v)) = lfs_db.get_by_sha256(&base_hash) {
-        if base_v.storage == LfsStorageType::Compressed {
-            result = compress::decompress(&result).unwrap_or(result);
-        }
-    }
-
-    for v in &chain {
-        if v.storage == LfsStorageType::Delta {
-            let delta_raw = backend
-                .get(&v.sha256)
-                .ok_or_else(|| format!("delta blob {} not found", v.sha256))?;
-            let delta_decoded = compress::decompress(&delta_raw).unwrap_or(delta_raw);
-            result = compress::decode_delta(&result, &delta_decoded)?;
-        }
-    }
-
-    Ok(result)
-}
-
-// ---------------------------------------------------------------------------
 // BUD-01: Upload
 // ---------------------------------------------------------------------------
 
@@ -608,13 +541,10 @@ async fn handle_upload(
                         LfsStorageType::Compressed => {
                             compress::decompress(&base_data).unwrap_or_else(|_| base_data.clone())
                         }
-                        LfsStorageType::Delta => reconstruct_blob(
-                            &base_data,
-                            &base_version,
-                            lfs_db.as_ref(),
-                            &*s.backend,
-                        )
-                        .unwrap_or_else(|_| base_data.clone()),
+                        LfsStorageType::Delta => {
+                            reconstruct_blob(&base_version, lfs_db.as_ref(), &*s.backend)
+                                .unwrap_or_else(|_| base_data.clone())
+                        }
                         _ => base_data.clone(),
                     };
 
@@ -769,7 +699,7 @@ async fn handle_get_blob(
                             compress::decompress(&raw_data).unwrap_or(raw_data)
                         }
                         LfsStorageType::Delta => {
-                            match reconstruct_blob(&raw_data, &version, &**lfs_db, &*s.backend) {
+                            match reconstruct_blob(&version, &**lfs_db, &*s.backend) {
                                 Ok(reconstructed) => reconstructed,
                                 Err(e) => {
                                     warn!(blob.sha256 = %sha256, error.message = %e, "delta reconstruction failed");
@@ -879,8 +809,7 @@ async fn handle_delete_blob(
                         s.backend
                             .get(&delta_version.sha256)
                             .and_then(|_delta_data| {
-                                reconstruct_blob(&[], delta_version, lfs_db.as_ref(), &*s.backend)
-                                    .ok()
+                                reconstruct_blob(delta_version, lfs_db.as_ref(), &*s.backend).ok()
                             })
                     };
 
