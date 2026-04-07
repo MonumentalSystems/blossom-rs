@@ -1,0 +1,21 @@
+# Cross.toml — configuration for the `cross` cross-compilation tool.
+# Installs system build dependencies inside the cross Docker containers
+# before the Rust build begins.
+# See: https://github.com/cross-rs/cross#configuration
+#
+# Note: TLS is provided by `rustls` (pure Rust), so no system OpenSSL is needed.
+# pkg-config and musl-tools are still required for musl cross-compilation.
+
+# GNU Linux x86_64
+[target.x86_64-unknown-linux-gnu]
+pre-build = [
+    "apt-get update -qq",
+    "apt-get install -y --no-install-recommends pkg-config",
+]
+
+# musl Linux x86_64 — needs musl-tools for the musl toolchain.
+[target.x86_64-unknown-linux-musl]
+pre-build = [
+    "apt-get update -qq",
+    "apt-get install -y --no-install-recommends pkg-config musl-tools",
+]
