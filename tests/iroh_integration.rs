@@ -52,6 +52,34 @@ async fn spawn_iroh_server() -> (EndpointAddr, Router) {
 }
 
 /// Create an iroh client.
+async fn spawn_iroh_server_with_locks() -> (EndpointAddr, Router) {
+    let state = Arc::new(Mutex::new(IrohState {
+        backend: Box::new(MemoryBackend::new()),
+        database: Box::new(MemoryDatabase::new()),
+        access: Box::new(OpenAccess),
+        base_url: "iroh://test".to_string(),
+        max_upload_size: None,
+        require_auth: false,
+        lock_db: Some(Box::new(MemoryLockDatabase::new())),
+        lfs_version_db: None,
+    }));
+
+    let endpoint = iroh::Endpoint::builder(N0)
+        .bind()
+        .await
+        .expect("bind server endpoint");
+
+    let addr = endpoint.addr();
+
+    let router = Router::builder(endpoint)
+        .accept(BLOSSOM_ALPN, Arc::new(BlossomProtocol::new(state)))
+        .spawn();
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    (addr, router)
+}
+
 async fn make_client(signer: Signer) -> IrohBlossomClient {
     let endpoint = iroh::Endpoint::builder(N0)
         .bind()
@@ -434,4 +462,65 @@ async fn test_iroh_lock_lifecycle() {
         .await
         .unwrap();
     assert!(locks_after.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn test_iroh_upload_file() {
+    let (server_addr, _router) = spawn_iroh_server().await;
+    let signer = Signer::generate();
+    let client = make_client(signer).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("test-file.bin");
+    let data: Vec<u8> = (0..5000).map(|i| (i % 256) as u8).collect();
+    tokio::fs::write(&file_path, &data).await.unwrap();
+
+    let desc = client
+        .upload_file(server_addr.clone(), &file_path, "application/octet-stream")
+        .await
+        .unwrap();
+
+    assert_eq!(desc.sha256, sha256_hex(&data));
+    assert_eq!(desc.size, data.len() as u64);
+
+    let downloaded = client.download(server_addr, &desc.sha256).await.unwrap();
+    assert_eq!(downloaded.as_slice(), data.as_slice());
+}
+
+#[tokio::test]
+#[serial]
+async fn test_iroh_force_unlock_by_non_owner() {
+    let (server_addr, _router) = spawn_iroh_server_with_locks().await;
+    let owner = Signer::generate();
+    let other = Signer::generate();
+
+    let owner_client = make_client(owner).await;
+    let other_client = make_client(other).await;
+
+    let lock = owner_client
+        .create_lock(&server_addr, "my-repo", "protected.bin")
+        .await
+        .unwrap();
+
+    let err = other_client
+        .delete_lock(&server_addr, "my-repo", &lock.id, false)
+        .await
+        .unwrap_err();
+    assert!(
+        err.contains("forbidden") || err.contains("owner"),
+        "non-owner unlock should fail: got {}",
+        err
+    );
+
+    other_client
+        .delete_lock(&server_addr, "my-repo", &lock.id, true)
+        .await
+        .unwrap();
+
+    let (locks, _) = other_client
+        .list_locks(&server_addr, "my-repo", None, None)
+        .await
+        .unwrap();
+    assert!(locks.is_empty(), "lock should be gone after force unlock");
 }
