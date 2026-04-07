@@ -1,0 +1,133 @@
+name: build-artifact
+on:
+  workflow_call:
+  workflow_dispatch:
+    inputs:
+      os:
+        description: 'OS / target to build (select "all" to build every target)'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - linux-x64
+          #- linux-x64-musl
+          #- linux-arm64
+          #- linux-arm64-musl
+          - windows-x64
+          - macos-x64
+          - macos-arm64
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - id: set-matrix
+        shell: python3 {0}
+        run: |
+          import json, os
+
+          ALL_TARGETS = [
+            {"build": "linux-x64",       "os": "ubuntu-latest",  "target": "x86_64-unknown-linux-gnu",    "native": True},
+            #{"build": "linux-x64-musl",  "os": "ubuntu-latest",  "target": "x86_64-unknown-linux-musl",   "native": False},
+            #{"build": "linux-arm64",     "os": "ubuntu-latest",  "target": "aarch64-unknown-linux-gnu",   "native": False},
+            #{"build": "linux-arm64-musl","os": "ubuntu-latest",  "target": "aarch64-unknown-linux-musl",  "native": False},
+            {"build": "windows-x64",     "os": "windows-latest", "target": "x86_64-pc-windows-msvc",      "native": True},
+            {"build": "macos-x64",       "os": "macos-15-intel", "target": "x86_64-apple-darwin",         "native": True},
+            {"build": "macos-arm64",     "os": "macos-latest",   "target": "aarch64-apple-darwin",        "native": True},
+          ]
+
+          selected = "${{ inputs.os }}" or "all"
+          targets = ALL_TARGETS if selected == "all" else [t for t in ALL_TARGETS if t["build"] == selected]
+          matrix = {"build": [t["build"] for t in targets], "include": targets}
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+            f.write(f"matrix={json.dumps(matrix)}\n")
+
+  build-artifacts:
+    needs: setup
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    env:
+      BUILD_NAME: "blossom-${{ github.ref_name }}-${{ matrix.target }}"
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 50
+
+    - name: Fetch tags
+      run: git fetch --tags --force
+
+    - name: Cache
+      uses: actions/cache@v4
+      with:
+        path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+        key: ${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Install Linux system dependencies
+      if: runner.os == 'Linux'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libssl-dev pkg-config musl-tools
+
+    - name: Install cross
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cross
+
+    - name: Build release binary
+      run: cross build --verbose --release --locked --target ${{ matrix.target }} -p blossom-server -p blossom-cli
+
+    - name: Bundle release (Unix)
+      if: matrix.build != 'windows-x64'
+      shell: bash
+      run: |
+        mkdir -p "$BUILD_NAME"
+        cp README.md LICENSE "$BUILD_NAME/"
+        cp "target/${{ matrix.target }}/release/blossom-server" "$BUILD_NAME/"
+        cp "target/${{ matrix.target }}/release/blossom-cli" "$BUILD_NAME/"
+
+    - name: Bundle release (Windows)
+      if: matrix.build == 'windows-x64'
+      shell: bash
+      run: |
+        mkdir -p "$BUILD_NAME"
+        cp README.md LICENSE "$BUILD_NAME/"
+        cp "target/${{ matrix.target }}/release/blossom-server.exe" "$BUILD_NAME/"
+        cp "target/${{ matrix.target }}/release/blossom-cli.exe" "$BUILD_NAME/"
+
+    - name: Run smoke test (Unix)
+      if: matrix.native && matrix.build != 'windows-x64'
+      shell: bash
+      run: |
+        "$BUILD_NAME/blossom-server" --version
+        "$BUILD_NAME/blossom-cli" --version
+
+    - name: Run smoke test (Windows)
+      if: matrix.native && matrix.build == 'windows-x64'
+      shell: bash
+      run: |
+        "$BUILD_NAME/blossom-server.exe" --version
+        "$BUILD_NAME/blossom-cli.exe" --version
+
+    - name: Upload asset
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ env.BUILD_NAME }}
+        path: ${{ env.BUILD_NAME }}
