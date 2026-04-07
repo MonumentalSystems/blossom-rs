@@ -37,7 +37,8 @@ echo -e "${GREEN}  OK${NC}"
 echo ""
 echo -e "${YELLOW}[5/5] Code coverage (workspace)...${NC}"
 if command -v cargo-tarpaulin &>/dev/null; then
-  cargo tarpaulin --workspace --timeout 300 --skip-clean --out Stdout 2>&1 | \
+  cargo tarpaulin --workspace --timeout 300 --out Stdout \
+    --exclude blossom-cli --exclude blossom-server --exclude xtask 2>&1 | \
     grep -E "(Tested/Total|src/.*[0-9]/[0-9]|coverage,)"
 else
   echo -e "${YELLOW}  cargo-tarpaulin not installed. Install with: cargo install cargo-tarpaulin${NC}"
