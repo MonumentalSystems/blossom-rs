@@ -62,7 +62,10 @@ pub mod client;
 
 // Re-exports for convenience.
 pub use access::{AccessControl, Role, RoleBasedAccess};
-pub use auth::{BlossomSigner, Signer};
+pub use auth::{
+    auth_header_value, build_blossom_auth, build_blossom_auth_with_extra_tags, BlossomSigner,
+    Signer,
+};
 pub use db::{BlobDatabase, MemoryDatabase};
 pub use labels::{MediaLabeler, NoopLabeler};
 pub use lfs::{

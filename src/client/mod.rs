@@ -6,7 +6,9 @@
 pub mod batch;
 pub mod multi;
 
-use crate::auth::{auth_header_value, build_blossom_auth, BlossomSigner};
+use crate::auth::{
+    auth_header_value, build_blossom_auth, build_blossom_auth_with_extra_tags, BlossomSigner,
+};
 use crate::protocol::{sha256_hex, BlobDescriptor, STREAM_CHUNK_SIZE};
 use tracing::{info, instrument, warn};
 
@@ -120,7 +122,109 @@ impl BlossomClient {
         Err("all Blossom servers failed for upload".into())
     }
 
-    /// Download a blob by SHA256 hash.
+    /// Upload a blob with LFS context tags (BUD-20).
+    ///
+    /// Adds `["t","lfs"]`, `["path",...]`, `["repo",...]`, and optionally
+    /// `["base",...]` and `["manifest"]` tags to the auth event so the
+    /// server can apply compression and delta encoding.
+    #[instrument(name = "blossom.client.upload_lfs", skip_all, fields(
+        blob.size = data.len(),
+        blob.sha256,
+        lfs.path = path,
+        lfs.repo = repo,
+        server.url,
+    ))]
+    pub async fn upload_lfs(
+        &self,
+        data: &[u8],
+        content_type: &str,
+        path: &str,
+        repo: &str,
+        base_sha256: Option<&str>,
+        is_manifest: bool,
+    ) -> Result<BlobDescriptor, String> {
+        let our_sha256 = sha256_hex(data);
+        tracing::Span::current().record("blob.sha256", our_sha256.as_str());
+
+        let mut extra_tags = vec![
+            vec!["t".into(), "lfs".into()],
+            vec!["path".into(), path.into()],
+            vec!["repo".into(), repo.into()],
+        ];
+        if let Some(base) = base_sha256 {
+            extra_tags.push(vec!["base".into(), base.into()]);
+        }
+        if is_manifest {
+            extra_tags.push(vec!["manifest".into()]);
+        }
+
+        let auth_event = build_blossom_auth_with_extra_tags(
+            self.signer.as_ref(),
+            "upload",
+            Some(&our_sha256),
+            None,
+            "",
+            &extra_tags,
+        );
+        let auth_header = auth_header_value(&auth_event);
+
+        for server in &self.servers {
+            let url = format!("{}/upload", server.trim_end_matches('/'));
+            let result = self
+                .http
+                .put(&url)
+                .header("Authorization", &auth_header)
+                .header("Content-Type", content_type)
+                .body(data.to_vec())
+                .send()
+                .await;
+
+            match result {
+                Ok(resp) if resp.status().is_success() => {
+                    let desc: BlobDescriptor = resp
+                        .json()
+                        .await
+                        .map_err(|e| format!("parse upload response: {e}"))?;
+                    if desc.sha256 != our_sha256 {
+                        return Err(format!(
+                            "SHA256 mismatch: server={}, ours={}",
+                            desc.sha256, our_sha256
+                        ));
+                    }
+                    tracing::Span::current().record("server.url", server.as_str());
+                    info!(
+                        blob.sha256 = %desc.sha256,
+                        blob.size = desc.size,
+                        lfs.path = %path,
+                        server.url = %server,
+                        "LFS blob uploaded"
+                    );
+                    return Ok(desc);
+                }
+                Ok(resp) => {
+                    let status = resp.status();
+                    let text = resp.text().await.unwrap_or_default();
+                    warn!(
+                        server.url = %server,
+                        http.status_code = status.as_u16(),
+                        error.message = %text,
+                        "LFS upload failed, trying next server"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    warn!(
+                        server.url = %server,
+                        error.message = %e,
+                        "LFS upload request error, trying next server"
+                    );
+                    continue;
+                }
+            }
+        }
+
+        Err("all Blossom servers failed for LFS upload".into())
+    }
     ///
     /// Verifies content-addressed integrity after download.
     #[instrument(name = "blossom.client.download", skip_all, fields(

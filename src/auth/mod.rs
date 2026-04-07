@@ -24,6 +24,22 @@ pub fn build_blossom_auth(
     server_url: Option<&str>,
     content: &str,
 ) -> NostrEvent {
+    build_blossom_auth_with_extra_tags(signer, action, blob_sha256, server_url, content, &[])
+}
+
+/// Build and sign a kind:24242 Blossom auth event with additional tags.
+///
+/// Additional tags are appended before the expiration tag.
+/// Used by BUD-20 to include LFS context tags (`["t","lfs"]`, `["path",...]`,
+/// `["repo",...]`, `["base",...]`, `["manifest"]`).
+pub fn build_blossom_auth_with_extra_tags(
+    signer: &dyn BlossomSigner,
+    action: &str,
+    blob_sha256: Option<&str>,
+    server_url: Option<&str>,
+    content: &str,
+    extra_tags: &[Vec<String>],
+) -> NostrEvent {
     let pubkey = signer.public_key_hex();
     tracing::Span::current().record("auth.pubkey", pubkey.as_str());
     let created_at = std::time::SystemTime::now()
@@ -38,6 +54,9 @@ pub fn build_blossom_auth(
     }
     if let Some(url) = server_url {
         tags.push(vec!["server".to_string(), url.to_string()]);
+    }
+    for extra in extra_tags {
+        tags.push(extra.clone());
     }
     let expiration = created_at + 60;
     tags.push(vec!["expiration".to_string(), expiration.to_string()]);
