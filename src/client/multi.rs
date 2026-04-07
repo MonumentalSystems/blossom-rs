@@ -78,6 +78,18 @@ impl MultiTransportClient {
         self
     }
 
+    /// Force all operations through HTTP.
+    pub fn force_http(mut self) -> Self {
+        self.upload_transport = Transport::Http;
+        self.download_transport = Transport::Http;
+        self
+    }
+
+    /// Access the underlying HTTP client (for LFS-specific methods).
+    pub fn http(&self) -> &BlossomClient {
+        &self.http
+    }
+
     #[cfg(feature = "iroh-transport")]
     fn has_iroh(&self) -> bool {
         self.iroh.is_some() && self.iroh_addr.is_some()

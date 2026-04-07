@@ -19,7 +19,7 @@ pub trait BlossomSigner: Send + Sync {
 ///
 /// For testing or standalone use. In production, implement [`BlossomSigner`]
 /// for your own identity type (e.g., one backed by a hardware key or Nostr identity).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Signer {
     secret_key: SecretKey,
     public_key: XOnlyPublicKey,
