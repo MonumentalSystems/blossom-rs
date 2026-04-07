@@ -409,6 +409,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_upload_size: args.max_upload_size,
             require_auth: args.require_auth,
             lock_db: None,
+            lfs_version_db: None,
         }));
 
         let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)

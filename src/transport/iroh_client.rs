@@ -12,7 +12,9 @@ use tracing::{info, instrument};
 
 use super::iroh_transport::BLOSSOM_ALPN;
 use super::wire::{self, Op, Request, Response, Status};
-use crate::auth::{auth_header_value, build_blossom_auth, BlossomSigner};
+use crate::auth::{
+    auth_header_value, build_blossom_auth, build_blossom_auth_with_extra_tags, BlossomSigner,
+};
 use crate::locks::LockRecord;
 use crate::protocol::{sha256_hex, BlobDescriptor};
 
@@ -126,6 +128,100 @@ impl IrohBlossomClient {
         }
 
         info!(blob.sha256 = %desc.sha256, blob.size = desc.size, "blob uploaded via iroh");
+        Ok(desc)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(name = "blossom.iroh.client.upload_lfs", skip_all, fields(
+        blob.size = data.len(),
+        blob.sha256,
+        lfs.path = path,
+        lfs.repo = repo,
+    ))]
+    pub async fn upload_lfs(
+        &self,
+        addr: EndpointAddr,
+        data: &[u8],
+        content_type: &str,
+        path: &str,
+        repo: &str,
+        base_sha256: Option<&str>,
+        is_manifest: bool,
+    ) -> Result<BlobDescriptor, String> {
+        let our_sha256 = sha256_hex(data);
+        tracing::Span::current().record("blob.sha256", our_sha256.as_str());
+
+        let mut extra_tags = vec![
+            vec!["t".into(), "lfs".into()],
+            vec!["path".into(), path.into()],
+            vec!["repo".into(), repo.into()],
+        ];
+        if let Some(base) = base_sha256 {
+            extra_tags.push(vec!["base".into(), base.into()]);
+        }
+        if is_manifest {
+            extra_tags.push(vec!["manifest".into()]);
+        }
+
+        let auth_event = build_blossom_auth_with_extra_tags(
+            self.signer.as_ref(),
+            "upload",
+            Some(&our_sha256),
+            None,
+            "",
+            &extra_tags,
+        );
+        let auth_header = auth_header_value(&auth_event);
+
+        let conn = self.connect(addr).await?;
+        let (mut send, mut recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| format!("open stream: {e}"))?;
+
+        let req = Request {
+            op: Op::Upload,
+            auth: auth_header,
+            content_type: content_type.to_string(),
+            body_len: data.len() as u64,
+            lfs_path: path.to_string(),
+            lfs_repo: repo.to_string(),
+            lfs_base: base_sha256.unwrap_or("").to_string(),
+            lfs_manifest: is_manifest,
+            ..Default::default()
+        };
+        send.write_all(&wire::encode_request(&req))
+            .await
+            .map_err(|e| format!("write request: {e}"))?;
+        send.write_all(data)
+            .await
+            .map_err(|e| format!("write body: {e}"))?;
+        send.finish().map_err(|e| format!("finish: {e}"))?;
+
+        let (resp, _) = read_response(&mut recv).await?;
+        if resp.status != Status::Ok {
+            return Err(format!("upload_lfs failed: {}", resp.error));
+        }
+
+        let desc: BlobDescriptor = serde_json::from_value(
+            resp.descriptor
+                .ok_or("no descriptor in upload_lfs response")?,
+        )
+        .map_err(|e| format!("parse descriptor: {e}"))?;
+
+        if desc.sha256 != our_sha256 {
+            return Err(format!(
+                "SHA256 mismatch: server={}, ours={}",
+                desc.sha256, our_sha256
+            ));
+        }
+
+        info!(
+            blob.sha256 = %desc.sha256,
+            blob.size = desc.size,
+            lfs.path = %path,
+            "LFS blob uploaded via iroh"
+        );
         Ok(desc)
     }
 

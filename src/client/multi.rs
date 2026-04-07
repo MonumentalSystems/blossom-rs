@@ -90,6 +90,20 @@ impl MultiTransportClient {
         &self.http
     }
 
+    pub async fn upload_lfs(
+        &self,
+        data: &[u8],
+        content_type: &str,
+        path: &str,
+        repo: &str,
+        base_sha256: Option<&str>,
+        is_manifest: bool,
+    ) -> Result<BlobDescriptor, String> {
+        self.http
+            .upload_lfs(data, content_type, path, repo, base_sha256, is_manifest)
+            .await
+    }
+
     #[cfg(feature = "iroh-transport")]
     fn has_iroh(&self) -> bool {
         self.iroh.is_some() && self.iroh_addr.is_some()

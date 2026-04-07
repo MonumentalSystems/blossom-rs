@@ -15,6 +15,7 @@ use super::wire::{self, Op, Request, Response, Status};
 use crate::access::{AccessControl, Action, Role};
 use crate::auth::{verify_blossom_auth, verify_nip98_auth};
 use crate::db::{BlobDatabase, UploadRecord};
+use crate::lfs::{compress, LfsContext, LfsFileVersion, LfsStorageType, LfsVersionDatabase};
 use crate::locks::{LockDatabase, LockFilters};
 use crate::protocol::{base64url_decode, BlobDescriptor, NostrEvent};
 use crate::storage::BlobBackend;
@@ -31,6 +32,7 @@ pub struct IrohState {
     pub max_upload_size: Option<u64>,
     pub require_auth: bool,
     pub lock_db: Option<Box<dyn LockDatabase>>,
+    pub lfs_version_db: Option<Box<dyn LfsVersionDatabase>>,
 }
 
 impl std::fmt::Debug for IrohState {
@@ -114,7 +116,7 @@ async fn handle_stream(
                 status: Status::Error,
                 body_len: 0,
                 content_type: String::new(),
-                error: format!("invalid request: {e}"),
+                error: e.to_string(),
                 descriptor: None,
             };
             let _ = send.write_all(&wire::encode_response(&resp)).await;
@@ -167,7 +169,7 @@ async fn handle_stream(
         Op::Get => handle_get(&mut send, &req.sha256, &s).await,
         Op::Head => handle_head(&mut send, &req.sha256, &s).await,
         Op::Upload => {
-            handle_upload(&mut send, body, auth_pubkey, &mut s).await;
+            handle_upload(&mut send, body, &req, auth_pubkey, &mut s).await;
         }
         Op::Delete => handle_delete(&mut send, &req.sha256, auth_pubkey, &mut s).await,
         Op::List => handle_list(&mut send, &req.pubkey, &s).await,
@@ -178,6 +180,94 @@ async fn handle_stream(
     }
 
     let _ = send.finish();
+}
+
+fn parse_lfs_from_request(req: &Request) -> LfsContext {
+    let is_lfs = !req.lfs_path.is_empty() || !req.lfs_repo.is_empty();
+    LfsContext {
+        is_lfs,
+        path: if req.lfs_path.is_empty() {
+            None
+        } else {
+            Some(req.lfs_path.clone())
+        },
+        repo: if req.lfs_repo.is_empty() {
+            None
+        } else {
+            Some(req.lfs_repo.clone())
+        },
+        base: if req.lfs_base.is_empty() {
+            None
+        } else {
+            Some(req.lfs_base.clone())
+        },
+        is_manifest: req.lfs_manifest,
+    }
+}
+
+const MAX_DELTA_CHAIN_DEPTH: usize = 10;
+
+fn reconstruct_blob_iroh(
+    _delta_data: &[u8],
+    version: &LfsFileVersion,
+    lfs_db: &dyn LfsVersionDatabase,
+    backend: &dyn BlobBackend,
+) -> Result<Vec<u8>, String> {
+    let mut chain: Vec<LfsFileVersion> = Vec::new();
+    let mut current_hash = version.sha256.clone();
+
+    for _ in 0..MAX_DELTA_CHAIN_DEPTH {
+        match lfs_db.get_by_sha256(&current_hash) {
+            Ok(Some(v)) => {
+                if v.storage == LfsStorageType::Delta {
+                    if let Some(ref base) = v.base_sha256 {
+                        let base_hash = base.clone();
+                        chain.push(v);
+                        current_hash = base_hash;
+                        continue;
+                    }
+                }
+                chain.push(v);
+                break;
+            }
+            _ => return Err("delta chain broken".into()),
+        }
+    }
+
+    chain.reverse();
+
+    let base_hash = chain
+        .first()
+        .and_then(|v| {
+            if v.storage != LfsStorageType::Delta {
+                Some(v.sha256.clone())
+            } else {
+                v.base_sha256.clone()
+            }
+        })
+        .ok_or("no base in chain")?;
+
+    let mut result = backend
+        .get(&base_hash)
+        .ok_or_else(|| format!("base blob {} not found", base_hash))?;
+
+    if let Ok(Some(base_v)) = lfs_db.get_by_sha256(&base_hash) {
+        if base_v.storage == LfsStorageType::Compressed {
+            result = compress::decompress(&result).unwrap_or(result);
+        }
+    }
+
+    for v in &chain {
+        if v.storage == LfsStorageType::Delta {
+            let delta_raw = backend
+                .get(&v.sha256)
+                .ok_or_else(|| format!("delta blob {} not found", v.sha256))?;
+            let delta_decoded = compress::decompress(&delta_raw).unwrap_or(delta_raw);
+            result = compress::decode_delta(&result, &delta_decoded)?;
+        }
+    }
+
+    Ok(result)
 }
 
 /// Verify auth from the wire protocol. Accepts both kind:24242 and kind:27235.
@@ -251,6 +341,7 @@ async fn handle_head(send: &mut iroh::endpoint::SendStream, sha256: &str, state:
 async fn handle_upload(
     send: &mut iroh::endpoint::SendStream,
     data: Vec<u8>,
+    req: &Request,
     auth_pubkey: Option<String>,
     state: &mut IrohState,
 ) {
@@ -266,7 +357,6 @@ async fn handle_upload(
         return;
     }
 
-    // Require auth if configured.
     if state.require_auth && auth_pubkey.is_none() {
         let resp = Response {
             status: Status::Unauthorized,
@@ -281,7 +371,6 @@ async fn handle_upload(
 
     let pubkey = auth_pubkey.unwrap_or_else(|| "anonymous".to_string());
 
-    // Check upload permission.
     if !state.access.is_allowed(&pubkey, Action::Upload) {
         let resp = Response {
             status: Status::Forbidden,
@@ -296,7 +385,6 @@ async fn handle_upload(
 
     let size = data.len() as u64;
 
-    // Check max upload size.
     if let Some(max) = state.max_upload_size {
         if size > max {
             let resp = Response {
@@ -311,7 +399,6 @@ async fn handle_upload(
         }
     }
 
-    // Check quota.
     if let Err(e) = state.database.check_quota(&pubkey, size) {
         let resp = Response {
             status: Status::Forbidden,
@@ -324,24 +411,129 @@ async fn handle_upload(
         return;
     }
 
-    let mut cursor = std::io::Cursor::new(data);
-    let descriptor = match state
-        .backend
-        .insert_stream(&mut cursor, size, &state.base_url)
-    {
-        Ok(desc) => desc,
-        Err(e) => {
-            let resp = Response {
-                status: Status::Error,
-                body_len: 0,
-                content_type: String::new(),
-                error: format!("storage error: {e}"),
-                descriptor: None,
-            };
-            let _ = send.write_all(&wire::encode_response(&resp)).await;
-            return;
+    let original_sha256 = crate::protocol::sha256_hex(&data);
+    let original_size = size;
+
+    let lfs_ctx = parse_lfs_from_request(req);
+
+    let (stored_data, storage_type, base_sha256) = if let Some(ref lfs_db) = state.lfs_version_db {
+        if lfs_ctx.is_lfs && !lfs_ctx.is_manifest {
+            if let Some(ref base_hash) = lfs_ctx.base {
+                let (base_version, base_data) = {
+                    let bv = lfs_db.get_by_sha256(base_hash).ok().flatten();
+                    let bd = state.backend.get(base_hash);
+                    (bv, bd)
+                };
+
+                if let (Some(base_version), Some(base_data)) = (base_version, base_data) {
+                    let base_decompressed = match base_version.storage {
+                        LfsStorageType::Compressed => {
+                            compress::decompress(&base_data).unwrap_or_else(|_| base_data.clone())
+                        }
+                        LfsStorageType::Delta => {
+                            let lfs_db_ref = state.lfs_version_db.as_ref().unwrap();
+                            reconstruct_blob_iroh(
+                                &base_data,
+                                &base_version,
+                                lfs_db_ref.as_ref(),
+                                &*state.backend,
+                            )
+                            .unwrap_or_else(|_| base_data.clone())
+                        }
+                        _ => base_data.clone(),
+                    };
+
+                    match compress::encode_delta(&base_decompressed, &data) {
+                        Ok(delta) if compress::delta_is_worthwhile(delta.len(), data.len()) => {
+                            match compress::compress(&delta) {
+                                Ok(compressed_delta) => {
+                                    info!(
+                                        blob.sha256 = %original_sha256,
+                                        lfs.storage = "delta",
+                                        lfs.base = %base_hash,
+                                        "LFS delta stored via iroh"
+                                    );
+                                    (
+                                        compressed_delta,
+                                        LfsStorageType::Delta,
+                                        Some(base_hash.clone()),
+                                    )
+                                }
+                                Err(_) => {
+                                    let compressed =
+                                        compress::compress(&data).unwrap_or_else(|_| data.clone());
+                                    (compressed, LfsStorageType::Compressed, None)
+                                }
+                            }
+                        }
+                        _ => {
+                            let compressed =
+                                compress::compress(&data).unwrap_or_else(|_| data.clone());
+                            (compressed, LfsStorageType::Compressed, None)
+                        }
+                    }
+                } else {
+                    let compressed = compress::compress(&data).unwrap_or_else(|_| data.clone());
+                    (compressed, LfsStorageType::Compressed, None)
+                }
+            } else {
+                let compressed = compress::compress(&data).unwrap_or_else(|_| data.clone());
+                (compressed, LfsStorageType::Compressed, None)
+            }
+        } else {
+            (data.clone(), LfsStorageType::Raw, None)
         }
+    } else {
+        (data.clone(), LfsStorageType::Raw, None)
     };
+
+    let base_url = state.base_url.clone();
+    let descriptor = {
+        let desc =
+            crate::storage::make_descriptor_from_hash(&original_sha256, original_size, &base_url);
+        if !state.backend.exists(&original_sha256) {
+            state
+                .backend
+                .insert_with_hash(stored_data, &original_sha256, original_size, &base_url);
+        }
+        desc
+    };
+
+    if let Some(ref mut lfs_db) = state.lfs_version_db {
+        if lfs_ctx.is_lfs {
+            if let (Some(repo), Some(path)) = (&lfs_ctx.repo, &lfs_ctx.path) {
+                let next_version = lfs_db
+                    .get_latest_version(repo, path)
+                    .ok()
+                    .flatten()
+                    .map(|v| v.version + 1)
+                    .unwrap_or(1);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+
+                let record = LfsFileVersion {
+                    repo_id: repo.clone(),
+                    path: path.clone(),
+                    version: next_version,
+                    sha256: original_sha256.clone(),
+                    base_sha256: base_sha256.clone(),
+                    storage: storage_type.clone(),
+                    delta_algo: if storage_type == LfsStorageType::Delta {
+                        Some("xdelta3".into())
+                    } else {
+                        None
+                    },
+                    original_size: original_size as i64,
+                    stored_size: descriptor.size as i64,
+                    created_at: now,
+                };
+                let _ = lfs_db.record_version(&record);
+            }
+        }
+    }
+
     let record = UploadRecord {
         sha256: descriptor.sha256.clone(),
         size: descriptor.size,

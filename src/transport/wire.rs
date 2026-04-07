@@ -60,6 +60,14 @@ pub struct Request {
     pub cursor: String,
     #[serde(default)]
     pub limit: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub lfs_path: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub lfs_repo: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub lfs_base: String,
+    #[serde(default)]
+    pub lfs_manifest: bool,
 }
 
 /// Response status.
@@ -139,6 +147,10 @@ mod tests {
             force: false,
             cursor: String::new(),
             limit: 0,
+            lfs_path: String::new(),
+            lfs_repo: String::new(),
+            lfs_base: String::new(),
+            lfs_manifest: false,
         };
         let encoded = encode_request(&req);
         assert!(encoded.ends_with(b"\n"));
@@ -179,6 +191,10 @@ mod tests {
             force: false,
             cursor: String::new(),
             limit: 0,
+            lfs_path: String::new(),
+            lfs_repo: String::new(),
+            lfs_base: String::new(),
+            lfs_manifest: false,
         };
         let encoded = encode_request(&req);
         let (decoded, _): (Request, usize) = decode_line(&encoded).unwrap();
@@ -217,6 +233,10 @@ mod tests {
             force: false,
             cursor: String::new(),
             limit: 0,
+            lfs_path: String::new(),
+            lfs_repo: String::new(),
+            lfs_base: String::new(),
+            lfs_manifest: false,
         };
         let encoded = encode_request(&req);
         let (decoded, _): (Request, usize) = decode_line(&encoded).unwrap();

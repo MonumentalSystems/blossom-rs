@@ -31,6 +31,7 @@ async fn spawn_iroh_server() -> (EndpointAddr, Router) {
         max_upload_size: None,
         require_auth: false,
         lock_db: None,
+        lfs_version_db: None,
     }));
 
     let endpoint = iroh::Endpoint::builder(N0)
@@ -193,6 +194,7 @@ async fn spawn_iroh_lock_server() -> (EndpointAddr, Router) {
         max_upload_size: None,
         require_auth: false,
         lock_db: Some(Box::new(MemoryLockDatabase::new())),
+        lfs_version_db: None,
     }));
 
     let endpoint = iroh::Endpoint::builder(N0)
