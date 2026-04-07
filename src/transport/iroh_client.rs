@@ -133,7 +133,7 @@ impl IrohBlossomClient {
     #[instrument(name = "blossom.iroh.client.download", skip_all, fields(blob.sha256 = %sha256))]
     pub async fn download(&self, addr: EndpointAddr, sha256: &str) -> Result<Vec<u8>, String> {
         let auth_event = build_blossom_auth(self.signer.as_ref(), "get", None, None, "");
-        let auth_header = auth_header_value(&auth_event);
+        let _auth_header = auth_header_value(&auth_event);
 
         let conn = self.connect(addr).await?;
         let (mut send, mut recv) = conn
@@ -142,7 +142,7 @@ impl IrohBlossomClient {
             .map_err(|e| format!("open stream: {e}"))?;
 
         let req = Request {
-            op: Op::Head,
+            op: Op::Get,
             sha256: sha256.to_string(),
             pubkey: String::new(),
             auth: String::new(),
