@@ -25,7 +25,11 @@ use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 #[derive(Parser)]
-#[command(name = "blossom-server", about = "Blossom blob storage API server")]
+#[command(
+    name = "blossom-server",
+    about = "Blossom blob storage API server",
+    version
+)]
 struct Args {
     /// Listen address.
     #[arg(short, long, default_value = "0.0.0.0:3000")]
