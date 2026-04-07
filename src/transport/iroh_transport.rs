@@ -298,7 +298,39 @@ fn verify_auth(auth_header: &str, op: &Op) -> Result<String, String> {
 
 async fn handle_get(send: &mut iroh::endpoint::SendStream, sha256: &str, state: &IrohState) {
     match state.backend.get(sha256) {
-        Some(data) => {
+        Some(raw_data) => {
+            let data = if let Some(ref lfs_db) = state.lfs_version_db {
+                if let Ok(Some(version)) = lfs_db.get_by_sha256(sha256) {
+                    match version.storage {
+                        LfsStorageType::Compressed => {
+                            compress::decompress(&raw_data).unwrap_or(raw_data)
+                        }
+                        LfsStorageType::Delta => {
+                            match reconstruct_blob_iroh(
+                                &raw_data,
+                                &version,
+                                &**lfs_db,
+                                &*state.backend,
+                            ) {
+                                Ok(reconstructed) => reconstructed,
+                                Err(e) => {
+                                    warn!(
+                                        blob.sha256 = %sha256,
+                                        error.message = %e,
+                                        "delta reconstruction failed"
+                                    );
+                                    raw_data
+                                }
+                            }
+                        }
+                        _ => raw_data,
+                    }
+                } else {
+                    raw_data
+                }
+            } else {
+                raw_data
+            };
             let resp = Response {
                 status: Status::Ok,
                 body_len: data.len() as u64,
@@ -323,14 +355,20 @@ async fn handle_get(send: &mut iroh::endpoint::SendStream, sha256: &str, state: 
 }
 
 async fn handle_head(send: &mut iroh::endpoint::SendStream, sha256: &str, state: &IrohState) {
-    let status = if state.backend.exists(sha256) {
-        Status::Ok
+    let exists = state.backend.exists(sha256);
+    let status = if exists { Status::Ok } else { Status::NotFound };
+    let original_size = if exists {
+        state
+            .lfs_version_db
+            .as_ref()
+            .and_then(|lfs_db| lfs_db.get_by_sha256(sha256).ok().flatten())
+            .map(|v| v.original_size as u64)
     } else {
-        Status::NotFound
+        None
     };
     let resp = Response {
         status,
-        body_len: 0,
+        body_len: original_size.unwrap_or(0),
         content_type: String::new(),
         error: String::new(),
         descriptor: None,
@@ -616,8 +654,53 @@ async fn handle_delete(
         }
     }
 
+    let base_url_clone = state.base_url.clone();
+    let deltas_to_rebase = state
+        .lfs_version_db
+        .as_ref()
+        .and_then(|lfs_db| lfs_db.get_deltas_for_base(sha256).ok());
+
+    if let Some(ref deltas) = deltas_to_rebase {
+        for delta_version in deltas {
+            let base_decompressed_opt = {
+                let lfs_db = state.lfs_version_db.as_ref().unwrap();
+                state
+                    .backend
+                    .get(&delta_version.sha256)
+                    .and_then(|_delta_data| {
+                        reconstruct_blob_iroh(&[], delta_version, lfs_db.as_ref(), &*state.backend)
+                            .ok()
+                    })
+            };
+
+            if let Some(base_decompressed) = base_decompressed_opt {
+                let compressed = compress::compress(&base_decompressed)
+                    .unwrap_or_else(|_| base_decompressed.clone());
+                state.backend.insert_with_hash(
+                    compressed,
+                    &delta_version.sha256,
+                    delta_version.original_size as u64,
+                    &base_url_clone,
+                );
+                if let Some(ref mut lfs_db) = state.lfs_version_db {
+                    let _ = lfs_db.update_version(
+                        &delta_version.sha256,
+                        LfsStorageType::Compressed,
+                        None,
+                        base_decompressed.len() as i64,
+                    );
+                }
+            }
+        }
+    }
+
     if state.backend.delete(sha256) {
         let _ = state.database.delete_upload(sha256);
+
+        if let Some(ref mut lfs_db) = state.lfs_version_db {
+            let _ = lfs_db.delete_by_sha256(sha256);
+        }
+
         let resp = Response {
             status: Status::Ok,
             body_len: 0,
