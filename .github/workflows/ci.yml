@@ -26,10 +26,14 @@ jobs:
       - run: cargo test --features iroh-transport --test iroh_integration
       - run: cargo clippy --workspace -- -D warnings
 
-  # PR CI — runs on GitHub-hosted runner for pull requests.
+  # PR CI — runs on GitHub-hosted runners across OS matrix for pull requests.
   ci-pr:
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, macos-15-intel, windows-latest]
+      fail-fast: false
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
