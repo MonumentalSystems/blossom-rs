@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use super::{make_descriptor, BlobBackend};
+use super::{make_descriptor, make_descriptor_from_hash, BlobBackend};
 use crate::protocol::BlobDescriptor;
 
 /// In-memory blob storage backed by a HashMap.
@@ -31,6 +31,19 @@ impl Default for MemoryBackend {
 impl BlobBackend for MemoryBackend {
     fn insert(&mut self, data: Vec<u8>, base_url: &str) -> BlobDescriptor {
         let desc = make_descriptor(&data, base_url);
+        self.index.insert(desc.sha256.clone(), desc.size);
+        self.blobs.insert(desc.sha256.clone(), data);
+        desc
+    }
+
+    fn insert_with_hash(
+        &mut self,
+        data: Vec<u8>,
+        hash: &str,
+        original_size: u64,
+        base_url: &str,
+    ) -> BlobDescriptor {
+        let desc = make_descriptor_from_hash(hash, original_size, base_url);
         self.index.insert(desc.sha256.clone(), desc.size);
         self.blobs.insert(desc.sha256.clone(), data);
         desc

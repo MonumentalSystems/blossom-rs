@@ -110,6 +110,8 @@ pkarr = { version = "6.0.0-rc.0", default-features = false, features = ["relays"
 
 # Statistics
 dashmap = "6"
+zstd = "0.13.3"
+xdelta3 = "0.1.5"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

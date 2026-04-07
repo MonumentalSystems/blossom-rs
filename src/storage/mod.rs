@@ -28,6 +28,21 @@ pub trait BlobBackend: Send + Sync {
     /// Store a blob. Returns the blob descriptor with SHA256 hash and size.
     fn insert(&mut self, data: Vec<u8>, base_url: &str) -> BlobDescriptor;
 
+    /// Store data under a pre-computed SHA-256 hash.
+    ///
+    /// Used by BUD-20 to store compressed/delta blobs under the original
+    /// content hash so that GET /<sha256> can find them.
+    fn insert_with_hash(
+        &mut self,
+        data: Vec<u8>,
+        hash: &str,
+        original_size: u64,
+        base_url: &str,
+    ) -> BlobDescriptor {
+        let _ = (hash, original_size);
+        self.insert(data, base_url)
+    }
+
     /// Retrieve a blob by SHA256 hash.
     fn get(&self, sha256: &str) -> Option<Vec<u8>>;
 

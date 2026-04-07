@@ -77,6 +77,27 @@ impl BlobBackend for FilesystemBackend {
         desc
     }
 
+    fn insert_with_hash(
+        &mut self,
+        data: Vec<u8>,
+        hash: &str,
+        original_size: u64,
+        base_url: &str,
+    ) -> BlobDescriptor {
+        let desc = make_descriptor_from_hash(hash, original_size, base_url);
+        let path = self.blob_path(&desc.sha256);
+        if let Err(e) = std::fs::write(&path, &data) {
+            warn!(
+                storage.backend = "filesystem",
+                blob.sha256 = %desc.sha256,
+                error.message = %e,
+                "failed to write blob to disk"
+            );
+        }
+        self.index.insert(desc.sha256.clone(), desc.size);
+        desc
+    }
+
     fn get(&self, sha256: &str) -> Option<Vec<u8>> {
         let path = self.blob_path(sha256);
         if path.exists() {
