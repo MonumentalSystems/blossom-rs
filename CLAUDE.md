@@ -58,7 +58,7 @@ cargo run -p blossom-cli -- status                    # Server status
 | `labels` | no | Content labeling (Vision Transformer, LLM API) |
 | `iroh-transport` | yes | P2P QUIC transport via iroh (node-ID addressed) |
 | `pkarr-discovery` | yes | PKARR endpoint publishing via DHT + relays (implies iroh-transport) |
-| `otel` | no | OpenTelemetry OTLP export (Jaeger, Tempo, Seq) |
+| `otel` | yes | OpenTelemetry OTLP export (Jaeger, Tempo, Seq) |
 
 ## Architecture
 

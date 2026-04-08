@@ -14,7 +14,7 @@ keywords = ["blossom", "nostr", "blob", "storage", "bip340"]
 categories = ["web-programming", "cryptography"]
 
 [features]
-default = ["server", "client", "filesystem", "iroh-transport", "pkarr-discovery"]
+default = ["server", "client", "filesystem", "iroh-transport", "pkarr-discovery", "otel"]
 
 # Core
 server = ["dep:axum", "dep:axum-extra", "dep:tower-http", "dep:reqwest"]

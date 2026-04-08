@@ -114,7 +114,7 @@ let data = client.download(&desc.sha256).await?;
 | `labels` | no | Content classification (Vision Transformer, LLM API) |
 | `iroh-transport` | yes | P2P QUIC transport via iroh (node-ID addressed, hole-punching) |
 | `pkarr-discovery` | yes | Publish endpoints to Mainline DHT via PKARR (unified Ed25519 identity) |
-| `otel` | no | OpenTelemetry OTLP export (Jaeger, Tempo, Seq, Honeycomb) |
+| `otel` | yes | OpenTelemetry OTLP export (Jaeger, Tempo, Seq, Honeycomb) |
 
 ## Protocol Support
 
