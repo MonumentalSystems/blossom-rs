@@ -50,8 +50,12 @@ fn sign_release_manifest(args: &[String]) -> Result<(), String> {
                 .file_name()
                 .ok_or_else(|| format!("missing filename for {}", bin_path.display()))?
                 .to_os_string();
+            let bin_stem = bin_path
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "release".to_string());
             let output = take_flag_path(args, "--output")
-                .unwrap_or_else(|| package_root.join("release-manifest.json"));
+                .unwrap_or_else(|| package_root.join(format!("{}.manifest.json", bin_stem)));
             let manifest = generate_release_manifest_for_entries(
                 &package_root,
                 vec![PathBuf::from(bin_name)],

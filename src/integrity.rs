@@ -443,8 +443,17 @@ fn release_manifest_path() -> Option<PathBuf> {
     }
     let exe = std::env::current_exe().ok()?;
     let exe_dir = exe.parent()?;
-    let adjacent = exe_dir.join("release-manifest.json");
-    adjacent.exists().then_some(adjacent)
+    let exe_name = exe.file_stem()?.to_string_lossy();
+
+    // Try <binary-name>.manifest.json first (supports multiple binaries in same dir)
+    let named = exe_dir.join(format!("{}.manifest.json", exe_name));
+    if named.exists() {
+        return Some(named);
+    }
+
+    // Fall back to generic name
+    let generic = exe_dir.join("release-manifest.json");
+    generic.exists().then_some(generic)
 }
 
 fn npub_hex_to_bech32(npub_hex: &str) -> Option<String> {

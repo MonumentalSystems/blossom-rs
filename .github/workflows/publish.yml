@@ -67,17 +67,13 @@ jobs:
         if: env.BLOSSOM_RELEASE_NSEC != ''
         env:
           BLOSSOM_RELEASE_NSEC: ${{ secrets.BLOSSOM_RELEASE_NSEC }}
-        run: |
-          cargo xtask sign-release-manifest --bin target/release/blossom-server \
-            --output target/release/release-manifest.json
+        run: cargo xtask sign-release-manifest --bin target/release/blossom-server
 
       - name: Sign release manifest (blossom-cli)
         if: env.BLOSSOM_RELEASE_NSEC != ''
         env:
           BLOSSOM_RELEASE_NSEC: ${{ secrets.BLOSSOM_RELEASE_NSEC }}
-        run: |
-          cargo xtask sign-release-manifest --bin target/release/blossom-cli \
-            --output target/release/release-manifest-cli.json
+        run: cargo xtask sign-release-manifest --bin target/release/blossom-cli
 
       - name: Generate source Merkle tree
         env:
@@ -93,7 +89,7 @@ jobs:
           gh release upload "$TAG" \
             target/release/blossom-server \
             target/release/blossom-cli \
-            target/release/release-manifest.json \
-            target/release/release-manifest-cli.json \
+            target/release/blossom-server.manifest.json \
+            target/release/blossom-cli.manifest.json \
             target/release/source-merkle-tree.json \
             --clobber || true
