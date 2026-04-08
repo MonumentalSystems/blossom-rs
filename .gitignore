@@ -2,3 +2,6 @@
 
 blossom.db
 run-tests.sh
+relay_db/
+*.db
+blossom_locks.db
