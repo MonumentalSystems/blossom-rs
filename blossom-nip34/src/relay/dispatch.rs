@@ -1,9 +1,11 @@
 //! Main handler — dispatches between WebSocket, NIP-11, and fallback.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::body::Body;
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 
 use crate::Nip34State;
@@ -11,12 +13,20 @@ use crate::Nip34State;
 /// Main handler for `GET /` and `POST /`.
 ///
 /// Dispatches based on request headers:
-/// 1. Accept: application/nostr+json → NIP-11 info
-/// 2. Default → 200 with relay name
-///
-/// WebSocket upgrade is handled by a separate route.
-pub async fn main_handler(State(state): State<Arc<Nip34State>>, headers: HeaderMap) -> Response {
-    // NIP-11 info document
+/// 1. WebSocket upgrade → Nostr relay (raw hyper upgrade)
+/// 2. Accept: application/nostr+json → NIP-11 info
+/// 3. Default → 200 with relay name
+pub async fn main_handler(State(state): State<Arc<Nip34State>>, req: Request<Body>) -> Response {
+    // 1. WebSocket upgrade
+    if super::websocket::is_websocket_upgrade(&req) {
+        // TODO: extract real client addr from ConnectInfo
+        let addr = SocketAddr::from(([127, 0, 0, 1], 0));
+        return super::websocket::handle_ws_upgrade(state, req, addr);
+    }
+
+    let headers = req.headers().clone();
+
+    // 2. NIP-11 info document
     if let Some(accept) = headers.get("accept") {
         if let Ok(accept_str) = accept.to_str() {
             if accept_str.contains("application/nostr+json") {
@@ -25,7 +35,7 @@ pub async fn main_handler(State(state): State<Arc<Nip34State>>, headers: HeaderM
         }
     }
 
-    // Default: simple relay info
+    // 3. Default: simple relay info
     (
         StatusCode::OK,
         format!(

@@ -17,11 +17,10 @@ use std::sync::Arc;
 /// Build an axum Router with NIP-34 relay + GRASP git server.
 ///
 /// The returned router handles:
-/// - `GET /` — NIP-11 relay info (with `Accept: application/nostr+json`) or default page
-/// - `GET /ws` — WebSocket for Nostr relay protocol
-/// - `GET /{npub}/{repo}.git/info/refs` — git smart HTTP
-/// - `POST /{npub}/{repo}.git/git-upload-pack` — git fetch
-/// - `POST /{npub}/{repo}.git/git-receive-pack` — git push
+/// - `GET/POST /` — WebSocket upgrade (Nostr relay), NIP-11 info, or default page
+/// - `GET /{npub}/{repo}/info/refs` — git smart HTTP ref advertisement
+/// - `POST /{npub}/{repo}/git-upload-pack` — git fetch
+/// - `POST /{npub}/{repo}/git-receive-pack` — git push
 pub async fn build_nip34_router(
     config: Nip34Config,
 ) -> Result<axum::Router, Box<dyn std::error::Error>> {
@@ -32,7 +31,6 @@ pub async fn build_nip34_router(
             "/",
             axum::routing::get(relay::dispatch::main_handler).post(relay::dispatch::main_handler),
         )
-        .route("/ws", axum::routing::get(relay::websocket::ws_handler))
         .merge(git_server::git_router())
         .with_state(state);
 
