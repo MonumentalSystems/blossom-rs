@@ -466,6 +466,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Log build integrity status at startup.
+    let integrity = blossom_rs::integrity::runtime_integrity_info(
+        option_env!("BLOSSOM_SOURCE_BUILD_HASH"),
+        option_env!("BLOSSOM_BUILD_TARGET"),
+    );
+    info!(
+        integrity.status = %integrity.integrity_status,
+        integrity.source_build_hash = ?integrity.source_build_hash,
+        integrity.build_target = ?integrity.build_target,
+        integrity.release_signer = ?integrity.release_signer_npub,
+        "build integrity"
+    );
+
     info!(bind = %args.bind, base_url = %args.base_url, "starting blossom server");
 
     // Serve with graceful shutdown on Ctrl+C.
