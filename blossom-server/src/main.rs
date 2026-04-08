@@ -193,9 +193,9 @@ struct Args {
     #[arg(long, default_value = "info")]
     log_level: String,
 
-    /// Use JSON log output (default: pretty human-readable).
+    /// Use pretty human-readable log output (default: JSON).
     #[arg(long)]
-    log_json: bool,
+    log_pretty: bool,
 }
 
 #[tokio::main]
@@ -213,14 +213,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Init structured tracing (JSON to stdout, OTEL-compatible field names).
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level));
-    if args.log_json {
+    if args.log_pretty {
         tracing_subscriber::registry()
             .with(filter)
             .with(
                 tracing_subscriber::fmt::layer()
-                    .json()
                     .with_target(true)
-                    .with_span_list(true),
+                    .with_ansi(true),
             )
             .init();
     } else {
@@ -228,8 +227,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with(filter)
             .with(
                 tracing_subscriber::fmt::layer()
+                    .json()
                     .with_target(true)
-                    .with_ansi(true),
+                    .with_span_list(true),
             )
             .init();
     }
