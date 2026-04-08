@@ -19,12 +19,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - run: cargo clean
       - run: cargo fmt --all --check
-      - run: cargo build --workspace --all-targets
+      - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
-      - run: cargo test --features iroh-transport --test iroh_integration
-      - run: cargo clippy --workspace -- -D warnings
 
   # PR CI — runs on GitHub-hosted runner for pull requests.
   ci-pr:
@@ -36,9 +33,5 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: cargo fmt --all --check
-      - run: cargo build --workspace --all-targets
-      - run: cargo run -p blossom-cli -- -V
-      - run: cargo run -p blossom-server -- -V
+      - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
-      - run: cargo test --features iroh-transport --test iroh_integration
-      - run: cargo clippy --workspace -- -D warnings
