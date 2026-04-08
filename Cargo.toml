@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "blossom-server", "blossom-cli", "xtask", "xdelta3-rs"]
+members = [".", "blossom-server", "blossom-cli", "xtask"]
 
 [package]
 name = "blossom-rs"
@@ -111,7 +111,10 @@ pkarr = { version = "6.0.0-rc.0", default-features = false, features = ["relays"
 # Statistics
 dashmap = "6"
 zstd = "0.13.3"
-xdelta3 = { path = "xdelta3-rs" }
+
+[build-dependencies]
+cc = "1.0"
+bindgen = "0.71"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

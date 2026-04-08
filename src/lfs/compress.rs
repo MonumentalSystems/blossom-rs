@@ -24,12 +24,12 @@ pub fn decompress(data: &[u8]) -> Result<Vec<u8>, String> {
 
 /// Encode a delta between a base blob and new data using xdelta3.
 pub fn encode_delta(base: &[u8], new: &[u8]) -> Result<Vec<u8>, String> {
-    xdelta3::encode(new, base).ok_or_else(|| "xdelta3 encode failed".into())
+    crate::xdelta3::encode(new, base).ok_or_else(|| "xdelta3 encode failed".into())
 }
 
 /// Decode a delta against a base blob using xdelta3.
 pub fn decode_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>, String> {
-    xdelta3::decode(delta, base).ok_or_else(|| "xdelta3 decode failed".into())
+    crate::xdelta3::decode(delta, base).ok_or_else(|| "xdelta3 decode failed".into())
 }
 
 /// Decide whether a delta is worth storing vs falling back to full compressed.

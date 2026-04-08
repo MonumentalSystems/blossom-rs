@@ -53,6 +53,7 @@ pub mod storage;
 pub mod traits;
 pub mod transport;
 pub mod webhooks;
+mod xdelta3;
 
 #[cfg(feature = "server")]
 pub mod server;

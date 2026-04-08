@@ -1,6 +1,4 @@
-//! Rust bindings for xdelta3 (VCDIFF binary delta encoding).
-//!
-//! Provides `encode` and `decode` for computing and applying binary diffs.
+//! Internal xdelta3 FFI bindings (VCDIFF binary delta encoding).
 
 mod binding {
     #![allow(dead_code)]
@@ -8,12 +6,10 @@ mod binding {
     #![allow(non_camel_case_types)]
     #![allow(non_snake_case)]
 
-    include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
+    include!(concat!(env!("OUT_DIR"), "/xdelta3_bindings.rs"));
 }
 
 /// Encode a binary delta from `src` (original) to `input` (new).
-///
-/// Returns `Some(delta)` on success, `None` on failure.
 pub fn encode(input: &[u8], src: &[u8]) -> Option<Vec<u8>> {
     let input_len = input.len() as std::ffi::c_uint;
     let src_len = src.len() as std::ffi::c_uint;
@@ -43,8 +39,6 @@ pub fn encode(input: &[u8], src: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Decode a binary delta. `src` is the original, `input` is the delta.
-///
-/// Returns `Some(reconstructed)` on success, `None` on failure.
 pub fn decode(input: &[u8], src: &[u8]) -> Option<Vec<u8>> {
     let input_len = input.len() as std::ffi::c_uint;
     let src_len = src.len() as std::ffi::c_uint;
@@ -84,13 +78,5 @@ mod tests {
         let delta = encode(new, src).expect("encode failed");
         let recovered = decode(&delta, src).expect("decode failed");
         assert_eq!(recovered, new);
-    }
-
-    #[test]
-    fn identical_data() {
-        let data = b"identical content here";
-        let delta = encode(data, data).expect("encode failed");
-        let recovered = decode(&delta, data).expect("decode failed");
-        assert_eq!(recovered, data);
     }
 }

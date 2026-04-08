@@ -1105,10 +1105,12 @@ dependencies = [
  "axum",
  "axum-extra",
  "bech32",
+ "bindgen",
  "blurhash",
  "candle-core",
  "candle-nn",
  "candle-transformers",
+ "cc",
  "dashmap",
  "hex",
  "image",
@@ -1137,7 +1139,6 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "webp",
- "xdelta3",
  "zstd",
 ]
 
@@ -8210,14 +8211,6 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
-]
-
-[[package]]
-name = "xdelta3"
-version = "0.2.0"
-dependencies = [
- "bindgen",
- "cc",
 ]
 
 [[package]]
