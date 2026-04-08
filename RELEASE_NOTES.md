@@ -1,5 +1,84 @@
 # Release Notes
 
+## v0.5.0
+
+### Major: NIP-34 Decentralized Git Hosting
+
+blossom-server is now a fully decentralized GitHub alternative — a single binary providing blob storage, Nostr relay, and GRASP git server.
+
+#### New Crate: `blossom-nip34`
+
+MIT-licensed NIP-34 Nostr relay + GRASP git server library. Enabled by default in blossom-server.
+
+- **Nostr relay** — NIP-34 event storage (repos, patches, issues, status) via WebSocket, backed by LMDB
+- **GRASP git server** — HTTP smart protocol (`git clone`/`git push`) at `/{npub}/{repo}.git/*`
+- **Push auth** — `git push` requires Nostr signature from the repo owner (npub in URL)
+- **NIP-11** — relay information document at `/` with `Accept: application/nostr+json`
+- **GRASP validation plugins** — repo announcement validation (name rules, clone/relay URLs), repo state validation (HEAD ref, SHA1 format)
+- **Relay admin policies** — runtime-mutable whitelist/blacklist/admin pubkeys, event size limits, kind filtering. All persisted to SQLite or PostgreSQL.
+- **Admin HTTP endpoints** — `GET/PUT/DELETE /relay/admin/{policy,whitelist,blacklist,admins}`
+- **Auto repo creation** — bare git repos created on filesystem when kind:30617 events arrive
+
+#### NIP-34 Event Kinds Supported
+
+| Kind | Event |
+|------|-------|
+| 30617 | Repository Announcement |
+| 30618 | Repository State |
+| 1617 | Patches |
+| 1618 | Pull Requests |
+| 1619 | PR Updates |
+| 1621 | Issues |
+| 1630–1633 | Status (Open/Applied/Closed/Draft) |
+| 10317 | User Grasp List |
+
+### Nostr Event Publishing
+
+- **NIP-94 file metadata (kind:1063)** — `blossom-cli upload` publishes file metadata events (URL, SHA256, MIME, size) to the server's relay after upload
+- **BUD-03 server list (kind:10063)** — publishes user's server list after upload
+- Both enabled by default, `--no-publish` to opt out
+- New `nostr_events` module in blossom-rs library
+
+### Axum 0.8 Migration
+
+- Entire workspace upgraded from axum 0.7 → 0.8
+- Route syntax updated: `:param` → `{param}`, `*path` → `{*path}`
+- axum-server 0.7 → 0.8 for TLS
+
+### CLI: Relay Admin Commands
+
+New `blossom-cli relay` subcommand group:
+- `relay policy` — view full policy summary
+- `relay whitelist-list/add/remove` — manage relay whitelist
+- `relay blacklist-list/add/remove` — manage relay blacklist
+- `relay admin-list/add` — manage relay admin pubkeys
+
+### PKARR Discovery
+
+- `_nostr` TXT record — relay WebSocket URL published alongside `_blossom` and `_iroh` records
+- `resolve_all_endpoints()` — returns HTTP URL, iroh node ID, and Nostr relay URL
+- `ResolvedEndpoints` struct for structured resolution
+
+### Default Changes
+
+- **NIP-34 relay enabled by default** in blossom-server (`--no-relay` to disable)
+- **JSON logs by default** (`--log-pretty` for human-readable)
+- **Per-binary manifest naming** — `<binary-name>.manifest.json` (supports multiple binaries in same directory)
+
+### Build & Integrity
+
+- **Vendored xdelta3** — bindgen 0.52 → 0.71, eliminates all future-Rust deprecation warnings
+- **CI signs release manifests** — `blossom-server.manifest.json` and `blossom-cli.manifest.json` uploaded to GitHub releases
+- **Integrity logged at startup** — verified/unsigned/mismatch status
+
+### Fixes
+
+- pkarr: DHT feature removed for crates.io publishability (mainline digest conflict)
+- Runtime DB files (.db, relay_db/) added to .gitignore
+- CI: `fmt → clippy → test` order, dropped redundant `cargo build` step
+
+---
+
 ## v0.4.2
 
 ### New Features

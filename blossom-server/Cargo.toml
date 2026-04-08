@@ -1,6 +1,6 @@
 [package]
 name = "blossom-server"
-version = "0.4.2"
+version = "0.5.0"
 edition = "2021"
 description = "Blossom blob storage API server — BUD-01/02/04/06, NIP-96, BIP-340 auth, SQLite metadata"
 license = "MIT"
@@ -10,7 +10,7 @@ keywords = ["blossom", "nostr", "server", "blob", "storage"]
 categories = ["command-line-utilities", "web-programming"]
 
 [dependencies]
-blossom-rs = { path = "..", version = "0.4.2", features = ["server", "filesystem", "s3", "db-sqlite", "db-postgres", "media", "iroh-transport", "pkarr-discovery"] }
+blossom-rs = { path = "..", version = "0.5.0", features = ["server", "filesystem", "s3", "db-sqlite", "db-postgres", "media", "iroh-transport", "pkarr-discovery"] }
 blossom-nip34 = { path = "../blossom-nip34", optional = true }
 axum = "0.8"
 axum-server = { version = "0.8", features = ["tls-rustls"] }
@@ -33,6 +33,6 @@ hex = "0.4"
 serde_json = "1.0"
 
 [dev-dependencies]
-blossom-rs = { path = "..", version = "0.4.2", features = ["server", "client", "filesystem", "db-sqlite"] }
+blossom-rs = { path = "..", version = "0.5.0", features = ["server", "client", "filesystem", "db-sqlite"] }
 reqwest = { version = "0.12", features = ["json"] }
 tempfile = "3"

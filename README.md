@@ -13,33 +13,32 @@ Content-addressed blob storage over HTTP with BIP-340 Schnorr authorization via 
 | Crate | Description | Install |
 |-------|-------------|---------|
 | **blossom-rs** | Core library — embeddable server, async client, all traits | `cargo add blossom-rs` |
-| **blossom-server** | API server binary — filesystem + SQLite, CORS, TLS, admin, rate limiting | `cargo install blossom-server` |
-| **blossom-cli** | CLI client — upload/download/mirror/keygen, hex + nsec1 key support | `cargo install blossom-cli` |
+| **blossom-server** | API server — blob storage + NIP-34 relay + GRASP git server | `cargo install blossom-server` |
+| **blossom-cli** | CLI client — upload/download/mirror/keygen/relay admin | `cargo install blossom-cli` |
+| **blossom-nip34** | NIP-34 relay + GRASP git server library | `cargo add blossom-nip34` |
 
 ## Features
 
-- **Embeddable server** — mount a Blossom-compliant Axum router into your app
-- **Async client** — upload/download with multi-server failover and SHA256 integrity
+- **Decentralized git hosting** — NIP-34 Nostr relay + GRASP git HTTP server (enabled by default)
+- **Blob storage** — content-addressed BUD-01 with SHA256 integrity
+- **BUD-19 file locking** — Git LFS lock/unlock/verify with ownership enforcement
+- **BUD-20 compression** — zstd + xdelta3 delta encoding for LFS blobs
+- **BUD-03 server list** — auto-publish kind:10063 events after upload
+- **NIP-94 file metadata** — auto-publish kind:1063 events after upload
 - **Dual auth** — kind:24242 (Blossom) and kind:27235 (NIP-98) Nostr event authentication
 - **Pluggable storage** — memory (testing), filesystem, S3-compatible backends
-- **Database layer** — metadata persistence with SQLite/Postgres via SQLx, versioned migrations
-- **Access control** — whitelist with hot-reload, custom policies via trait
-- **Admin API** — user management, quota CRUD, blob management, server stats
-- **Rate limiting** — token-bucket per-key throttling with configurable refill
-- **Webhook notifications** — fire-and-forget HTTP POST on upload/delete/mirror events
-- **File statistics** — lock-free egress tracking with DashMap accumulator, periodic DB flush
-- **Observability** — OTEL-compatible structured tracing with opt-in OTLP export
+- **Database layer** — SQLite/Postgres via SQLx, versioned migrations
+- **Relay admin** — runtime whitelist/blacklist/admin pubkeys, kind filtering, persisted to DB
+- **Access control** — whitelist with hot-reload, role-based, custom policies via trait
+- **Admin API** — user management, quota CRUD, blob management, LFS stats, relay policy
+- **Rate limiting** — token-bucket per-key throttling
+- **iroh P2P transport** — QUIC transport for uploads with HTTP download fallback
+- **PKARR DHT discovery** — publish `_blossom`, `_iroh`, `_nostr` TXT records
+- **Observability** — OTEL-compatible structured tracing with OTLP export
 - **NIP-96** — Nostr file storage protocol endpoints
-- **BUD-01/02/04/06** — core Blossom protocol + list, mirror, upload requirements
-- **BUD-19 file locking** — Git LFS lock/unlock/verify with ownership enforcement and admin force unlock
-- **Health check** — `GET /health` for load balancer probes
-- **CORS** — configurable origins or allow-all for browser clients
-- **TLS** — optional rustls-based HTTPS via `axum-server`
-- **Graceful shutdown** — flushes stats to DB on Ctrl+C
-- **Media processing** — WebP conversion, thumbnails, blurhash, EXIF validation (feature-gated)
-- **Content labeling** — pluggable classification traits for moderation (feature-gated)
-- **Perceptual hashing** — image dedup support via phash field in upload records
-- **Trait-based** — implement `BlossomSigner`, `BlobBackend`, `BlobDatabase`, `AccessControl`, `MediaProcessor`, `MediaLabeler`, or `WebhookNotifier` for your own types
+- **Build integrity** — signed release manifests, source Merkle tree attestation
+- **TLS, CORS, graceful shutdown** — production-ready defaults
+- **Trait-based** — `BlossomSigner`, `BlobBackend`, `BlobDatabase`, `LockDatabase`, `AccessControl`, `MediaProcessor`, `WebhookNotifier`
 
 ## Quick Start
 
@@ -120,20 +119,24 @@ let data = client.download(&desc.sha256).await?;
 
 | Protocol | Status | Endpoints |
 |----------|--------|-----------|
-| **BUD-01** | Implemented | `PUT /upload`, `GET/HEAD/DELETE /:sha256` |
-| **BUD-02** | Implemented | `GET /list/:pubkey` |
+| **BUD-01** | Implemented | `PUT /upload`, `GET/HEAD/DELETE /{sha256}` |
+| **BUD-02** | Implemented | `GET /list/{pubkey}` |
+| **BUD-03** | Implemented | kind:10063 server list (auto-published by CLI on upload) |
 | **BUD-04** | Implemented | `PUT /mirror` |
 | **BUD-06** | Implemented | `GET /upload-requirements` |
+| **BUD-19** | Implemented | `POST/GET /lfs/{repo_id}/locks`, verify, unlock (default on) |
+| **BUD-20** | Implemented | zstd + xdelta3 LFS compression/delta (server-side) |
+| **NIP-34** | Implemented | Nostr relay (WebSocket) + GRASP git HTTP server (default on) |
+| **NIP-94** | Implemented | kind:1063 file metadata (auto-published by CLI on upload) |
 | **NIP-96** | Implemented | `GET /.well-known/nostr/nip96.json`, `POST/GET/DELETE /n96` |
 | **NIP-98** | Implemented | kind:27235 HTTP auth (accepted alongside kind:24242) |
 | **BIP-340** | Implemented | Schnorr signature auth on all write operations |
-| **Admin** | Implemented | `GET/PUT/DELETE /admin/*` (stats, users, quotas, blobs, LFS stats) |
-| **BUD-19** | Implemented | `POST/GET /lfs/{repo_id}/locks`, verify, unlock (`--enable-locks`) |
-| **S3-compat** | Implemented | `PUT/GET/HEAD/DELETE /:bucket/*key` (feature-gated) |
+| **Admin** | Implemented | `/admin/*` (stats, users, quotas, blobs, LFS stats) + `/relay/admin/*` |
+| **S3-compat** | Implemented | `PUT/GET/HEAD/DELETE /{bucket}/{*key}` (feature-gated) |
 | **Health** | Implemented | `GET /health` |
-| **Status** | Implemented | `GET /status` |
-| **iroh** | Implemented | P2P QUIC via `/blossom/1` ALPN (feature-gated) |
-| **PKARR** | Implemented | DHT endpoint discovery via `_blossom` / `_iroh` TXT records (feature-gated) |
+| **Status** | Implemented | `GET /status` (with build integrity) |
+| **iroh** | Implemented | P2P QUIC via `/blossom/1` ALPN |
+| **PKARR** | Implemented | `_blossom`, `_iroh`, `_nostr` TXT records |
 
 ## Architecture
 
