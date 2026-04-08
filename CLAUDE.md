@@ -52,7 +52,7 @@ cargo run -p blossom-cli -- status                    # Server status
 | `filesystem` | yes | FilesystemBackend (persistent, restart-safe) |
 | `s3` | no | S3/R2/MinIO backend via aws-sdk-s3 |
 | `s3-compat` | no | S3-compat test router (requires `server`) |
-| `db-sqlite` | no | SQLite metadata backend via SQLx (versioned migrations) |
+| `db-sqlite` | yes | SQLite metadata backend via SQLx (versioned migrations) |
 | `db-postgres` | no | PostgreSQL metadata backend via SQLx |
 | `media` | no | Image processing (WebP, thumbnails, blurhash, EXIF) |
 | `labels` | no | Content labeling (Vision Transformer, LLM API) |

@@ -108,7 +108,7 @@ let data = client.download(&desc.sha256).await?;
 | `filesystem` | yes | FilesystemBackend (persistent, restart-safe) |
 | `s3` | no | S3/R2/MinIO backend via `aws-sdk-s3` |
 | `s3-compat` | no | S3-protocol compatibility test router |
-| `db-sqlite` | no | SQLite metadata backend via SQLx (versioned migrations) |
+| `db-sqlite` | yes | SQLite metadata backend via SQLx (versioned migrations) |
 | `db-postgres` | no | PostgreSQL metadata backend via SQLx |
 | `media` | no | Image processing (WebP, thumbnails, blurhash, EXIF) |
 | `labels` | no | Content classification (Vision Transformer, LLM API) |
