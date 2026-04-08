@@ -106,7 +106,7 @@ iroh = { version = "0.97", optional = true }
 anyhow = { version = "1", optional = true }
 
 # PKARR discovery (optional)
-pkarr = { version = "6.0.0-rc.0", default-features = false, features = ["relays", "signed_packet"], optional = true }
+pkarr = { version = "6.0.0-rc.0", default-features = false, features = ["relays", "signed_packet", "dht"], optional = true }
 
 # Statistics
 dashmap = "6"
@@ -120,3 +120,8 @@ rand = "0.8"
 tempfile = "3"
 proptest = "1"
 serial_test = "3"
+
+[patch.crates-io]
+# mainline 6.1.1 on crates.io pins digest =0.11.0-rc.9, but iroh 0.97 needs
+# =0.11.0-rc.10. The git repo has the fix; use it until 6.1.2 is published.
+mainline = { git = "https://github.com/pubky/mainline.git" }
