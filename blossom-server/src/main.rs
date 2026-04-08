@@ -11,6 +11,7 @@ use std::sync::Arc as StdArc;
 
 use blossom_rs::access::{normalize_pubkey, RoleBasedAccess, Whitelist};
 use blossom_rs::db::MemoryDatabase;
+use blossom_rs::locks::MemoryLockDatabase;
 use blossom_rs::ratelimit::{RateLimitConfig, RateLimiter};
 use blossom_rs::server::admin::admin_router;
 use blossom_rs::server::nip96::nip96_router;
@@ -136,6 +137,10 @@ struct Args {
     /// Enable admin endpoints.
     #[arg(long)]
     enable_admin: bool,
+
+    /// Enable BUD-19 Git LFS file locking endpoints.
+    #[arg(long)]
+    enable_locks: bool,
 
     /// Bootstrap admin pubkey (hex or npub1). Persisted in the database.
     /// Can be specified multiple times.
@@ -309,6 +314,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+
+    if args.enable_locks {
+        builder = builder.lock_database(MemoryLockDatabase::new());
+        info!("BUD-19 file locking enabled (in-memory lock database)");
+    }
 
     let server = builder.build();
     let state = server.shared_state();

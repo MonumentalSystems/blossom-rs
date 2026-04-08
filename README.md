@@ -31,6 +31,7 @@ Content-addressed blob storage over HTTP with BIP-340 Schnorr authorization via 
 - **Observability** — OTEL-compatible structured tracing with opt-in OTLP export
 - **NIP-96** — Nostr file storage protocol endpoints
 - **BUD-01/02/04/06** — core Blossom protocol + list, mirror, upload requirements
+- **BUD-19 file locking** — Git LFS lock/unlock/verify with ownership enforcement and admin force unlock
 - **Health check** — `GET /health` for load balancer probes
 - **CORS** — configurable origins or allow-all for browser clients
 - **TLS** — optional rustls-based HTTPS via `axum-server`
@@ -127,6 +128,7 @@ let data = client.download(&desc.sha256).await?;
 | **NIP-98** | Implemented | kind:27235 HTTP auth (accepted alongside kind:24242) |
 | **BIP-340** | Implemented | Schnorr signature auth on all write operations |
 | **Admin** | Implemented | `GET/PUT/DELETE /admin/*` (stats, users, quotas, blobs) |
+| **BUD-19** | Implemented | `POST/GET /lfs/{repo_id}/locks`, verify, unlock (`--enable-locks`) |
 | **S3-compat** | Implemented | `PUT/GET/HEAD/DELETE /:bucket/*key` (feature-gated) |
 | **Health** | Implemented | `GET /health` |
 | **Status** | Implemented | `GET /status` |
@@ -141,6 +143,7 @@ All extension points are trait-based:
 BlossomSigner   — BIP-340 signing (bring your own identity)
 BlobBackend     — blob storage (Memory, Filesystem, S3)
 BlobDatabase    — metadata persistence (Memory, SQLite, Postgres)
+LockDatabase    — BUD-19 file locks (Memory; bring your own for persistence)
 AccessControl   — authorization (OpenAccess, Whitelist, custom)
 WebhookNotifier — event notifications (Noop, HTTP POST, custom)
 MediaProcessor  — image/video processing (Passthrough, ImageProcessor)
@@ -160,6 +163,7 @@ BlobServer::builder(backend, "http://localhost:3000")
     .rate_limiter(limiter)      // Token-bucket rate limiting
     .webhook_notifier(notifier) // Lifecycle event webhooks
     .media_processor(processor) // BUD-05 image processing on PUT /media
+    .lock_database(blossom_rs::locks::MemoryLockDatabase::new()) // BUD-19 file locking
     .build();
 ```
 

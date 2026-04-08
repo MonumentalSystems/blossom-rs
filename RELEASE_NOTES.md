@@ -1,5 +1,20 @@
 # Release Notes
 
+## v0.4.1
+
+### Bug Fixes
+
+- **`blossom-server --enable-locks`** — Add CLI flag to enable BUD-19 file locking endpoints. Previously, lock endpoints were implemented in the library but never wired up in the server binary, causing all lock requests to return 404.
+- Lock endpoints (`POST/GET /lfs/{repo_id}/locks`, `POST /lfs/{repo_id}/locks/verify`, `POST /lfs/{repo_id}/locks/{id}/unlock`) are now mounted when `--enable-locks` is passed.
+- Uses `MemoryLockDatabase` — locks are held in-memory and released on server restart.
+
+### Documentation
+
+- README protocol support table now lists BUD-19 (LFS File Locking).
+- Server builder example includes `.lock_database()`.
+
+---
+
 ## v0.4.0
 
 ### Breaking Changes
