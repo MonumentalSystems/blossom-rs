@@ -2,22 +2,47 @@
 
 Blossom blob storage API server built on [blossom-rs](https://github.com/MonumentalSystems/blossom-rs).
 
+[![crates.io](https://img.shields.io/crates/v/blossom-server.svg)](https://crates.io/crates/blossom-server)
+
+## What You Get Out of the Box
+
+A plain `cargo install blossom-server && blossom-server` gives you:
+
+- **BUD-19 file locking** — enabled by default with SQLite persistence (opt out with `--no-locks`)
+- **SQLite metadata** — uploads, users, quotas, LFS file versions, lock database
+- **iroh hybrid transport** — P2P QUIC uploads + HTTP downloads (activate with `--iroh`)
+- **PKARR DHT discovery** — publish endpoints to Mainline DHT + relays (activate with `--iroh --pkarr`)
+- **OpenTelemetry tracing** — structured JSON logs with OTEL field names, ready for Jaeger/Tempo
+- **Build integrity** — source hash embedded at compile time, signed release manifests in CI
+- **BUD-20 compression** — server-side zstd + xdelta3 delta encoding for LFS blobs
+- **Rate limiting, CORS, TLS, graceful shutdown** — production-ready defaults
+
 ## Quick Start
 
 ```bash
-# Default: filesystem storage + SQLite metadata
-cargo run -p blossom-server
+cargo install blossom-server
+
+# Default: filesystem storage + SQLite + locks enabled
+blossom-server
+
+# With iroh P2P + PKARR DHT advertisement
+blossom-server --iroh --pkarr
 
 # In-memory (no persistence, good for testing)
-cargo run -p blossom-server -- --memory
+blossom-server --memory
 
 # Custom bind address and base URL
-cargo run -p blossom-server -- --bind 0.0.0.0:8080 --base-url https://blobs.example.com
+blossom-server --bind 0.0.0.0:8080 --base-url https://blobs.example.com
 
-# With iroh P2P transport + PKARR discovery
-cargo run -p blossom-server -- --iroh --pkarr
-# Prints: iroh P2P transport enabled — connect with: iroh://<node-id>
-# Prints: PKARR discovery enabled — pk:<public-key>
+# Full production setup
+blossom-server \
+  --bind 0.0.0.0:3000 \
+  --base-url https://blobs.example.com \
+  --require-auth \
+  --admin npub1... \
+  --enable-admin \
+  --iroh --pkarr \
+  --tls-cert cert.pem --tls-key key.pem
 ```
 
 ## Options
@@ -25,33 +50,54 @@ cargo run -p blossom-server -- --iroh --pkarr
 ```
 blossom-server [OPTIONS]
 
-Options:
-  -b, --bind <ADDR>              Listen address [default: 0.0.0.0:3000]
-  -u, --base-url <URL>           Public base URL [default: http://localhost:3000]
+Storage:
   -d, --data-dir <PATH>          Blob storage directory [default: ./blobs]
       --memory                   Use in-memory storage (no persistence)
+      --s3-endpoint <URL>        S3-compatible endpoint (overrides --data-dir)
+      --s3-bucket <NAME>         S3 bucket name [default: blobs]
+      --s3-region <REGION>       S3 region [default: auto]
+      --s3-public-url <URL>      S3 CDN/public URL prefix
+
+Database:
       --db-path <PATH>           SQLite database path [default: ./blossom.db]
+      --db-postgres <URL>        PostgreSQL connection URL (overrides SQLite)
+
+Network:
+  -b, --bind <ADDR>              Listen address [default: 0.0.0.0:3000]
+  -u, --base-url <URL>           Public base URL [default: http://localhost:3000]
+      --tls-cert <FILE>          TLS certificate (PEM)
+      --tls-key <FILE>           TLS private key (PEM)
+      --cors-origins <ORIGINS>   CORS allowed origins (comma-separated, default: all)
+
+Auth & Access:
       --require-auth             Require BIP-340 auth for uploads
+      --whitelist <FILE>         Path to pubkey whitelist file
+      --whitelist-reload-secs <N> Whitelist hot-reload interval [default: 0]
+      --admin <PUBKEY>           Bootstrap admin pubkey (hex or npub, repeatable)
+      --enable-admin             Enable admin endpoints at /admin/*
+
+Locking:
+      --no-locks                 Disable BUD-19 file locking (enabled by default)
+
+P2P Transport:
+      --iroh                     Enable iroh P2P transport alongside HTTP
+      --iroh-key-file <PATH>     Iroh secret key file [default: ./iroh_secret.key]
+      --pkarr                    Enable PKARR DHT endpoint discovery (requires --iroh)
+      --pkarr-republish-secs <N> PKARR republish interval [default: 3600]
+
+Limits:
       --max-upload-size <BYTES>  Max upload size in bytes
       --body-limit <BYTES>       Max HTTP body size [default: 268435456 (256 MB)]
       --allowed-types <TYPES>    Comma-separated MIME types (empty = all)
-      --whitelist <FILE>         Path to pubkey whitelist file
-      --whitelist-reload-secs <N> Whitelist hot-reload interval [default: 0 (disabled)]
-      --stats-flush-secs <N>    Stats flush interval [default: 60]
-      --keygen                   Generate a keypair and exit
-      --tls-cert <FILE>          TLS certificate (PEM)
-      --tls-key <FILE>           TLS private key (PEM)
       --rate-limit-max <N>       Max requests per bucket [default: 60]
       --rate-limit-refill <F>    Token refill rate per second [default: 1.0]
       --no-rate-limit            Disable rate limiting
-      --webhook-urls <URLS>      Webhook URLs (comma-separated)
-      --cors-origins <ORIGINS>   CORS allowed origins (comma-separated, default: all)
-      --enable-admin             Enable admin endpoints at /admin/*
+
+Other:
       --media                    Enable media processing on PUT /media (BUD-05)
-      --iroh                     Enable iroh P2P transport alongside HTTP
-      --iroh-key-file <PATH>     Iroh secret key file [default: ./iroh_secret.key]
-      --pkarr                    Enable PKARR endpoint discovery (requires --iroh)
-      --pkarr-republish-secs <N> PKARR republish interval [default: 3600]
+      --webhook-urls <URLS>      Webhook URLs (comma-separated)
+      --stats-flush-secs <N>     Stats flush interval [default: 60]
+      --keygen                   Generate a keypair and exit
       --log-level <LEVEL>        Log level [default: info]
 ```
 
@@ -61,90 +107,62 @@ Options:
 |--------|------|-------------|----------|
 | `PUT` | `/upload` | Upload a blob | BUD-01 |
 | `GET` | `/:sha256` | Download a blob | BUD-01 |
-| `HEAD` | `/:sha256` | Check existence | BUD-01 |
+| `HEAD` | `/:sha256` | Check existence + size | BUD-01 |
 | `DELETE` | `/:sha256` | Delete a blob (auth required) | BUD-01 |
 | `GET` | `/list/:pubkey` | List blobs by uploader | BUD-02 |
-| `PUT` | `/mirror` | Mirror from remote URL (auth required) | BUD-04 |
-| `PUT` | `/media` | Upload with server-side processing (auth required, --media) | BUD-05 |
+| `PUT` | `/mirror` | Mirror from remote URL | BUD-04 |
+| `PUT` | `/media` | Upload with processing (`--media`) | BUD-05 |
 | `GET` | `/upload-requirements` | Server constraints | BUD-06 |
-| `GET` | `/status` | Server statistics | - |
+| `POST` | `/lfs/:repo_id/locks` | Create lock | BUD-19 |
+| `GET` | `/lfs/:repo_id/locks` | List locks | BUD-19 |
+| `POST` | `/lfs/:repo_id/locks/verify` | Verify locks (ours/theirs) | BUD-19 |
+| `POST` | `/lfs/:repo_id/locks/:id/unlock` | Unlock | BUD-19 |
+| `GET` | `/status` | Server statistics + build integrity | - |
 | `GET` | `/health` | Health check (200 OK) | - |
+| `GET` | `/admin/stats` | Server statistics | Admin |
+| `GET` | `/admin/lfs-stats` | LFS storage efficiency metrics | Admin |
+| `GET` | `/admin/users/:pubkey` | Get user record | Admin |
+| `PUT` | `/admin/users/:pubkey/quota` | Set user quota | Admin |
+| `PUT` | `/admin/users/:pubkey/role` | Set user role | Admin |
+| `GET` | `/admin/roles` | List users by role | Admin |
+| `GET` | `/admin/blobs` | Blob count and size | Admin |
+| `DELETE` | `/admin/blobs/:sha256` | Admin delete blob | Admin |
+| `GET` | `/admin/whitelist` | List whitelisted pubkeys | Admin |
+| `PUT` | `/admin/whitelist/:pubkey` | Add to whitelist | Admin |
+| `DELETE` | `/admin/whitelist/:pubkey` | Remove from whitelist | Admin |
 | `GET` | `/.well-known/nostr/nip96.json` | NIP-96 server info | NIP-96 |
-| `POST` | `/n96` | NIP-96 upload (auth required) | NIP-96 |
-| `GET` | `/n96` | NIP-96 file list (auth required) | NIP-96 |
-| `DELETE` | `/n96/:sha256` | NIP-96 delete (auth required) | NIP-96 |
-| `GET` | `/admin/stats` | Server statistics (admin auth) | Admin |
-| `GET` | `/admin/users/:pubkey` | Get user record (admin auth) | Admin |
-| `PUT` | `/admin/users/:pubkey/quota` | Set user quota (admin auth) | Admin |
-| `GET` | `/admin/blobs` | Blob count and size (admin auth) | Admin |
-| `DELETE` | `/admin/blobs/:sha256` | Admin delete blob (admin auth) | Admin |
-| `GET` | `/admin/whitelist` | List whitelisted pubkeys (admin auth) | Admin |
-| `PUT` | `/admin/whitelist/:pubkey` | Add pubkey to whitelist (admin auth) | Admin |
-| `DELETE` | `/admin/whitelist/:pubkey` | Remove pubkey from whitelist (admin auth) | Admin |
+| `POST` | `/n96` | NIP-96 upload | NIP-96 |
+| `GET` | `/n96` | NIP-96 file list | NIP-96 |
+| `DELETE` | `/n96/:sha256` | NIP-96 delete | NIP-96 |
 
-## Features
+## Build Integrity
 
-### CORS
-Enabled by default — allows all origins, methods, and headers. Suitable for browser-based Nostr clients.
+The server embeds a deterministic source hash at compile time and reports it via `GET /status`:
 
-### Graceful Shutdown
-On Ctrl+C, the server flushes accumulated access statistics to the database before exiting.
-
-### Stats Flush
-Access statistics (egress bytes, last accessed) accumulate in memory via lock-free DashMap counters and flush to the database periodically (default: every 60 seconds) and on shutdown.
-
-### Whitelist Hot-Reload
-When `--whitelist-reload-secs` is set, the whitelist file is re-read at that interval without restarting the server.
-
-### TLS
-Optional TLS via rustls. Provide `--tls-cert` and `--tls-key` PEM files.
-
-```bash
-cargo run -p blossom-server -- --tls-cert cert.pem --tls-key key.pem
+```json
+{
+  "integrity": {
+    "integrity_status": "verified",
+    "source_build_hash": "b52cdffc...",
+    "build_target": "x86_64-unknown-linux-gnu",
+    "release_signer_npub": "npub1..."
+  }
+}
 ```
 
-### Logging
-Structured JSON logs to stdout with OTEL-compatible field names. Control verbosity with `--log-level` or `RUST_LOG`.
-
-```bash
-RUST_LOG=blossom_rs::server=debug cargo run -p blossom-server
-```
+- **unsigned** — built from source (normal for `cargo install`)
+- **verified** — pre-built binary with signed release manifest from CI
+- **mismatch** — binary or manifest has been tampered with
 
 ## Access Control
-
-### Modes
 
 | Flags | Behavior |
 |-------|----------|
 | *(none)* | Open server — anyone can upload/download |
-| `--require-auth` | Auth required for uploads, downloads are public |
-| `--require-auth --whitelist keys.txt` | Only whitelisted pubkeys can upload, downloads are public |
-| `--require-auth --whitelist keys.txt --enable-admin` | Above + admin can live-manage the whitelist via API |
+| `--require-auth` | Auth required for uploads, downloads public |
+| `--require-auth --whitelist keys.txt` | Only whitelisted pubkeys upload |
+| `--require-auth --admin npub1... --enable-admin` | Role-based access with admin API |
 
-### Whitelist file
+## License
 
-Create a whitelist file with one hex pubkey per line:
-
-```
-# allowed-keys.txt
-a1b2c3...  (64-char hex pubkey)
-d4e5f6...
-```
-
-```bash
-cargo run -p blossom-server -- \
-  --require-auth \
-  --whitelist allowed-keys.txt \
-  --whitelist-reload-secs 30 \
-  --enable-admin
-```
-
-## Roadmap
-
-| Item | Status | Notes |
-|------|--------|-------|
-| **VitLabeler** | Not implemented | Vision Transformer inference via Candle |
-| **LlmLabeler** | Not implemented | OpenAI-compatible API classification |
-| **File-watch whitelist reload** | Timer-based only | Polling interval, not `inotify`/`kqueue` |
-| **Server --db-postgres flag** | Not wired | PostgresDatabase works but server binary only supports SQLite |
-| **Server --s3 flag** | Not wired | S3Backend works but server binary only supports filesystem |
+MIT
