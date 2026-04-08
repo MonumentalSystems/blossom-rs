@@ -54,6 +54,7 @@ jobs:
   release-binaries:
     needs: test
     runs-on: self-hosted
+    environment: crates-io
     permissions:
       contents: write
     steps:
