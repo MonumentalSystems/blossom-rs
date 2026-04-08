@@ -6,12 +6,23 @@
 
 - **`blossom-server --enable-locks`** — Add CLI flag to enable BUD-19 file locking endpoints. Previously, lock endpoints were implemented in the library but never wired up in the server binary, causing all lock requests to return 404.
 - Lock endpoints (`POST/GET /lfs/{repo_id}/locks`, `POST /lfs/{repo_id}/locks/verify`, `POST /lfs/{repo_id}/locks/{id}/unlock`) are now mounted when `--enable-locks` is passed.
-- Uses `MemoryLockDatabase` — locks are held in-memory and released on server restart.
+- Server uses `SqliteLockDatabase` by default (persistent across restarts); falls back to `MemoryLockDatabase` with `--memory`.
+
+### Persistent Lock Databases
+
+- **`SqliteLockDatabase`** — SQLite-backed lock persistence (feature `db-sqlite`). Creates `lfs_locks` table with auto-migration. Locks survive server restarts.
+- **`PostgresLockDatabase`** — PostgreSQL-backed lock persistence (feature `db-postgres`). Same schema and behavior as SQLite variant.
+- Both implement the `LockDatabase` trait and can be used with `.lock_database()` on the server builder.
+
+### Tests
+
+- 10 SQLite lock integration tests: create, conflict, unlock (owner/non-owner), list, path filter, verify ours/theirs, cross-repo isolation, full lifecycle, and **persistence across server restart**.
 
 ### Documentation
 
 - README protocol support table now lists BUD-19 (LFS File Locking).
 - Server builder example includes `.lock_database()`.
+- Architecture section lists `LockDatabase` trait.
 
 ---
 

@@ -4,6 +4,18 @@
 //! by repo ID and owned by Nostr pubkeys. Includes an in-memory
 //! implementation for testing and as a default.
 
+#[cfg(feature = "db-sqlite")]
+mod sqlite;
+
+#[cfg(feature = "db-postgres")]
+mod postgres;
+
+#[cfg(feature = "db-sqlite")]
+pub use sqlite::SqliteLockDatabase;
+
+#[cfg(feature = "db-postgres")]
+pub use postgres::PostgresLockDatabase;
+
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
