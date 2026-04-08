@@ -7,6 +7,10 @@
 //! ## Quick Start
 //!
 //! ```rust,ignore
+//! // Requires the `otel` feature:
+//! // blossom-rs = { features = ["otel"] }
+//! # #[cfg(feature = "otel")]
+//! # mod example {
 //! use blossom_rs::otel::init_tracing;
 //!
 //! #[tokio::main]
@@ -17,6 +21,7 @@
 //!     // ... start your server ...
 //!     // When _guard is dropped, pending spans are flushed.
 //! }
+//! # }
 //! ```
 //!
 //! ## Structured Fields

@@ -18,6 +18,7 @@ use crate::protocol::BlobDescriptor;
 /// # Example
 ///
 /// ```rust,ignore
+/// # use blossom_rs::BlobClient;
 /// async fn download_blob<C: BlobClient>(
 ///     client: &C,
 ///     addr: &C::Address,

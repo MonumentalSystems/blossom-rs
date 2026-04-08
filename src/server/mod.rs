@@ -242,11 +242,17 @@ impl BlobServerBuilder {
 ///
 /// Simple open server:
 /// ```rust,ignore
+/// # use blossom_rs::{BlobServer, MemoryBackend};
 /// let server = BlobServer::new(MemoryBackend::new(), "http://localhost:3000");
 /// ```
 ///
 /// Configured server with auth, quotas, and access control:
 /// ```rust,ignore
+/// # use blossom_rs::{BlobServer, MemoryBackend, MemoryDatabase, RoleBasedAccess};
+/// # use std::collections::HashSet;
+/// # let backend = MemoryBackend::new();
+/// # let my_db = MemoryDatabase::new();
+/// # let my_whitelist = RoleBasedAccess::new(HashSet::new(), HashSet::new());
 /// let server = BlobServer::builder(backend, "http://localhost:3000")
 ///     .database(my_db)
 ///     .access_control(my_whitelist)
