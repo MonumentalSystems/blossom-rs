@@ -44,6 +44,9 @@ pkarr-discovery = ["dep:pkarr", "iroh-transport"]
 # Observability — opt-in OTEL export support for consumers
 otel = ["dep:tracing-opentelemetry", "dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-subscriber"]
 
+# Terminal UI binary (blossom-tui)
+tui = ["dep:ratatui", "dep:crossterm", "client"]
+
 [dependencies]
 # Crypto
 secp256k1 = { version = "0.29", features = ["rand-std", "global-context"] }
@@ -108,6 +111,10 @@ anyhow = { version = "1", optional = true }
 # PKARR discovery (optional)
 pkarr = { version = "6.0.0-rc.0", default-features = false, features = ["relays", "signed_packet"], optional = true }
 
+# Terminal UI (optional — blossom-tui binary)
+ratatui = { version = "0.30", optional = true }
+crossterm = { version = "0.29", optional = true }
+
 # Statistics
 dashmap = "6"
 zstd = "0.13.3"
@@ -119,4 +126,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "htt
 rand = "0.8"
 tempfile = "3"
 proptest = "1"
-serial_test = "3"
+
+[[bin]]
+name = "blossom-tui"
+path = "src/bin/blossom-tui.rs"
+required-features = ["tui"]
