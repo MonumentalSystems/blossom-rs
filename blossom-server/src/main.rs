@@ -138,9 +138,9 @@ struct Args {
     #[arg(long)]
     enable_admin: bool,
 
-    /// Enable BUD-19 Git LFS file locking endpoints.
+    /// Disable BUD-19 Git LFS file locking endpoints (enabled by default).
     #[arg(long)]
-    enable_locks: bool,
+    no_locks: bool,
 
     /// Bootstrap admin pubkey (hex or npub1). Persisted in the database.
     /// Can be specified multiple times.
@@ -315,7 +315,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    if args.enable_locks {
+    if !args.no_locks {
         if args.memory {
             builder = builder.lock_database(MemoryLockDatabase::new());
             info!("BUD-19 file locking enabled (in-memory lock database)");
@@ -465,6 +465,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             publisher.spawn_republish_loop();
         }
     }
+
+    // Log build integrity status at startup.
+    let integrity = blossom_rs::integrity::runtime_integrity_info(
+        option_env!("BLOSSOM_SOURCE_BUILD_HASH"),
+        option_env!("BLOSSOM_BUILD_TARGET"),
+    );
+    info!(
+        integrity.status = %integrity.integrity_status,
+        integrity.source_build_hash = ?integrity.source_build_hash,
+        integrity.build_target = ?integrity.build_target,
+        integrity.release_signer = ?integrity.release_signer_npub,
+        "build integrity"
+    );
 
     info!(bind = %args.bind, base_url = %args.base_url, "starting blossom server");
 

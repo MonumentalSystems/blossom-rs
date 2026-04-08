@@ -108,13 +108,13 @@ let data = client.download(&desc.sha256).await?;
 | `filesystem` | yes | FilesystemBackend (persistent, restart-safe) |
 | `s3` | no | S3/R2/MinIO backend via `aws-sdk-s3` |
 | `s3-compat` | no | S3-protocol compatibility test router |
-| `db-sqlite` | no | SQLite metadata backend via SQLx (versioned migrations) |
+| `db-sqlite` | yes | SQLite metadata backend via SQLx (versioned migrations) |
 | `db-postgres` | no | PostgreSQL metadata backend via SQLx |
 | `media` | no | Image processing (WebP, thumbnails, blurhash, EXIF) |
 | `labels` | no | Content classification (Vision Transformer, LLM API) |
-| `iroh-transport` | no | P2P QUIC transport via iroh (node-ID addressed, hole-punching) |
-| `pkarr-discovery` | no | Publish endpoints to Mainline DHT via PKARR (unified Ed25519 identity) |
-| `otel` | no | OpenTelemetry OTLP export (Jaeger, Tempo, Seq, Honeycomb) |
+| `iroh-transport` | yes | P2P QUIC transport via iroh (node-ID addressed, hole-punching) |
+| `pkarr-discovery` | yes | Publish endpoints to Mainline DHT via PKARR (unified Ed25519 identity) |
+| `otel` | yes | OpenTelemetry OTLP export (Jaeger, Tempo, Seq, Honeycomb) |
 
 ## Protocol Support
 
@@ -127,7 +127,7 @@ let data = client.download(&desc.sha256).await?;
 | **NIP-96** | Implemented | `GET /.well-known/nostr/nip96.json`, `POST/GET/DELETE /n96` |
 | **NIP-98** | Implemented | kind:27235 HTTP auth (accepted alongside kind:24242) |
 | **BIP-340** | Implemented | Schnorr signature auth on all write operations |
-| **Admin** | Implemented | `GET/PUT/DELETE /admin/*` (stats, users, quotas, blobs) |
+| **Admin** | Implemented | `GET/PUT/DELETE /admin/*` (stats, users, quotas, blobs, LFS stats) |
 | **BUD-19** | Implemented | `POST/GET /lfs/{repo_id}/locks`, verify, unlock (`--enable-locks`) |
 | **S3-compat** | Implemented | `PUT/GET/HEAD/DELETE /:bucket/*key` (feature-gated) |
 | **Health** | Implemented | `GET /health` |

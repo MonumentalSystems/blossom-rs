@@ -136,6 +136,8 @@ enum AdminCommand {
         /// Quota in bytes (omit for unlimited).
         quota_bytes: Option<u64>,
     },
+    /// Show LFS storage statistics (compression savings, delta efficiency).
+    LfsStats,
     /// List blob count and total size.
     ListBlobs,
     /// Admin delete a blob (no ownership check).
@@ -506,6 +508,22 @@ async fn run(args: Args) -> Result<(), String> {
                     } else {
                         let text = resp.text().await.unwrap_or_default();
                         return Err(format!("admin set-quota failed: {text}"));
+                    }
+                }
+                AdminCommand::LfsStats => {
+                    let resp = http
+                        .get(format!("{}/admin/lfs-stats", base))
+                        .header("Authorization", &auth_header)
+                        .send()
+                        .await
+                        .map_err(|e| format!("request: {e}"))?;
+                    if resp.status().is_success() {
+                        let body: serde_json::Value =
+                            resp.json().await.map_err(|e| format!("parse: {e}"))?;
+                        print_output(&args.format, &body);
+                    } else {
+                        let text = resp.text().await.unwrap_or_default();
+                        return Err(format!("admin lfs-stats failed: {text}"));
                     }
                 }
                 AdminCommand::ListBlobs => {

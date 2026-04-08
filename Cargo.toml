@@ -1,9 +1,9 @@
 [workspace]
-members = [".", "blossom-server", "blossom-cli", "xtask"]
+members = [".", "blossom-server", "blossom-cli", "xtask", "xdelta3-rs"]
 
 [package]
 name = "blossom-rs"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 rust-version = "1.80"
 description = "Full-featured Blossom (BUD-01) blob storage library for Rust — embeddable server, async client, BIP-340 Nostr auth"
@@ -14,7 +14,7 @@ keywords = ["blossom", "nostr", "blob", "storage", "bip340"]
 categories = ["web-programming", "cryptography"]
 
 [features]
-default = ["server", "client", "filesystem"]
+default = ["server", "client", "filesystem", "iroh-transport", "pkarr-discovery", "otel", "db-sqlite"]
 
 # Core
 server = ["dep:axum", "dep:axum-extra", "dep:tower-http", "dep:reqwest"]
@@ -106,12 +106,12 @@ iroh = { version = "0.97", optional = true }
 anyhow = { version = "1", optional = true }
 
 # PKARR discovery (optional)
-pkarr = { version = "6.0.0-rc.0", default-features = false, features = ["relays", "signed_packet"], optional = true }
+pkarr = { version = "6.0.0-rc.0", default-features = false, features = ["relays", "signed_packet", "dht"], optional = true }
 
 # Statistics
 dashmap = "6"
 zstd = "0.13.3"
-xdelta3 = "0.1.5"
+xdelta3 = { path = "xdelta3-rs" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -120,3 +120,8 @@ rand = "0.8"
 tempfile = "3"
 proptest = "1"
 serial_test = "3"
+
+[patch.crates-io]
+# mainline 6.1.1 on crates.io pins digest =0.11.0-rc.9, but iroh 0.97 needs
+# =0.11.0-rc.10. The git repo has the fix; use it until 6.1.2 is published.
+mainline = { git = "https://github.com/pubky/mainline.git" }

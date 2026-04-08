@@ -1,5 +1,20 @@
 # Release Notes
 
+## v0.4.2
+
+### New Features
+
+- **`GET /admin/lfs-stats`** — Admin endpoint exposing LFS storage efficiency metrics: total original bytes vs stored bytes, savings percentage, and per-storage-type breakdown (raw, compressed, delta).
+- **`blossom-cli admin lfs-stats`** — CLI command to query LFS storage statistics from the server.
+- **PKARR DHT support** — pkarr now publishes/resolves via Mainline DHT directly (in addition to relays). Resolves `digest` version conflict between `mainline` and `iroh` via cargo patch.
+- **Default features now include iroh + pkarr** — `cargo build` gives you HTTP, iroh QUIC transport, and PKARR DHT discovery out of the box.
+
+### Improvements
+
+- **Vendor xdelta3 crate** — Replaced crates.io `xdelta3 0.1.5` (bindgen 0.52, cexpr 0.3.6, nom 4.2.3) with vendored `xdelta3-rs` using bindgen 0.71. Eliminates all "code will be rejected by a future version of Rust" warnings. Drops `libc` and `rand 0.6` deps. Replaces runtime sizeof detection with compile-time constants.
+
+---
+
 ## v0.4.1
 
 ### Bug Fixes

@@ -50,3 +50,50 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: sleep 30
       - run: cargo publish -p blossom-cli --allow-dirty --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  release-binaries:
+    needs: test
+    runs-on: self-hosted
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binaries
+        run: cargo build --release --workspace
+
+      - name: Sign release manifest (blossom-server)
+        if: env.BLOSSOM_RELEASE_NSEC != ''
+        env:
+          BLOSSOM_RELEASE_NSEC: ${{ secrets.BLOSSOM_RELEASE_NSEC }}
+        run: |
+          cargo xtask sign-release-manifest --bin target/release/blossom-server \
+            --output target/release/release-manifest.json
+
+      - name: Sign release manifest (blossom-cli)
+        if: env.BLOSSOM_RELEASE_NSEC != ''
+        env:
+          BLOSSOM_RELEASE_NSEC: ${{ secrets.BLOSSOM_RELEASE_NSEC }}
+        run: |
+          cargo xtask sign-release-manifest --bin target/release/blossom-cli \
+            --output target/release/release-manifest-cli.json
+
+      - name: Generate source Merkle tree
+        env:
+          BLOSSOM_RELEASE_NSEC: ${{ secrets.BLOSSOM_RELEASE_NSEC }}
+        run: |
+          cargo xtask source-merkle-tree --output target/release/source-merkle-tree.json
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          gh release upload "$TAG" \
+            target/release/blossom-server \
+            target/release/blossom-cli \
+            target/release/release-manifest.json \
+            target/release/release-manifest-cli.json \
+            target/release/source-merkle-tree.json \
+            --clobber || true

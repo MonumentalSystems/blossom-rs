@@ -28,6 +28,7 @@ pub fn admin_router(state: SharedState) -> Router {
         .route("/admin/users/:pubkey/quota", put(handle_set_quota))
         .route("/admin/users/:pubkey/role", put(handle_set_role))
         .route("/admin/roles", get(handle_list_roles))
+        .route("/admin/lfs-stats", get(handle_lfs_stats))
         .route("/admin/blobs", get(handle_list_all_blobs))
         .route("/admin/blobs/:sha256", delete(handle_admin_delete_blob))
         .route("/admin/whitelist", get(handle_whitelist_list))
@@ -80,6 +81,52 @@ async fn handle_admin_stats(
             "tracked_stats": s.stats.tracked_count(),
         })),
     )
+}
+
+// ---------------------------------------------------------------------------
+// LFS Stats
+// ---------------------------------------------------------------------------
+
+#[instrument(name = "admin.lfs_stats", skip_all)]
+async fn handle_lfs_stats(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let s = state.lock().await;
+    if let Err(e) = extract_admin_pubkey(&headers, &*s.access) {
+        return e;
+    }
+
+    match &s.lfs_version_db {
+        Some(db) => match db.lfs_stats() {
+            Ok(stats) => {
+                let savings_pct = if stats.total_original_bytes > 0 {
+                    (1.0 - stats.total_stored_bytes as f64 / stats.total_original_bytes as f64)
+                        * 100.0
+                } else {
+                    0.0
+                };
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "total_versions": stats.total_versions,
+                        "total_original_bytes": stats.total_original_bytes,
+                        "total_stored_bytes": stats.total_stored_bytes,
+                        "savings_percent": (savings_pct * 100.0).round() / 100.0,
+                        "by_storage_type": stats.by_storage_type,
+                    })),
+                )
+            }
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_json(&format!("lfs stats: {e}")),
+            ),
+        },
+        None => (
+            StatusCode::NOT_FOUND,
+            error_json("LFS version database not configured"),
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
