@@ -24,6 +24,7 @@ iroh = "0.97"
 rand = "0.9"
 
 [features]
+default = ["nip34"]
 nip34 = ["dep:blossom-nip34"]
 
 [build-dependencies]
