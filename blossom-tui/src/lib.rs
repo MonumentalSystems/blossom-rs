@@ -26,11 +26,12 @@ use ratatui::{
     Frame, Terminal,
 };
 use tokio::sync::mpsc;
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
 pub const APP_TITLE: &str = "blossom-tui";
-pub const TAB_NAMES: &[&str] = &[" Blobs ", " Upload ", " Batch ", " Admin ", " Relay ", " NIP-96 ", " Status ", " Keygen "];
+pub const TAB_NAMES: &[&str] = &[" Blobs ", " Upload ", " Batch ", " Admin ", " Relay ", " NIP-96 ", " NIP-34 ", " Status ", " Keygen "];
 
 pub const COLOR_ACCENT: Color = Color::Cyan;
 pub const COLOR_OK: Color = Color::Green;
@@ -109,6 +110,40 @@ pub enum AppMsg {
     Nip96FilesError(String),
     Nip94Published(String),  // relay URL
     Nip94PublishError(String),
+    Nip34EventReceived(Nip34EventItem),
+    Nip34Connected(String),   // relay URL
+    Nip34Error(String),
+}
+
+// ── NIP-34 ────────────────────────────────────────────────────────────────────
+
+/// A single NIP-34 event received from a relay.
+#[derive(Debug, Clone)]
+pub struct Nip34EventItem {
+    pub kind: u64,
+    pub id: String,
+    pub pubkey: String,
+    pub created_at: u64,
+    pub content_preview: String, // first 80 chars of content or d-tag
+}
+
+impl Nip34EventItem {
+    pub fn kind_name(&self) -> &'static str {
+        match self.kind {
+            30617 => "RepoAnnounce",
+            30618 => "RepoState",
+            1617  => "Patch",
+            1618  => "PullRequest",
+            1619  => "PRUpdate",
+            1621  => "Issue",
+            1630  => "Status:Open",
+            1631  => "Status:Applied",
+            1632  => "Status:Closed",
+            1633  => "Status:Draft",
+            10317 => "GraspList",
+            _     => "Unknown",
+        }
+    }
 }
 
 // ── Batch upload ──────────────────────────────────────────────────────────────
@@ -198,6 +233,14 @@ pub struct App {
     pub nip96_files_loading: bool,
     pub nip96_files_error: Option<String>,
 
+    // NIP-34 tab
+    pub nip34_relay: String,
+    pub nip34_relay_edit: bool,
+    pub nip34_events: Vec<Nip34EventItem>,
+    pub nip34_events_table: TableState,
+    pub nip34_connected: bool,
+    pub nip34_status: String,         // connection status message
+
     // UI state
     pub show_help: bool,
     pub notification: Option<(String, bool)>, // (message, is_error)
@@ -260,6 +303,12 @@ impl App {
             nip96_files: None,
             nip96_files_loading: false,
             nip96_files_error: None,
+            nip34_relay: String::new(),
+            nip34_relay_edit: false,
+            nip34_events: Vec::new(),
+            nip34_events_table: TableState::default(),
+            nip34_connected: false,
+            nip34_status: "Press 'c' to connect to a NIP-34 relay.".into(),
             show_help: false,
             notification: None,
             modal: None,
@@ -421,6 +470,22 @@ impl App {
             }
             AppMsg::Nip94PublishError(e) => {
                 self.notification = Some((format!("NIP-94 publish failed: {e}"), true));
+            }
+            AppMsg::Nip34EventReceived(ev) => {
+                // Keep newest events at top; cap at 200
+                self.nip34_events.insert(0, ev);
+                if self.nip34_events.len() > 200 {
+                    self.nip34_events.truncate(200);
+                }
+            }
+            AppMsg::Nip34Connected(url) => {
+                self.nip34_connected = true;
+                self.nip34_status = format!("Connected to {url} — subscribing to NIP-34 events…");
+                self.nip34_events.clear();
+            }
+            AppMsg::Nip34Error(e) => {
+                self.nip34_connected = false;
+                self.nip34_status = format!("Error: {e}");
             }
         }
     }
@@ -898,6 +963,105 @@ impl App {
         });
     }
 
+    /// Connect to a NIP-34 Nostr relay via WebSocket and subscribe to NIP-34 events.
+    pub fn connect_nip34_relay(&mut self) {
+        let relay = self.nip34_relay.trim().to_string();
+        if relay.is_empty() {
+            self.nip34_status = "Enter a relay URL first (press 'r' to edit).".into();
+            return;
+        }
+        self.nip34_connected = false;
+        self.nip34_status = format!("Connecting to {relay}…");
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            use futures_util::{SinkExt, StreamExt};
+            let ws_url = relay.replace("http://", "ws://").replace("https://", "wss://");
+            let conn = tokio_tungstenite::connect_async(&ws_url).await;
+            let (mut ws, _) = match conn {
+                Ok(pair) => pair,
+                Err(e) => {
+                    tx.send(AppMsg::Nip34Error(format!("connect failed: {e}"))).ok();
+                    return;
+                }
+            };
+            tx.send(AppMsg::Nip34Connected(ws_url.clone())).ok();
+
+            // Send REQ for NIP-34 kinds
+            let kinds: Vec<u64> = vec![30617, 30618, 1617, 1618, 1619, 1621, 1630, 1631, 1632, 1633, 10317];
+            let req = serde_json::json!([
+                "REQ",
+                "nip34-sub",
+                {"kinds": kinds, "limit": 100}
+            ]);
+            if ws.send(WsMessage::Text(req.to_string().into())).await.is_err() {
+                tx.send(AppMsg::Nip34Error("failed to send REQ".into())).ok();
+                return;
+            }
+
+            // Receive events (run for up to 60 seconds then reconnect on next 'c')
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                if std::time::Instant::now() > deadline {
+                    tx.send(AppMsg::Nip34Error("session timeout — press 'c' to reconnect".into())).ok();
+                    break;
+                }
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    ws.next(),
+                ).await {
+                    Ok(Some(Ok(WsMessage::Text(text)))) => {
+                        // NIP-01 messages: ["EVENT", sub_id, event] or ["EOSE", sub_id]
+                        if let Ok(arr) = serde_json::from_str::<serde_json::Value>(&text) {
+                            if arr.get(0).and_then(|v| v.as_str()) == Some("EVENT") {
+                                if let Some(ev) = arr.get(2) {
+                                    let kind = ev["kind"].as_u64().unwrap_or(0);
+                                    let id = ev["id"].as_str().unwrap_or("").to_string();
+                                    let pubkey = ev["pubkey"].as_str().unwrap_or("").to_string();
+                                    let created_at = ev["created_at"].as_u64().unwrap_or(0);
+                                    // Try to get d-tag or first content chars as preview
+                                    let d_tag = ev["tags"].as_array()
+                                        .and_then(|tags| tags.iter().find(|t| t.get(0).and_then(|v| v.as_str()) == Some("d")))
+                                        .and_then(|t| t.get(1))
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    let content = ev["content"].as_str().unwrap_or("");
+                                    let preview = if !d_tag.is_empty() {
+                                        format!("d={d_tag}")
+                                    } else {
+                                        content.chars().take(80).collect()
+                                    };
+                                    tx.send(AppMsg::Nip34EventReceived(Nip34EventItem {
+                                        kind, id, pubkey, created_at,
+                                        content_preview: preview,
+                                    })).ok();
+                                }
+                            } else if arr.get(0).and_then(|v| v.as_str()) == Some("EOSE") {
+                                // End of stored events — keep connection alive for live updates
+                            } else if arr.get(0).and_then(|v| v.as_str()) == Some("NOTICE") {
+                                let notice = arr.get(1).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                tx.send(AppMsg::Nip34Error(format!("relay notice: {notice}"))).ok();
+                            }
+                        }
+                    }
+                    Ok(Some(Ok(WsMessage::Close(_)))) => {
+                        tx.send(AppMsg::Nip34Error("relay closed connection".into())).ok();
+                        break;
+                    }
+                    Ok(Some(Err(e))) => {
+                        tx.send(AppMsg::Nip34Error(format!("ws error: {e}"))).ok();
+                        break;
+                    }
+                    Ok(None) => {
+                        tx.send(AppMsg::Nip34Error("relay disconnected".into())).ok();
+                        break;
+                    }
+                    Err(_) => {} // timeout, continue loop
+                    _ => {}
+                }
+            }
+        });
+    }
+
     /// Add a path to the batch queue.
     pub fn add_batch_path(&mut self) {
         let path = self.batch_input.trim().to_string();
@@ -1002,8 +1166,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         3 => draw_admin_tab(f, app, chunks[2]),
         4 => draw_relay_tab(f, app, chunks[2]),
         5 => draw_nip96_tab(f, app, chunks[2]),
-        6 => draw_status_tab(f, app, chunks[2]),
-        7 => draw_keygen_tab(f, app, chunks[2]),
+        6 => draw_nip34_tab(f, app, chunks[2]),
+        7 => draw_status_tab(f, app, chunks[2]),
+        8 => draw_keygen_tab(f, app, chunks[2]),
         _ => {}
     }
 
@@ -1654,6 +1819,100 @@ pub fn draw_nip96_tab(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+pub fn draw_nip34_tab(f: &mut Frame, app: &mut App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // relay URL bar
+            Constraint::Length(1), // status line
+            Constraint::Min(1),    // events table
+        ])
+        .split(area);
+
+    // ── Relay URL bar ─────────────────────────────────────────────────────────
+    let relay_display = if app.nip34_relay.is_empty() {
+        "(enter relay URL)".to_string()
+    } else {
+        app.nip34_relay.clone()
+    };
+    let relay_style = if app.nip34_relay_edit {
+        Style::default().fg(COLOR_ACCENT).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    let relay_title = if app.nip34_relay_edit {
+        " Relay URL [editing — Enter/Esc to confirm] "
+    } else {
+        " Relay URL (r to edit, c to connect) "
+    };
+    let relay_block = Block::default()
+        .borders(Borders::ALL)
+        .title(relay_title)
+        .border_style(if app.nip34_relay_edit {
+            Style::default().fg(COLOR_ACCENT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(COLOR_DIM)
+        });
+    f.render_widget(
+        Paragraph::new(relay_display.as_str())
+            .block(relay_block)
+            .style(relay_style),
+        chunks[0],
+    );
+    if app.nip34_relay_edit {
+        f.set_cursor_position((chunks[0].x + 1 + app.nip34_relay.len() as u16, chunks[0].y + 1));
+    }
+
+    // ── Status line ───────────────────────────────────────────────────────────
+    let status_color = if app.nip34_connected { COLOR_OK } else { COLOR_DIM };
+    f.render_widget(
+        Paragraph::new(app.nip34_status.as_str()).style(Style::default().fg(status_color)),
+        chunks[1],
+    );
+
+    // ── Events table ──────────────────────────────────────────────────────────
+    let header = Row::new(vec![
+        Cell::from("Kind").style(Style::default().fg(COLOR_ACCENT).add_modifier(Modifier::BOLD)),
+        Cell::from("ID").style(Style::default().fg(COLOR_ACCENT).add_modifier(Modifier::BOLD)),
+        Cell::from("Pubkey").style(Style::default().fg(COLOR_ACCENT).add_modifier(Modifier::BOLD)),
+        Cell::from("Created").style(Style::default().fg(COLOR_ACCENT).add_modifier(Modifier::BOLD)),
+        Cell::from("Preview").style(Style::default().fg(COLOR_ACCENT).add_modifier(Modifier::BOLD)),
+    ]).height(1).bottom_margin(0);
+
+    let rows: Vec<Row> = app.nip34_events.iter().map(|ev| {
+        let ts = chrono_fmt_unix(ev.created_at);
+        Row::new(vec![
+            Cell::from(ev.kind_name()),
+            Cell::from(format!("{:.8}", ev.id)),
+            Cell::from(format!("{:.8}", ev.pubkey)),
+            Cell::from(ts),
+            Cell::from(ev.content_preview.as_str()),
+        ])
+    }).collect();
+
+    let total = rows.len();
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(13),  // kind name
+            Constraint::Length(9),   // id prefix
+            Constraint::Length(9),   // pubkey prefix
+            Constraint::Length(11),  // created_at
+            Constraint::Min(20),     // preview
+        ],
+    )
+    .header(header)
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" NIP-34 Events ({total}) "))
+            .border_style(Style::default().fg(COLOR_ACCENT)),
+    )
+    .row_highlight_style(Style::default().bg(COLOR_SELECTED_BG).add_modifier(Modifier::BOLD));
+
+    f.render_stateful_widget(table, chunks[2], &mut app.nip34_events_table);
+}
+
 pub fn draw_status_tab(f: &mut Frame, app: &App, area: Rect) {
     let loading_suffix = if app.status_loading {
         " (loading…)"
@@ -1780,8 +2039,9 @@ pub fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
             3 => " r:refresh  Tab:next  ?:help  q:quit",
             4 => " r:refresh  Tab:next  ?:help  q:quit",
             5 => " r:refresh  Tab:next  ?:help  q:quit",
-            6 => " r:refresh  Tab:next  ?:help  q:quit",
-            7 => " g:generate  Tab:next  ?:help  q:quit",
+            6 => " r:edit-relay  c:connect  ↑↓:scroll  Tab:next  ?:help  q:quit",
+            7 => " r:refresh  Tab:next  ?:help  q:quit",
+            8 => " g:generate  Tab:next  ?:help  q:quit",
             _ => " Tab:next  ?:help  q:quit",
         };
         Line::from(Span::styled(
@@ -1936,6 +2196,21 @@ pub fn draw_help_popup(f: &mut Frame, area: Rect) {
             Span::raw("Refresh NIP-96 server info + files"),
         ]),
         Line::from(""),
+        Line::from(Span::styled("  NIP-34 tab", h)),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  r                ", y),
+            Span::raw("Edit relay URL"),
+        ]),
+        Line::from(vec![
+            Span::styled("  c                ", y),
+            Span::raw("Connect and subscribe to NIP-34 events"),
+        ]),
+        Line::from(vec![
+            Span::styled("  ↑ / ↓            ", y),
+            Span::raw("Scroll event list"),
+        ]),
+        Line::from(""),
         Line::from(Span::styled("  Status tab", h)),
         Line::from(""),
         Line::from(vec![
@@ -2081,6 +2356,16 @@ pub async fn run_loop(
                     continue;
                 }
 
+                if app.nip34_relay_edit {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Enter => app.nip34_relay_edit = false,
+                        KeyCode::Backspace => { app.nip34_relay.pop(); }
+                        KeyCode::Char(c) => app.nip34_relay.push(c),
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 if app.batch_input_mode {
                     match key.code {
                         KeyCode::Esc => app.batch_input_mode = false,
@@ -2139,12 +2424,26 @@ pub async fn run_loop(
                             app.refresh_nip96();
                         }
                     }
-                    6 => {
+                    6 => match key.code {
+                        KeyCode::Char('r') => app.nip34_relay_edit = true,
+                        KeyCode::Char('c') => app.connect_nip34_relay(),
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            let i = app.nip34_events_table.selected().unwrap_or(0);
+                            if i > 0 { app.nip34_events_table.select(Some(i - 1)); }
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            let i = app.nip34_events_table.selected().unwrap_or(0);
+                            let max = app.nip34_events.len().saturating_sub(1);
+                            app.nip34_events_table.select(Some((i + 1).min(max)));
+                        }
+                        _ => {}
+                    },
+                    7 => {
                         if key.code == KeyCode::Char('r') {
                             app.refresh_status();
                         }
                     }
-                    7 => {
+                    8 => {
                         if key.code == KeyCode::Char('g') {
                             app.generate_keypair();
                         }
@@ -2159,6 +2458,39 @@ pub async fn run_loop(
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Format a Unix timestamp as a compact date string (YYYY-MM-DD HH:MM).
+pub fn chrono_fmt_unix(ts: u64) -> String {
+    // Simple manual formatting without chrono dependency
+    let secs = ts as i64;
+    let days_since_epoch = secs / 86400;
+    let time_of_day = secs % 86400;
+    let hh = time_of_day / 3600;
+    let mm = (time_of_day % 3600) / 60;
+    // Approximate date calculation (good enough for display)
+    let mut y = 1970i64;
+    let mut d = days_since_epoch;
+    loop {
+        let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+        let days_in_year = if leap { 366 } else { 365 };
+        if d < days_in_year { break; }
+        d -= days_in_year;
+        y += 1;
+    }
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let months = if leap {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+    let mut mo = 0usize;
+    for &dim in &months {
+        if d < dim { break; }
+        d -= dim;
+        mo += 1;
+    }
+    format!("{y}-{:02}-{:02} {:02}:{:02}", mo + 1, d + 1, hh, mm)
+}
 
 /// Guess a MIME type from the file extension.
 pub fn mime_from_path(path: &std::path::Path) -> String {
