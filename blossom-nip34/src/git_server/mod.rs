@@ -199,8 +199,14 @@ async fn receive_pack(
     // Optional: if Nostr auth header present, verify it as additional auth
     let has_nostr_auth = verify_push_auth(&headers, &npub).is_ok();
 
-    if !has_nostr_auth {
-        // Fall back to GRASP relay-based validation
+    // Check if repo is empty (first push) — allow without validation
+    let is_empty_repo = !repo_path.join("refs/heads").exists()
+        || std::fs::read_dir(repo_path.join("refs/heads"))
+            .map(|mut d| d.next().is_none())
+            .unwrap_or(true);
+
+    if !has_nostr_auth && !is_empty_repo {
+        // Fall back to GRASP relay-based validation (skip for first push to empty repo)
         match validation::validate_push(&ref_updates, &state.database, &author_hex, repo_name).await
         {
             Ok(errors) if errors.is_empty() => {
