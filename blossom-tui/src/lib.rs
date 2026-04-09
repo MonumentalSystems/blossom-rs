@@ -30,7 +30,7 @@ use tokio::sync::mpsc;
 // ── Constants ────────────────────────────────────────────────────────────────
 
 pub const APP_TITLE: &str = "blossom-tui";
-pub const TAB_NAMES: &[&str] = &[" Blobs ", " Upload ", " Batch ", " Status ", " Keygen "];
+pub const TAB_NAMES: &[&str] = &[" Blobs ", " Upload ", " Batch ", " Admin ", " Status ", " Keygen "];
 
 pub const COLOR_ACCENT: Color = Color::Cyan;
 pub const COLOR_OK: Color = Color::Green;
@@ -97,6 +97,10 @@ pub enum AppMsg {
     MirrorError(String),
     BatchItemDone(usize, BlobDescriptor), // (index, descriptor)
     BatchItemError(usize, String),        // (index, error)
+    AdminStatsLoaded(serde_json::Value),
+    AdminStatsError(String),
+    AdminUsersLoaded(serde_json::Value),
+    AdminUsersError(String),
 }
 
 // ── Batch upload ──────────────────────────────────────────────────────────────
@@ -162,6 +166,14 @@ pub struct App {
     pub batch_input_mode: bool,
     pub batch_running: bool,
 
+    // Admin tab
+    pub admin_stats: Option<serde_json::Value>,
+    pub admin_stats_loading: bool,
+    pub admin_stats_error: Option<String>,
+    pub admin_users: Option<serde_json::Value>,
+    pub admin_users_loading: bool,
+    pub admin_users_error: Option<String>,
+
     // UI state
     pub show_help: bool,
     pub notification: Option<(String, bool)>, // (message, is_error)
@@ -206,6 +218,12 @@ impl App {
             batch_input: String::new(),
             batch_input_mode: false,
             batch_running: false,
+            admin_stats: None,
+            admin_stats_loading: false,
+            admin_stats_error: None,
+            admin_users: None,
+            admin_users_loading: false,
+            admin_users_error: None,
             show_help: false,
             notification: None,
             modal: None,
@@ -316,6 +334,24 @@ impl App {
                 if all_done {
                     self.batch_running = false;
                 }
+            }
+            AppMsg::AdminStatsLoaded(data) => {
+                self.admin_stats_loading = false;
+                self.admin_stats = Some(data);
+                self.admin_stats_error = None;
+            }
+            AppMsg::AdminStatsError(e) => {
+                self.admin_stats_loading = false;
+                self.admin_stats_error = Some(e);
+            }
+            AppMsg::AdminUsersLoaded(data) => {
+                self.admin_users_loading = false;
+                self.admin_users = Some(data);
+                self.admin_users_error = None;
+            }
+            AppMsg::AdminUsersError(e) => {
+                self.admin_users_loading = false;
+                self.admin_users_error = Some(e);
             }
         }
     }
@@ -647,6 +683,54 @@ impl App {
         });
     }
 
+    /// Fetch admin stats and users.
+    pub fn refresh_admin(&mut self) {
+        let server = self.server.clone();
+        let tx = self.tx.clone();
+
+        if !self.admin_stats_loading {
+            self.admin_stats_loading = true;
+            let server2 = server.clone();
+            let tx2 = tx.clone();
+            tokio::spawn(async move {
+                let url = format!("{}/admin/stats", server2.trim_end_matches('/'));
+                match reqwest::get(&url).await {
+                    Ok(r) if r.status().is_success() => {
+                        match r.json::<serde_json::Value>().await {
+                            Ok(v) => tx2.send(AppMsg::AdminStatsLoaded(v)).ok(),
+                            Err(e) => tx2.send(AppMsg::AdminStatsError(format!("parse: {e}"))).ok(),
+                        }
+                    }
+                    Ok(r) => {
+                        let t = r.text().await.unwrap_or_default();
+                        tx2.send(AppMsg::AdminStatsError(format!("server: {t}"))).ok()
+                    }
+                    Err(e) => tx2.send(AppMsg::AdminStatsError(format!("request: {e}"))).ok(),
+                };
+            });
+        }
+
+        if !self.admin_users_loading {
+            self.admin_users_loading = true;
+            tokio::spawn(async move {
+                let url = format!("{}/admin/users", server.trim_end_matches('/'));
+                match reqwest::get(&url).await {
+                    Ok(r) if r.status().is_success() => {
+                        match r.json::<serde_json::Value>().await {
+                            Ok(v) => tx.send(AppMsg::AdminUsersLoaded(v)).ok(),
+                            Err(e) => tx.send(AppMsg::AdminUsersError(format!("parse: {e}"))).ok(),
+                        }
+                    }
+                    Ok(r) => {
+                        let t = r.text().await.unwrap_or_default();
+                        tx.send(AppMsg::AdminUsersError(format!("server: {t}"))).ok()
+                    }
+                    Err(e) => tx.send(AppMsg::AdminUsersError(format!("request: {e}"))).ok(),
+                };
+            });
+        }
+    }
+
     /// Add a path to the batch queue.
     pub fn add_batch_path(&mut self) {
         let path = self.batch_input.trim().to_string();
@@ -748,8 +832,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         0 => draw_blobs_tab(f, app, chunks[2]),
         1 => draw_upload_tab(f, app, chunks[2]),
         2 => draw_batch_tab(f, app, chunks[2]),
-        3 => draw_status_tab(f, app, chunks[2]),
-        4 => draw_keygen_tab(f, app, chunks[2]),
+        3 => draw_admin_tab(f, app, chunks[2]),
+        4 => draw_status_tab(f, app, chunks[2]),
+        5 => draw_keygen_tab(f, app, chunks[2]),
         _ => {}
     }
 
@@ -1163,6 +1248,66 @@ pub fn draw_batch_tab(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(table, chunks[2]);
 }
 
+pub fn draw_admin_tab(f: &mut Frame, app: &App, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Admin ")
+        .border_style(Style::default().fg(COLOR_ACCENT));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(inner);
+
+    // Stats panel
+    let stats_text = if app.admin_stats_loading {
+        "Loading stats…".to_string()
+    } else if let Some(e) = &app.admin_stats_error {
+        format!("Error: {e}\n\nPress 'r' to retry.")
+    } else if let Some(stats) = &app.admin_stats {
+        serde_json::to_string_pretty(stats).unwrap_or_else(|_| stats.to_string())
+    } else {
+        "Press 'r' to load admin stats.".to_string()
+    };
+
+    let stats_block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Stats ")
+        .border_style(Style::default().fg(COLOR_DIM));
+    f.render_widget(
+        Paragraph::new(stats_text.as_str())
+            .block(stats_block)
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(Color::White)),
+        chunks[0],
+    );
+
+    // Users panel
+    let users_text = if app.admin_users_loading {
+        "Loading users…".to_string()
+    } else if let Some(e) = &app.admin_users_error {
+        format!("Error: {e}")
+    } else if let Some(users) = &app.admin_users {
+        serde_json::to_string_pretty(users).unwrap_or_else(|_| users.to_string())
+    } else {
+        "Press 'r' to load users.".to_string()
+    };
+
+    let users_block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Users ")
+        .border_style(Style::default().fg(COLOR_DIM));
+    f.render_widget(
+        Paragraph::new(users_text.as_str())
+            .block(users_block)
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(Color::White)),
+        chunks[1],
+    );
+}
+
 pub fn draw_status_tab(f: &mut Frame, app: &App, area: Rect) {
     let loading_suffix = if app.status_loading {
         " (loading…)"
@@ -1287,7 +1432,8 @@ pub fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
             1 => " i:edit-path  Enter:upload  Esc:clear  Tab:next  ?:help  q:quit",
             2 => " i:edit  Enter:add/start  x:remove-last  Tab:next  ?:help  q:quit",
             3 => " r:refresh  Tab:next  ?:help  q:quit",
-            4 => " g:generate  Tab:next  ?:help  q:quit",
+            4 => " r:refresh  Tab:next  ?:help  q:quit",
+            5 => " g:generate  Tab:next  ?:help  q:quit",
             _ => " Tab:next  ?:help  q:quit",
         };
         Line::from(Span::styled(
@@ -1613,10 +1759,15 @@ pub async fn run_loop(
                     },
                     3 => {
                         if key.code == KeyCode::Char('r') {
-                            app.refresh_status();
+                            app.refresh_admin();
                         }
                     }
                     4 => {
+                        if key.code == KeyCode::Char('r') {
+                            app.refresh_status();
+                        }
+                    }
+                    5 => {
                         if key.code == KeyCode::Char('g') {
                             app.generate_keypair();
                         }
