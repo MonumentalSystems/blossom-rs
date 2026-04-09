@@ -30,7 +30,7 @@ use tokio::sync::mpsc;
 // ── Constants ────────────────────────────────────────────────────────────────
 
 pub const APP_TITLE: &str = "blossom-tui";
-pub const TAB_NAMES: &[&str] = &[" Blobs ", " Upload ", " Batch ", " Admin ", " Status ", " Keygen "];
+pub const TAB_NAMES: &[&str] = &[" Blobs ", " Upload ", " Batch ", " Admin ", " Relay ", " Status ", " Keygen "];
 
 pub const COLOR_ACCENT: Color = Color::Cyan;
 pub const COLOR_OK: Color = Color::Green;
@@ -101,6 +101,8 @@ pub enum AppMsg {
     AdminStatsError(String),
     AdminUsersLoaded(serde_json::Value),
     AdminUsersError(String),
+    RelayPolicyLoaded(serde_json::Value),
+    RelayPolicyError(String),
 }
 
 // ── Batch upload ──────────────────────────────────────────────────────────────
@@ -174,6 +176,11 @@ pub struct App {
     pub admin_users_loading: bool,
     pub admin_users_error: Option<String>,
 
+    // Relay tab
+    pub relay_policy: Option<serde_json::Value>,
+    pub relay_policy_loading: bool,
+    pub relay_policy_error: Option<String>,
+
     // UI state
     pub show_help: bool,
     pub notification: Option<(String, bool)>, // (message, is_error)
@@ -224,6 +231,9 @@ impl App {
             admin_users: None,
             admin_users_loading: false,
             admin_users_error: None,
+            relay_policy: None,
+            relay_policy_loading: false,
+            relay_policy_error: None,
             show_help: false,
             notification: None,
             modal: None,
@@ -352,6 +362,15 @@ impl App {
             AppMsg::AdminUsersError(e) => {
                 self.admin_users_loading = false;
                 self.admin_users_error = Some(e);
+            }
+            AppMsg::RelayPolicyLoaded(data) => {
+                self.relay_policy_loading = false;
+                self.relay_policy = Some(data);
+                self.relay_policy_error = None;
+            }
+            AppMsg::RelayPolicyError(e) => {
+                self.relay_policy_loading = false;
+                self.relay_policy_error = Some(e);
             }
         }
     }
@@ -731,6 +750,32 @@ impl App {
         }
     }
 
+    /// Fetch relay policy.
+    pub fn refresh_relay(&mut self) {
+        if self.relay_policy_loading {
+            return;
+        }
+        self.relay_policy_loading = true;
+        let server = self.server.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let url = format!("{}/relay/admin/policy", server.trim_end_matches('/'));
+            match reqwest::get(&url).await {
+                Ok(r) if r.status().is_success() => {
+                    match r.json::<serde_json::Value>().await {
+                        Ok(v) => tx.send(AppMsg::RelayPolicyLoaded(v)).ok(),
+                        Err(e) => tx.send(AppMsg::RelayPolicyError(format!("parse: {e}"))).ok(),
+                    }
+                }
+                Ok(r) => {
+                    let t = r.text().await.unwrap_or_default();
+                    tx.send(AppMsg::RelayPolicyError(format!("server: {t}"))).ok()
+                }
+                Err(e) => tx.send(AppMsg::RelayPolicyError(format!("request: {e}"))).ok(),
+            };
+        });
+    }
+
     /// Add a path to the batch queue.
     pub fn add_batch_path(&mut self) {
         let path = self.batch_input.trim().to_string();
@@ -833,8 +878,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         1 => draw_upload_tab(f, app, chunks[2]),
         2 => draw_batch_tab(f, app, chunks[2]),
         3 => draw_admin_tab(f, app, chunks[2]),
-        4 => draw_status_tab(f, app, chunks[2]),
-        5 => draw_keygen_tab(f, app, chunks[2]),
+        4 => draw_relay_tab(f, app, chunks[2]),
+        5 => draw_status_tab(f, app, chunks[2]),
+        6 => draw_keygen_tab(f, app, chunks[2]),
         _ => {}
     }
 
@@ -1308,6 +1354,32 @@ pub fn draw_admin_tab(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+pub fn draw_relay_tab(f: &mut Frame, app: &App, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Relay Admin ")
+        .border_style(Style::default().fg(COLOR_ACCENT));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let text = if app.relay_policy_loading {
+        "Loading relay policy…".to_string()
+    } else if let Some(e) = &app.relay_policy_error {
+        format!("Error: {e}\n\nPress 'r' to retry.\n\nNote: relay endpoints require blossom-nip34 to be running.")
+    } else if let Some(policy) = &app.relay_policy {
+        serde_json::to_string_pretty(policy).unwrap_or_else(|_| policy.to_string())
+    } else {
+        "Press 'r' to load relay policy.\n\nNote: requires blossom-nip34 server.".to_string()
+    };
+
+    f.render_widget(
+        Paragraph::new(text.as_str())
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(Color::White)),
+        inner,
+    );
+}
+
 pub fn draw_status_tab(f: &mut Frame, app: &App, area: Rect) {
     let loading_suffix = if app.status_loading {
         " (loading…)"
@@ -1433,7 +1505,8 @@ pub fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
             2 => " i:edit  Enter:add/start  x:remove-last  Tab:next  ?:help  q:quit",
             3 => " r:refresh  Tab:next  ?:help  q:quit",
             4 => " r:refresh  Tab:next  ?:help  q:quit",
-            5 => " g:generate  Tab:next  ?:help  q:quit",
+            5 => " r:refresh  Tab:next  ?:help  q:quit",
+            6 => " g:generate  Tab:next  ?:help  q:quit",
             _ => " Tab:next  ?:help  q:quit",
         };
         Line::from(Span::styled(
@@ -1764,10 +1837,15 @@ pub async fn run_loop(
                     }
                     4 => {
                         if key.code == KeyCode::Char('r') {
-                            app.refresh_status();
+                            app.refresh_relay();
                         }
                     }
                     5 => {
+                        if key.code == KeyCode::Char('r') {
+                            app.refresh_status();
+                        }
+                    }
+                    6 => {
                         if key.code == KeyCode::Char('g') {
                             app.generate_keypair();
                         }
