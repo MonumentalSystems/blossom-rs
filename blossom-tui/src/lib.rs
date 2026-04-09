@@ -40,9 +40,12 @@ pub const COLOR_TITLE_BG: Color = Color::DarkGray;
 
 // ── Modal ─────────────────────────────────────────────────────────────────────
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Modal {
+    /// Prompt for local save path to download selected blob.
     Download { sha256: String },
+    /// Prompt for remote URL to mirror onto the server.
+    Mirror,
 }
 
 // ── Async messages ────────────────────────────────────────────────────────────
@@ -59,6 +62,8 @@ pub enum AppMsg {
     DeleteError(String),
     DownloadDone(PathBuf),
     DownloadError(String),
+    MirrorDone(BlobDescriptor),
+    MirrorError(String),
 }
 
 // ── App state ─────────────────────────────────────────────────────────────────
@@ -214,6 +219,16 @@ impl App {
             }
             AppMsg::DownloadError(e) => {
                 self.notification = Some((format!("Download failed: {e}"), true));
+            }
+            AppMsg::MirrorDone(desc) => {
+                self.notification = Some((
+                    format!("Mirrored: {}", &desc.sha256[..16.min(desc.sha256.len())]),
+                    false,
+                ));
+                self.refresh_blobs();
+            }
+            AppMsg::MirrorError(e) => {
+                self.notification = Some((format!("Mirror failed: {e}"), true));
             }
         }
     }
@@ -463,6 +478,60 @@ impl App {
                     Err(e) => tx.send(AppMsg::DownloadError(format!("write: {e}"))).ok(),
                 },
                 Err(e) => tx.send(AppMsg::DownloadError(e)).ok(),
+            };
+        });
+    }
+
+    /// Open the mirror URL prompt.
+    pub fn prompt_mirror(&mut self) {
+        if self.secret_key.is_none() {
+            self.notification = Some(("A secret key is required to mirror.".into(), true));
+            return;
+        }
+        self.modal_input.clear();
+        self.modal = Some(Modal::Mirror);
+    }
+
+    /// Execute mirroring using the URL in `modal_input`.
+    pub fn confirm_mirror(&mut self) {
+        self.modal = None;
+        let url = self.modal_input.trim().to_string();
+        self.modal_input.clear();
+        if url.is_empty() {
+            self.notification = Some(("Enter a URL.".into(), true));
+            return;
+        }
+        let server = self.server.clone();
+        let secret_key = self.secret_key.clone();
+        let tx = self.tx.clone();
+
+        tokio::spawn(async move {
+            let signer = secret_key
+                .as_deref()
+                .and_then(|k| Signer::from_secret_hex(k).ok())
+                .unwrap_or_else(Signer::generate);
+            let auth_event = blossom_rs::auth::build_blossom_auth(&signer, "upload", None, None, "");
+            let auth_header = blossom_rs::auth::auth_header_value(&auth_event);
+            let endpoint = format!("{}/mirror", server.trim_end_matches('/'));
+            let http = reqwest::Client::new();
+            match http
+                .put(&endpoint)
+                .header("Authorization", auth_header)
+                .json(&serde_json::json!({"url": url}))
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    match resp.json::<BlobDescriptor>().await {
+                        Ok(desc) => tx.send(AppMsg::MirrorDone(desc)).ok(),
+                        Err(e) => tx.send(AppMsg::MirrorError(format!("parse: {e}"))).ok(),
+                    }
+                }
+                Ok(resp) => {
+                    let text = resp.text().await.unwrap_or_default();
+                    tx.send(AppMsg::MirrorError(format!("server: {text}"))).ok()
+                }
+                Err(e) => tx.send(AppMsg::MirrorError(format!("request: {e}"))).ok(),
             };
         });
     }
@@ -892,7 +961,7 @@ pub fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
         ))
     } else {
         let hints = match app.tab {
-            0 => " r:refresh  d:delete  o:download  ↑↓/jk:navigate  Tab:next  ?:help  q:quit",
+            0 => " r:refresh  d:delete  o:download  m:mirror  ↑↓/jk:navigate  Tab:next  ?:help  q:quit",
             1 => " i:edit-path  Enter:upload  Esc:clear  Tab:next  ?:help  q:quit",
             2 => " r:refresh  Tab:next  ?:help  q:quit",
             3 => " g:generate  Tab:next  ?:help  q:quit",
@@ -914,6 +983,10 @@ pub fn draw_modal_input(f: &mut Frame, app: &App, area: Rect) {
         Some(Modal::Download { sha256 }) => (
             " Download Blob ",
             format!("Save path for {}…{}:", &sha256[..8.min(sha256.len())], &sha256[sha256.len().saturating_sub(4)..]),
+        ),
+        Some(Modal::Mirror) => (
+            " Mirror Blob ",
+            "Remote URL to mirror:".to_string(),
         ),
         None => return,
     };
@@ -1011,6 +1084,10 @@ pub fn draw_help_popup(f: &mut Frame, area: Rect) {
             Span::styled("  o                ", y),
             Span::raw("Download selected blob"),
         ]),
+        Line::from(vec![
+            Span::styled("  m                ", y),
+            Span::raw("Mirror blob from URL"),
+        ]),
         Line::from(""),
         Line::from(Span::styled("  Upload tab", h)),
         Line::from(""),
@@ -1084,8 +1161,10 @@ pub async fn run_loop(
                             app.modal_input.clear();
                         }
                         KeyCode::Enter => {
-                            if let Some(Modal::Download { .. }) = &app.modal {
-                                app.confirm_download();
+                            match &app.modal {
+                                Some(Modal::Download { .. }) => app.confirm_download(),
+                                Some(Modal::Mirror) => app.confirm_mirror(),
+                                None => {}
                             }
                         }
                         KeyCode::Backspace => { app.modal_input.pop(); }
@@ -1152,6 +1231,7 @@ pub async fn run_loop(
                         KeyCode::Char('r') => app.refresh_blobs(),
                         KeyCode::Char('d') => app.delete_selected(),
                         KeyCode::Char('o') => app.prompt_download(),
+                        KeyCode::Char('m') => app.prompt_mirror(),
                         _ => {}
                     },
                     1 => match key.code {
