@@ -266,7 +266,7 @@ async fn test_git_info_refs_endpoint() {
 }
 
 #[tokio::test]
-async fn test_git_info_refs_not_found() {
+async fn test_git_info_refs_invalid_repo_name() {
     let tmp = tempfile::tempdir().unwrap();
     let config = Nip34Config {
         domain: "test.localhost".into(),
@@ -284,7 +284,7 @@ async fn test_git_info_refs_not_found() {
 
     let resp = reqwest::Client::new()
         .get(format!(
-            "{}/npub1test/nonexistent/info/refs?service=git-upload-pack",
+            "{}/npub1test/invalid repo name!/info/refs?service=git-upload-pack",
             url
         ))
         .send()

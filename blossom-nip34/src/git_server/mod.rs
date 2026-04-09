@@ -16,6 +16,21 @@ use nostr::nips::nip19::FromBech32;
 
 use crate::Nip34State;
 
+/// Ensure a bare repo exists on disk. If it doesn't exist but the npub has
+/// a repo path, create it (lazy repo creation for GRASP).
+async fn ensure_repo(
+    state: &Nip34State,
+    npub: &str,
+    repo_name: &str,
+) -> Option<std::path::PathBuf> {
+    let path = state.repo_path(npub, repo_name)?;
+    if path.join("HEAD").exists() {
+        return Some(path);
+    }
+    // Auto-create bare repo
+    state.create_bare_repo(npub, repo_name, "").await.ok()
+}
+
 /// Build the git HTTP router.
 ///
 /// Routes:
@@ -83,9 +98,9 @@ async fn info_refs(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
     let repo_name = repo.trim_end_matches(".git");
-    let repo_path = match state.repo_path(&npub, repo_name) {
-        Some(p) if p.join("HEAD").exists() => p,
-        _ => return (StatusCode::NOT_FOUND, "repository not found").into_response(),
+    let repo_path = match ensure_repo(&state, &npub, repo_name).await {
+        Some(p) => p,
+        None => return (StatusCode::NOT_FOUND, "repository not found").into_response(),
     };
 
     let service = params
@@ -125,9 +140,9 @@ async fn upload_pack(
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
     let repo_name = repo.trim_end_matches(".git");
-    let repo_path = match state.repo_path(&npub, repo_name) {
-        Some(p) if p.join("HEAD").exists() => p,
-        _ => return (StatusCode::NOT_FOUND, "repository not found").into_response(),
+    let repo_path = match ensure_repo(&state, &npub, repo_name).await {
+        Some(p) => p,
+        None => return (StatusCode::NOT_FOUND, "repository not found").into_response(),
     };
 
     let git_cmd = command::GitCommand::new(&state.config.git_path, &repo_path);
@@ -159,9 +174,9 @@ async fn receive_pack(
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
     let repo_name = repo.trim_end_matches(".git");
-    let repo_path = match state.repo_path(&npub, repo_name) {
-        Some(p) if p.join("HEAD").exists() => p,
-        _ => return (StatusCode::NOT_FOUND, "repository not found").into_response(),
+    let repo_path = match ensure_repo(&state, &npub, repo_name).await {
+        Some(p) => p,
+        None => return (StatusCode::NOT_FOUND, "repository not found").into_response(),
     };
 
     // Parse ref updates from the pkt-line body
