@@ -9,6 +9,7 @@
 //! - **Keygen** — generate a fresh BIP-340 keypair
 
 use std::io::Stdout;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use blossom_rs::{BlobDescriptor, BlossomClient, BlossomSigner, Signer};
@@ -37,6 +38,13 @@ pub const COLOR_DIM: Color = Color::DarkGray;
 pub const COLOR_SELECTED_BG: Color = Color::Blue;
 pub const COLOR_TITLE_BG: Color = Color::DarkGray;
 
+// ── Modal ─────────────────────────────────────────────────────────────────────
+
+#[derive(Debug)]
+pub enum Modal {
+    Download { sha256: String },
+}
+
 // ── Async messages ────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
@@ -49,6 +57,8 @@ pub enum AppMsg {
     StatusError(String),
     DeleteDone(String),
     DeleteError(String),
+    DownloadDone(PathBuf),
+    DownloadError(String),
 }
 
 // ── App state ─────────────────────────────────────────────────────────────────
@@ -92,6 +102,8 @@ pub struct App {
     // UI state
     pub show_help: bool,
     pub notification: Option<(String, bool)>, // (message, is_error)
+    pub modal: Option<Modal>,
+    pub modal_input: String,
 
     // Channel sender for async results
     pub tx: mpsc::UnboundedSender<AppMsg>,
@@ -126,6 +138,8 @@ impl App {
             keygen_data: None,
             show_help: false,
             notification: None,
+            modal: None,
+            modal_input: String::new(),
             tx,
         }
     }
@@ -194,6 +208,12 @@ impl App {
             }
             AppMsg::DeleteError(e) => {
                 self.notification = Some((format!("Delete failed: {e}"), true));
+            }
+            AppMsg::DownloadDone(path) => {
+                self.notification = Some((format!("Downloaded → {}", path.display()), false));
+            }
+            AppMsg::DownloadError(e) => {
+                self.notification = Some((format!("Download failed: {e}"), true));
             }
         }
     }
@@ -407,6 +427,45 @@ impl App {
             self.blobs_table.select(Some(i));
         }
     }
+
+    /// Open the download path prompt for the selected blob.
+    pub fn prompt_download(&mut self) {
+        let Some(idx) = self.blobs_table.selected() else { return };
+        let Some(blob) = self.blobs.get(idx) else { return };
+        let sha256 = blob.sha256.clone();
+        self.modal_input = sha256[..16.min(sha256.len())].to_string();
+        self.modal = Some(Modal::Download { sha256 });
+    }
+
+    /// Execute the download using the path in `modal_input`.
+    pub fn confirm_download(&mut self) {
+        let Some(Modal::Download { sha256 }) = self.modal.take() else { return };
+        let path_str = self.modal_input.trim().to_string();
+        self.modal_input.clear();
+        if path_str.is_empty() {
+            self.notification = Some(("Enter a file path.".into(), true));
+            return;
+        }
+        let server = self.server.clone();
+        let secret_key = self.secret_key.clone();
+        let tx = self.tx.clone();
+        let path = PathBuf::from(&path_str);
+
+        tokio::spawn(async move {
+            let signer = secret_key
+                .as_deref()
+                .and_then(|k| Signer::from_secret_hex(k).ok())
+                .unwrap_or_else(Signer::generate);
+            let client = BlossomClient::new(vec![server], signer);
+            match client.download(&sha256).await {
+                Ok(data) => match tokio::fs::write(&path, &data).await {
+                    Ok(()) => tx.send(AppMsg::DownloadDone(path)).ok(),
+                    Err(e) => tx.send(AppMsg::DownloadError(format!("write: {e}"))).ok(),
+                },
+                Err(e) => tx.send(AppMsg::DownloadError(e)).ok(),
+            };
+        });
+    }
 }
 
 // ── Drawing ───────────────────────────────────────────────────────────────────
@@ -438,6 +497,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     if app.show_help {
         draw_help_popup(f, area);
+    }
+
+    if app.modal.is_some() {
+        draw_modal_input(f, app, area);
     }
 }
 
@@ -829,7 +892,7 @@ pub fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
         ))
     } else {
         let hints = match app.tab {
-            0 => " r:refresh  d:delete  ↑↓/jk:navigate  Tab:next  ?:help  q:quit",
+            0 => " r:refresh  d:delete  o:download  ↑↓/jk:navigate  Tab:next  ?:help  q:quit",
             1 => " i:edit-path  Enter:upload  Esc:clear  Tab:next  ?:help  q:quit",
             2 => " r:refresh  Tab:next  ?:help  q:quit",
             3 => " g:generate  Tab:next  ?:help  q:quit",
@@ -843,6 +906,56 @@ pub fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(
         Paragraph::new(content).style(Style::default().bg(COLOR_TITLE_BG)),
         area,
+    );
+}
+
+pub fn draw_modal_input(f: &mut Frame, app: &App, area: Rect) {
+    let (title, label) = match &app.modal {
+        Some(Modal::Download { sha256 }) => (
+            " Download Blob ",
+            format!("Save path for {}…{}:", &sha256[..8.min(sha256.len())], &sha256[sha256.len().saturating_sub(4)..]),
+        ),
+        None => return,
+    };
+
+    let popup_w = 60u16.min(area.width.saturating_sub(4));
+    let popup_h = 7u16;
+    let popup_x = (area.width.saturating_sub(popup_w)) / 2;
+    let popup_y = (area.height.saturating_sub(popup_h)) / 2;
+    let popup_area = Rect::new(popup_x, popup_y, popup_w, popup_h);
+
+    f.render_widget(Clear, popup_area);
+
+    let inner_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(3), Constraint::Length(1)])
+        .margin(1)
+        .split(popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::default().fg(COLOR_ACCENT));
+    f.render_widget(block, popup_area);
+
+    f.render_widget(
+        Paragraph::new(label.as_str()).style(Style::default().fg(COLOR_DIM)),
+        inner_chunks[0],
+    );
+
+    let input = Paragraph::new(app.modal_input.as_str())
+        .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(COLOR_ACCENT)))
+        .style(Style::default().fg(Color::White));
+    f.render_widget(input, inner_chunks[1]);
+
+    f.set_cursor_position((
+        inner_chunks[1].x + app.modal_input.len() as u16 + 1,
+        inner_chunks[1].y + 1,
+    ));
+
+    f.render_widget(
+        Paragraph::new("Enter: confirm   Esc: cancel").style(Style::default().fg(COLOR_DIM)),
+        inner_chunks[2],
     );
 }
 
@@ -893,6 +1006,10 @@ pub fn draw_help_popup(f: &mut Frame, area: Rect) {
         Line::from(vec![
             Span::styled("  d                ", y),
             Span::raw("Delete selected blob"),
+        ]),
+        Line::from(vec![
+            Span::styled("  o                ", y),
+            Span::raw("Download selected blob"),
         ]),
         Line::from(""),
         Line::from(Span::styled("  Upload tab", h)),
@@ -959,6 +1076,25 @@ pub async fn run_loop(
 
         match evt {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
+                // Modal input intercepts all keys when active
+                if app.modal.is_some() {
+                    match key.code {
+                        KeyCode::Esc => {
+                            app.modal = None;
+                            app.modal_input.clear();
+                        }
+                        KeyCode::Enter => {
+                            if let Some(Modal::Download { .. }) = &app.modal {
+                                app.confirm_download();
+                            }
+                        }
+                        KeyCode::Backspace => { app.modal_input.pop(); }
+                        KeyCode::Char(c) => app.modal_input.push(c),
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 if (!app.input_mode && key.code == KeyCode::Char('q'))
                     || (key.modifiers.contains(KeyModifiers::CONTROL)
                         && key.code == KeyCode::Char('c'))
@@ -1015,6 +1151,7 @@ pub async fn run_loop(
                         KeyCode::Down | KeyCode::Char('j') => app.scroll_down(),
                         KeyCode::Char('r') => app.refresh_blobs(),
                         KeyCode::Char('d') => app.delete_selected(),
+                        KeyCode::Char('o') => app.prompt_download(),
                         _ => {}
                     },
                     1 => match key.code {
