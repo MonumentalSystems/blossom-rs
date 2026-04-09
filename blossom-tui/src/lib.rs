@@ -14,16 +14,14 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use blossom_rs::{BlobDescriptor, BlossomClient, BlossomSigner, Signer};
-use crossterm::event::{
-    self, Event, KeyCode, KeyEventKind, KeyModifiers,
-};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
+    Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Tabs, Wrap},
-    Frame, Terminal,
 };
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -31,7 +29,10 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 // ── Constants ────────────────────────────────────────────────────────────────
 
 pub const APP_TITLE: &str = "blossom-tui";
-pub const TAB_NAMES: &[&str] = &[" Blobs ", " Upload ", " Batch ", " Admin ", " Relay ", " NIP-96 ", " NIP-34 ", " Status ", " Keygen "];
+pub const TAB_NAMES: &[&str] = &[
+    " Blobs ", " Upload ", " Batch ", " Admin ", " Relay ", " NIP-96 ", " NIP-34 ", " Status ",
+    " Keygen ",
+];
 
 pub const COLOR_ACCENT: Color = Color::Cyan;
 pub const COLOR_OK: Color = Color::Green;
@@ -108,10 +109,10 @@ pub enum AppMsg {
     Nip96InfoError(String),
     Nip96FilesLoaded(serde_json::Value),
     Nip96FilesError(String),
-    Nip94Published(String),  // relay URL
+    Nip94Published(String), // relay URL
     Nip94PublishError(String),
     Nip34EventReceived(Nip34EventItem),
-    Nip34Connected(String),   // relay URL
+    Nip34Connected(String), // relay URL
     Nip34Error(String),
 }
 
@@ -132,16 +133,16 @@ impl Nip34EventItem {
         match self.kind {
             30617 => "RepoAnnounce",
             30618 => "RepoState",
-            1617  => "Patch",
-            1618  => "PullRequest",
-            1619  => "PRUpdate",
-            1621  => "Issue",
-            1630  => "Status:Open",
-            1631  => "Status:Applied",
-            1632  => "Status:Closed",
-            1633  => "Status:Draft",
+            1617 => "Patch",
+            1618 => "PullRequest",
+            1619 => "PRUpdate",
+            1621 => "Issue",
+            1630 => "Status:Open",
+            1631 => "Status:Applied",
+            1632 => "Status:Closed",
+            1633 => "Status:Draft",
             10317 => "GraspList",
-            _     => "Unknown",
+            _ => "Unknown",
         }
     }
 }
@@ -194,9 +195,9 @@ pub struct App {
     pub upload_msg: Option<String>,
     pub upload_ok: bool,
     pub input_mode: bool,
-    pub publish_nip94: bool,          // toggle: publish NIP-94 after upload
-    pub publish_relay: String,        // relay URL for NIP-94 publishing
-    pub publish_relay_edit: bool,     // editing relay URL field
+    pub publish_nip94: bool,      // toggle: publish NIP-94 after upload
+    pub publish_relay: String,    // relay URL for NIP-94 publishing
+    pub publish_relay_edit: bool, // editing relay URL field
 
     // Status tab
     pub status_data: Option<serde_json::Value>,
@@ -239,7 +240,7 @@ pub struct App {
     pub nip34_events: Vec<Nip34EventItem>,
     pub nip34_events_table: TableState,
     pub nip34_connected: bool,
-    pub nip34_status: String,         // connection status message
+    pub nip34_status: String, // connection status message
 
     // UI state
     pub show_help: bool,
@@ -252,7 +253,11 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(server: String, secret_key: Option<String>, tx: mpsc::UnboundedSender<AppMsg>) -> Self {
+    pub fn new(
+        server: String,
+        secret_key: Option<String>,
+        tx: mpsc::UnboundedSender<AppMsg>,
+    ) -> Self {
         let pubkey = secret_key
             .as_deref()
             .and_then(|k| Signer::from_secret_hex(k).ok().map(|s| s.public_key_hex()));
@@ -402,9 +407,10 @@ impl App {
                 if let Some(item) = self.batch_items.get_mut(idx) {
                     item.status = BatchStatus::Done(desc);
                 }
-                let all_done = self.batch_items.iter().all(|i| {
-                    matches!(i.status, BatchStatus::Done(_) | BatchStatus::Failed(_))
-                });
+                let all_done = self
+                    .batch_items
+                    .iter()
+                    .all(|i| matches!(i.status, BatchStatus::Done(_) | BatchStatus::Failed(_)));
                 if all_done {
                     self.batch_running = false;
                 }
@@ -413,9 +419,10 @@ impl App {
                 if let Some(item) = self.batch_items.get_mut(idx) {
                     item.status = BatchStatus::Failed(e);
                 }
-                let all_done = self.batch_items.iter().all(|i| {
-                    matches!(i.status, BatchStatus::Done(_) | BatchStatus::Failed(_))
-                });
+                let all_done = self
+                    .batch_items
+                    .iter()
+                    .all(|i| matches!(i.status, BatchStatus::Done(_) | BatchStatus::Failed(_)));
                 if all_done {
                     self.batch_running = false;
                 }
@@ -562,12 +569,11 @@ impl App {
                     // Optionally publish NIP-94 kind:1063 event
                     if publish_nip94 && !publish_relay.is_empty() {
                         let event = blossom_rs::nostr_events::build_file_metadata_event(
-                            &signer,
-                            &desc,
-                            &server,
-                            &mime,
+                            &signer, &desc, &server, &mime,
                         );
-                        match blossom_rs::nostr_events::publish_to_relay(&publish_relay, &event).await {
+                        match blossom_rs::nostr_events::publish_to_relay(&publish_relay, &event)
+                            .await
+                        {
                             Ok(()) => tx.send(AppMsg::Nip94Published(publish_relay)).ok(),
                             Err(e) => tx.send(AppMsg::Nip94PublishError(e)).ok(),
                         };
@@ -741,8 +747,12 @@ impl App {
 
     /// Open the download path prompt for the selected blob.
     pub fn prompt_download(&mut self) {
-        let Some(idx) = self.blobs_table.selected() else { return };
-        let Some(blob) = self.blobs.get(idx) else { return };
+        let Some(idx) = self.blobs_table.selected() else {
+            return;
+        };
+        let Some(blob) = self.blobs.get(idx) else {
+            return;
+        };
         let sha256 = blob.sha256.clone();
         self.modal_input = sha256[..16.min(sha256.len())].to_string();
         self.modal = Some(Modal::Download { sha256 });
@@ -750,7 +760,9 @@ impl App {
 
     /// Execute the download using the path in `modal_input`.
     pub fn confirm_download(&mut self) {
-        let Some(Modal::Download { sha256 }) = self.modal.take() else { return };
+        let Some(Modal::Download { sha256 }) = self.modal.take() else {
+            return;
+        };
         let path_str = self.modal_input.trim().to_string();
         self.modal_input.clear();
         if path_str.is_empty() {
@@ -806,7 +818,8 @@ impl App {
                 .as_deref()
                 .and_then(|k| Signer::from_secret_hex(k).ok())
                 .unwrap_or_else(Signer::generate);
-            let auth_event = blossom_rs::auth::build_blossom_auth(&signer, "upload", None, None, "");
+            let auth_event =
+                blossom_rs::auth::build_blossom_auth(&signer, "upload", None, None, "");
             let auth_header = blossom_rs::auth::auth_header_value(&auth_event);
             let endpoint = format!("{}/mirror", server.trim_end_matches('/'));
             let http = reqwest::Client::new();
@@ -844,17 +857,20 @@ impl App {
             tokio::spawn(async move {
                 let url = format!("{}/admin/stats", server2.trim_end_matches('/'));
                 match reqwest::get(&url).await {
-                    Ok(r) if r.status().is_success() => {
-                        match r.json::<serde_json::Value>().await {
-                            Ok(v) => tx2.send(AppMsg::AdminStatsLoaded(v)).ok(),
-                            Err(e) => tx2.send(AppMsg::AdminStatsError(format!("parse: {e}"))).ok(),
-                        }
-                    }
+                    Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
+                        Ok(v) => tx2.send(AppMsg::AdminStatsLoaded(v)).ok(),
+                        Err(e) => tx2
+                            .send(AppMsg::AdminStatsError(format!("parse: {e}")))
+                            .ok(),
+                    },
                     Ok(r) => {
                         let t = r.text().await.unwrap_or_default();
-                        tx2.send(AppMsg::AdminStatsError(format!("server: {t}"))).ok()
+                        tx2.send(AppMsg::AdminStatsError(format!("server: {t}")))
+                            .ok()
                     }
-                    Err(e) => tx2.send(AppMsg::AdminStatsError(format!("request: {e}"))).ok(),
+                    Err(e) => tx2
+                        .send(AppMsg::AdminStatsError(format!("request: {e}")))
+                        .ok(),
                 };
             });
         }
@@ -864,17 +880,18 @@ impl App {
             tokio::spawn(async move {
                 let url = format!("{}/admin/users", server.trim_end_matches('/'));
                 match reqwest::get(&url).await {
-                    Ok(r) if r.status().is_success() => {
-                        match r.json::<serde_json::Value>().await {
-                            Ok(v) => tx.send(AppMsg::AdminUsersLoaded(v)).ok(),
-                            Err(e) => tx.send(AppMsg::AdminUsersError(format!("parse: {e}"))).ok(),
-                        }
-                    }
+                    Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
+                        Ok(v) => tx.send(AppMsg::AdminUsersLoaded(v)).ok(),
+                        Err(e) => tx.send(AppMsg::AdminUsersError(format!("parse: {e}"))).ok(),
+                    },
                     Ok(r) => {
                         let t = r.text().await.unwrap_or_default();
-                        tx.send(AppMsg::AdminUsersError(format!("server: {t}"))).ok()
+                        tx.send(AppMsg::AdminUsersError(format!("server: {t}")))
+                            .ok()
                     }
-                    Err(e) => tx.send(AppMsg::AdminUsersError(format!("request: {e}"))).ok(),
+                    Err(e) => tx
+                        .send(AppMsg::AdminUsersError(format!("request: {e}")))
+                        .ok(),
                 };
             });
         }
@@ -891,17 +908,20 @@ impl App {
         tokio::spawn(async move {
             let url = format!("{}/relay/admin/policy", server.trim_end_matches('/'));
             match reqwest::get(&url).await {
-                Ok(r) if r.status().is_success() => {
-                    match r.json::<serde_json::Value>().await {
-                        Ok(v) => tx.send(AppMsg::RelayPolicyLoaded(v)).ok(),
-                        Err(e) => tx.send(AppMsg::RelayPolicyError(format!("parse: {e}"))).ok(),
-                    }
-                }
+                Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
+                    Ok(v) => tx.send(AppMsg::RelayPolicyLoaded(v)).ok(),
+                    Err(e) => tx
+                        .send(AppMsg::RelayPolicyError(format!("parse: {e}")))
+                        .ok(),
+                },
                 Ok(r) => {
                     let t = r.text().await.unwrap_or_default();
-                    tx.send(AppMsg::RelayPolicyError(format!("server: {t}"))).ok()
+                    tx.send(AppMsg::RelayPolicyError(format!("server: {t}")))
+                        .ok()
                 }
-                Err(e) => tx.send(AppMsg::RelayPolicyError(format!("request: {e}"))).ok(),
+                Err(e) => tx
+                    .send(AppMsg::RelayPolicyError(format!("request: {e}")))
+                    .ok(),
             };
         });
     }
@@ -921,16 +941,16 @@ impl App {
             // Fetch /.well-known/nostr/nip96.json
             let info_url = format!("{}/.well-known/nostr/nip96.json", base);
             match reqwest::get(&info_url).await {
-                Ok(r) if r.status().is_success() => {
-                    match r.json::<serde_json::Value>().await {
-                        Ok(v) => tx.send(AppMsg::Nip96InfoLoaded(v)).ok(),
-                        Err(e) => tx.send(AppMsg::Nip96InfoError(format!("parse: {e}"))).ok(),
-                    }
-                }
-                Ok(r) => {
-                    tx.send(AppMsg::Nip96InfoError(format!("HTTP {}", r.status()))).ok()
-                }
-                Err(e) => tx.send(AppMsg::Nip96InfoError(format!("request: {e}"))).ok(),
+                Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
+                    Ok(v) => tx.send(AppMsg::Nip96InfoLoaded(v)).ok(),
+                    Err(e) => tx.send(AppMsg::Nip96InfoError(format!("parse: {e}"))).ok(),
+                },
+                Ok(r) => tx
+                    .send(AppMsg::Nip96InfoError(format!("HTTP {}", r.status())))
+                    .ok(),
+                Err(e) => tx
+                    .send(AppMsg::Nip96InfoError(format!("request: {e}")))
+                    .ok(),
             };
 
             // Fetch /n96?page=1&count=50 (requires auth if server enforces it)
@@ -939,26 +959,22 @@ impl App {
             let mut req = client.get(&files_url);
             if let Some(key) = &secret_key {
                 if let Ok(signer) = blossom_rs::auth::Signer::from_secret_hex(key) {
-                    let auth_event = blossom_rs::auth::build_nip98_auth(
-                        &signer,
-                        &files_url,
-                        "GET",
-                    );
+                    let auth_event = blossom_rs::auth::build_nip98_auth(&signer, &files_url, "GET");
                     let token = blossom_rs::auth::auth_header_value(&auth_event);
                     req = req.header("Authorization", token);
                 }
             }
             match req.send().await {
-                Ok(r) if r.status().is_success() => {
-                    match r.json::<serde_json::Value>().await {
-                        Ok(v) => tx.send(AppMsg::Nip96FilesLoaded(v)).ok(),
-                        Err(e) => tx.send(AppMsg::Nip96FilesError(format!("parse: {e}"))).ok(),
-                    }
-                }
-                Ok(r) => {
-                    tx.send(AppMsg::Nip96FilesError(format!("HTTP {}", r.status()))).ok()
-                }
-                Err(e) => tx.send(AppMsg::Nip96FilesError(format!("request: {e}"))).ok(),
+                Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
+                    Ok(v) => tx.send(AppMsg::Nip96FilesLoaded(v)).ok(),
+                    Err(e) => tx.send(AppMsg::Nip96FilesError(format!("parse: {e}"))).ok(),
+                },
+                Ok(r) => tx
+                    .send(AppMsg::Nip96FilesError(format!("HTTP {}", r.status())))
+                    .ok(),
+                Err(e) => tx
+                    .send(AppMsg::Nip96FilesError(format!("request: {e}")))
+                    .ok(),
             };
         });
     }
@@ -975,26 +991,36 @@ impl App {
         let tx = self.tx.clone();
         tokio::spawn(async move {
             use futures_util::{SinkExt, StreamExt};
-            let ws_url = relay.replace("http://", "ws://").replace("https://", "wss://");
+            let ws_url = relay
+                .replace("http://", "ws://")
+                .replace("https://", "wss://");
             let conn = tokio_tungstenite::connect_async(&ws_url).await;
             let (mut ws, _) = match conn {
                 Ok(pair) => pair,
                 Err(e) => {
-                    tx.send(AppMsg::Nip34Error(format!("connect failed: {e}"))).ok();
+                    tx.send(AppMsg::Nip34Error(format!("connect failed: {e}")))
+                        .ok();
                     return;
                 }
             };
             tx.send(AppMsg::Nip34Connected(ws_url.clone())).ok();
 
             // Send REQ for NIP-34 kinds
-            let kinds: Vec<u64> = vec![30617, 30618, 1617, 1618, 1619, 1621, 1630, 1631, 1632, 1633, 10317];
+            let kinds: Vec<u64> = vec![
+                30617, 30618, 1617, 1618, 1619, 1621, 1630, 1631, 1632, 1633, 10317,
+            ];
             let req = serde_json::json!([
                 "REQ",
                 "nip34-sub",
                 {"kinds": kinds, "limit": 100}
             ]);
-            if ws.send(WsMessage::Text(req.to_string().into())).await.is_err() {
-                tx.send(AppMsg::Nip34Error("failed to send REQ".into())).ok();
+            if ws
+                .send(WsMessage::Text(req.to_string().into()))
+                .await
+                .is_err()
+            {
+                tx.send(AppMsg::Nip34Error("failed to send REQ".into()))
+                    .ok();
                 return;
             }
 
@@ -1002,13 +1028,13 @@ impl App {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
             loop {
                 if std::time::Instant::now() > deadline {
-                    tx.send(AppMsg::Nip34Error("session timeout — press 'c' to reconnect".into())).ok();
+                    tx.send(AppMsg::Nip34Error(
+                        "session timeout — press 'c' to reconnect".into(),
+                    ))
+                    .ok();
                     break;
                 }
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    ws.next(),
-                ).await {
+                match tokio::time::timeout(std::time::Duration::from_secs(5), ws.next()).await {
                     Ok(Some(Ok(WsMessage::Text(text)))) => {
                         // NIP-01 messages: ["EVENT", sub_id, event] or ["EOSE", sub_id]
                         if let Ok(arr) = serde_json::from_str::<serde_json::Value>(&text) {
@@ -1019,8 +1045,13 @@ impl App {
                                     let pubkey = ev["pubkey"].as_str().unwrap_or("").to_string();
                                     let created_at = ev["created_at"].as_u64().unwrap_or(0);
                                     // Try to get d-tag or first content chars as preview
-                                    let d_tag = ev["tags"].as_array()
-                                        .and_then(|tags| tags.iter().find(|t| t.get(0).and_then(|v| v.as_str()) == Some("d")))
+                                    let d_tag = ev["tags"]
+                                        .as_array()
+                                        .and_then(|tags| {
+                                            tags.iter().find(|t| {
+                                                t.get(0).and_then(|v| v.as_str()) == Some("d")
+                                            })
+                                        })
                                         .and_then(|t| t.get(1))
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("");
@@ -1031,20 +1062,30 @@ impl App {
                                         content.chars().take(80).collect()
                                     };
                                     tx.send(AppMsg::Nip34EventReceived(Nip34EventItem {
-                                        kind, id, pubkey, created_at,
+                                        kind,
+                                        id,
+                                        pubkey,
+                                        created_at,
                                         content_preview: preview,
-                                    })).ok();
+                                    }))
+                                    .ok();
                                 }
                             } else if arr.get(0).and_then(|v| v.as_str()) == Some("EOSE") {
                                 // End of stored events — keep connection alive for live updates
                             } else if arr.get(0).and_then(|v| v.as_str()) == Some("NOTICE") {
-                                let notice = arr.get(1).and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                tx.send(AppMsg::Nip34Error(format!("relay notice: {notice}"))).ok();
+                                let notice = arr
+                                    .get(1)
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                tx.send(AppMsg::Nip34Error(format!("relay notice: {notice}")))
+                                    .ok();
                             }
                         }
                     }
                     Ok(Some(Ok(WsMessage::Close(_)))) => {
-                        tx.send(AppMsg::Nip34Error("relay closed connection".into())).ok();
+                        tx.send(AppMsg::Nip34Error("relay closed connection".into()))
+                            .ok();
                         break;
                     }
                     Ok(Some(Err(e))) => {
@@ -1052,7 +1093,8 @@ impl App {
                         break;
                     }
                     Ok(None) => {
-                        tx.send(AppMsg::Nip34Error("relay disconnected".into())).ok();
+                        tx.send(AppMsg::Nip34Error("relay disconnected".into()))
+                            .ok();
                         break;
                     }
                     Err(_) => {} // timeout, continue loop
@@ -1068,7 +1110,10 @@ impl App {
         if path.is_empty() {
             return;
         }
-        self.batch_items.push(BatchItem { path, status: BatchStatus::Pending });
+        self.batch_items.push(BatchItem {
+            path,
+            status: BatchStatus::Pending,
+        });
         self.batch_input.clear();
     }
 
@@ -1338,10 +1383,26 @@ pub fn draw_blobs_tab(f: &mut Frame, app: &mut App, area: Rect) {
     };
 
     let header = Row::new(vec![
-        Cell::from(sha_header_label).style(Style::default().add_modifier(Modifier::BOLD).fg(COLOR_ACCENT)),
-        Cell::from(size_header_label).style(Style::default().add_modifier(Modifier::BOLD).fg(COLOR_ACCENT)),
-        Cell::from(type_header_label).style(Style::default().add_modifier(Modifier::BOLD).fg(COLOR_ACCENT)),
-        Cell::from(date_header_label).style(Style::default().add_modifier(Modifier::BOLD).fg(COLOR_ACCENT)),
+        Cell::from(sha_header_label).style(
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .fg(COLOR_ACCENT),
+        ),
+        Cell::from(size_header_label).style(
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .fg(COLOR_ACCENT),
+        ),
+        Cell::from(type_header_label).style(
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .fg(COLOR_ACCENT),
+        ),
+        Cell::from(date_header_label).style(
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .fg(COLOR_ACCENT),
+        ),
     ])
     .bottom_margin(1);
 
@@ -1439,32 +1500,43 @@ pub fn draw_upload_tab(f: &mut Frame, app: &App, area: Rect) {
         app.publish_relay.clone()
     };
     let relay_style = if app.publish_relay_edit {
-        Style::default().fg(COLOR_ACCENT).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(COLOR_ACCENT)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::White)
     };
     let nip94_line = Line::from(vec![
         Span::styled(
             "  p",
-            Style::default().fg(COLOR_ACCENT).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(COLOR_ACCENT)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw(format!(": Publish NIP-94 event {nip94_toggle}  relay: ")),
         Span::styled(relay_label, relay_style),
         Span::raw("  "),
         Span::styled(
             "R",
-            Style::default().fg(COLOR_ACCENT).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(COLOR_ACCENT)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw(": edit relay URL"),
     ]);
     f.render_widget(
-        Paragraph::new(nip94_line)
-            .block(Block::default().borders(Borders::ALL).title(" NIP-94 Publish ")),
+        Paragraph::new(nip94_line).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" NIP-94 Publish "),
+        ),
         chunks[1],
     );
     if app.publish_relay_edit {
         f.set_cursor_position((
-            chunks[1].x + 1 + "  p: Publish NIP-94 event [x]  relay: ".len() as u16
+            chunks[1].x
+                + 1
+                + "  p: Publish NIP-94 event [x]  relay: ".len() as u16
                 + app.publish_relay.len() as u16,
             chunks[1].y + 1,
         ));
@@ -1472,7 +1544,12 @@ pub fn draw_upload_tab(f: &mut Frame, app: &App, area: Rect) {
 
     let hints = if app.publish_relay_edit {
         Line::from(vec![
-            Span::styled("Enter/Esc", Style::default().fg(COLOR_ACCENT).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Enter/Esc",
+                Style::default()
+                    .fg(COLOR_ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(": confirm relay URL"),
         ])
     } else if app.input_mode {
@@ -1546,7 +1623,11 @@ pub fn draw_upload_tab(f: &mut Frame, app: &App, area: Rect) {
 }
 
 pub fn draw_batch_tab(f: &mut Frame, app: &mut App, area: Rect) {
-    let running = if app.batch_running { " (running…)" } else { "" };
+    let running = if app.batch_running {
+        " (running…)"
+    } else {
+        ""
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" Batch Upload{running} "))
@@ -1565,23 +1646,45 @@ pub fn draw_batch_tab(f: &mut Frame, app: &mut App, area: Rect) {
 
     // Path input
     let input_style = if app.batch_input_mode {
-        Style::default().fg(COLOR_ACCENT).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(COLOR_ACCENT)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(COLOR_DIM)
     };
-    let input_title = if app.batch_input_mode { " Path (Esc: cancel) " } else { " Path (i: edit, Enter: add) " };
+    let input_title = if app.batch_input_mode {
+        " Path (Esc: cancel) "
+    } else {
+        " Path (i: edit, Enter: add) "
+    };
     let input = Paragraph::new(app.batch_input.as_str())
-        .block(Block::default().borders(Borders::ALL).title(input_title).border_style(input_style))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(input_title)
+                .border_style(input_style),
+        )
         .style(Style::default().fg(Color::White));
     f.render_widget(input, chunks[0]);
 
     if app.batch_input_mode {
-        f.set_cursor_position((chunks[0].x + app.batch_input.len() as u16 + 1, chunks[0].y + 1));
+        f.set_cursor_position((
+            chunks[0].x + app.batch_input.len() as u16 + 1,
+            chunks[0].y + 1,
+        ));
     }
 
     // Hints
-    let done = app.batch_items.iter().filter(|i| matches!(i.status, BatchStatus::Done(_))).count();
-    let failed = app.batch_items.iter().filter(|i| matches!(i.status, BatchStatus::Failed(_))).count();
+    let done = app
+        .batch_items
+        .iter()
+        .filter(|i| matches!(i.status, BatchStatus::Done(_)))
+        .count();
+    let failed = app
+        .batch_items
+        .iter()
+        .filter(|i| matches!(i.status, BatchStatus::Failed(_)))
+        .count();
     let hint = format!(
         " {} queued  {} done  {} failed  │  Enter: start upload  x: remove last",
         app.batch_items.len(),
@@ -1594,36 +1697,47 @@ pub fn draw_batch_tab(f: &mut Frame, app: &mut App, area: Rect) {
     );
 
     // Queue list
-    let rows: Vec<Row> = app.batch_items.iter().map(|item| {
-        let (status_text, status_style) = match &item.status {
-            BatchStatus::Pending => ("pending", Style::default().fg(COLOR_DIM)),
-            BatchStatus::Running => ("running…", Style::default().fg(Color::Yellow)),
-            BatchStatus::Done(_) => ("✓ done", Style::default().fg(COLOR_OK)),
-            BatchStatus::Failed(e) => {
-                let _ = e;
-                ("✗ failed", Style::default().fg(COLOR_ERR))
-            }
-        };
-        let path_display = if item.path.len() > 60 {
-            format!("…{}", &item.path[item.path.len() - 57..])
-        } else {
-            item.path.clone()
-        };
-        Row::new(vec![
-            Cell::from(path_display),
-            Cell::from(status_text).style(status_style),
-        ])
-    }).collect();
+    let rows: Vec<Row> = app
+        .batch_items
+        .iter()
+        .map(|item| {
+            let (status_text, status_style) = match &item.status {
+                BatchStatus::Pending => ("pending", Style::default().fg(COLOR_DIM)),
+                BatchStatus::Running => ("running…", Style::default().fg(Color::Yellow)),
+                BatchStatus::Done(_) => ("✓ done", Style::default().fg(COLOR_OK)),
+                BatchStatus::Failed(e) => {
+                    let _ = e;
+                    ("✗ failed", Style::default().fg(COLOR_ERR))
+                }
+            };
+            let path_display = if item.path.len() > 60 {
+                format!("…{}", &item.path[item.path.len() - 57..])
+            } else {
+                item.path.clone()
+            };
+            Row::new(vec![
+                Cell::from(path_display),
+                Cell::from(status_text).style(status_style),
+            ])
+        })
+        .collect();
 
     let widths = [Constraint::Min(40), Constraint::Length(12)];
-    let table = Table::new(rows, widths)
-        .header(
-            Row::new(vec![
-                Cell::from("Path").style(Style::default().fg(COLOR_ACCENT).add_modifier(Modifier::BOLD)),
-                Cell::from("Status").style(Style::default().fg(COLOR_ACCENT).add_modifier(Modifier::BOLD)),
-            ])
-            .bottom_margin(1),
-        );
+    let table = Table::new(rows, widths).header(
+        Row::new(vec![
+            Cell::from("Path").style(
+                Style::default()
+                    .fg(COLOR_ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Cell::from("Status").style(
+                Style::default()
+                    .fg(COLOR_ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])
+        .bottom_margin(1),
+    );
     f.render_widget(table, chunks[2]);
 }
 
@@ -1698,7 +1812,9 @@ pub fn draw_relay_tab(f: &mut Frame, app: &App, area: Rect) {
     let text = if app.relay_policy_loading {
         "Loading relay policy…".to_string()
     } else if let Some(e) = &app.relay_policy_error {
-        format!("Error: {e}\n\nPress 'r' to retry.\n\nNote: relay endpoints require blossom-nip34 to be running.")
+        format!(
+            "Error: {e}\n\nPress 'r' to retry.\n\nNote: relay endpoints require blossom-nip34 to be running."
+        )
     } else if let Some(policy) = &app.relay_policy {
         serde_json::to_string_pretty(policy).unwrap_or_else(|_| policy.to_string())
     } else {
@@ -1752,7 +1868,10 @@ pub fn draw_nip96_tab(f: &mut Frame, app: &App, area: Rect) {
             lines.push(format!("content_types:{types}"));
         }
         if let Some(plans) = info.get("plans") {
-            lines.push(format!("\nPlans:\n{}", serde_json::to_string_pretty(plans).unwrap_or_default()));
+            lines.push(format!(
+                "\nPlans:\n{}",
+                serde_json::to_string_pretty(plans).unwrap_or_default()
+            ));
         }
         if lines.is_empty() {
             serde_json::to_string_pretty(info).unwrap_or_else(|_| info.to_string())
@@ -1787,20 +1906,28 @@ pub fn draw_nip96_tab(f: &mut Frame, app: &App, area: Rect) {
         format!("Error: {e}\n\nNote: file listing requires authentication.")
     } else if let Some(files) = &app.nip96_files {
         // Try to extract file list from NIP-96 response
-        let items = files.get("files")
+        let items = files
+            .get("files")
             .or_else(|| files.get("data"))
             .and_then(|v| v.as_array());
         if let Some(arr) = items {
             if arr.is_empty() {
                 "(no files)".to_string()
             } else {
-                arr.iter().take(20).map(|f| {
-                    let hash = f.get("ox").or_else(|| f.get("x"))
-                        .and_then(|v| v.as_str()).unwrap_or("?");
-                    let mime = f.get("m").and_then(|v| v.as_str()).unwrap_or("?");
-                    let url = f.get("url").and_then(|v| v.as_str()).unwrap_or("");
-                    format!("{:.16}  {:<20}  {}", hash, mime, url)
-                }).collect::<Vec<_>>().join("\n")
+                arr.iter()
+                    .take(20)
+                    .map(|f| {
+                        let hash = f
+                            .get("ox")
+                            .or_else(|| f.get("x"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("?");
+                        let mime = f.get("m").and_then(|v| v.as_str()).unwrap_or("?");
+                        let url = f.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                        format!("{:.16}  {:<20}  {}", hash, mime, url)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
             }
         } else {
             serde_json::to_string_pretty(files).unwrap_or_else(|_| files.to_string())
@@ -1836,7 +1963,9 @@ pub fn draw_nip34_tab(f: &mut Frame, app: &mut App, area: Rect) {
         app.nip34_relay.clone()
     };
     let relay_style = if app.nip34_relay_edit {
-        Style::default().fg(COLOR_ACCENT).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(COLOR_ACCENT)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::White)
     };
@@ -1849,7 +1978,9 @@ pub fn draw_nip34_tab(f: &mut Frame, app: &mut App, area: Rect) {
         .borders(Borders::ALL)
         .title(relay_title)
         .border_style(if app.nip34_relay_edit {
-            Style::default().fg(COLOR_ACCENT).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(COLOR_ACCENT)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(COLOR_DIM)
         });
@@ -1860,11 +1991,18 @@ pub fn draw_nip34_tab(f: &mut Frame, app: &mut App, area: Rect) {
         chunks[0],
     );
     if app.nip34_relay_edit {
-        f.set_cursor_position((chunks[0].x + 1 + app.nip34_relay.len() as u16, chunks[0].y + 1));
+        f.set_cursor_position((
+            chunks[0].x + 1 + app.nip34_relay.len() as u16,
+            chunks[0].y + 1,
+        ));
     }
 
     // ── Status line ───────────────────────────────────────────────────────────
-    let status_color = if app.nip34_connected { COLOR_OK } else { COLOR_DIM };
+    let status_color = if app.nip34_connected {
+        COLOR_OK
+    } else {
+        COLOR_DIM
+    };
     f.render_widget(
         Paragraph::new(app.nip34_status.as_str()).style(Style::default().fg(status_color)),
         chunks[1],
@@ -1872,33 +2010,59 @@ pub fn draw_nip34_tab(f: &mut Frame, app: &mut App, area: Rect) {
 
     // ── Events table ──────────────────────────────────────────────────────────
     let header = Row::new(vec![
-        Cell::from("Kind").style(Style::default().fg(COLOR_ACCENT).add_modifier(Modifier::BOLD)),
-        Cell::from("ID").style(Style::default().fg(COLOR_ACCENT).add_modifier(Modifier::BOLD)),
-        Cell::from("Pubkey").style(Style::default().fg(COLOR_ACCENT).add_modifier(Modifier::BOLD)),
-        Cell::from("Created").style(Style::default().fg(COLOR_ACCENT).add_modifier(Modifier::BOLD)),
-        Cell::from("Preview").style(Style::default().fg(COLOR_ACCENT).add_modifier(Modifier::BOLD)),
-    ]).height(1).bottom_margin(0);
+        Cell::from("Kind").style(
+            Style::default()
+                .fg(COLOR_ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Cell::from("ID").style(
+            Style::default()
+                .fg(COLOR_ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Cell::from("Pubkey").style(
+            Style::default()
+                .fg(COLOR_ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Cell::from("Created").style(
+            Style::default()
+                .fg(COLOR_ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Cell::from("Preview").style(
+            Style::default()
+                .fg(COLOR_ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])
+    .height(1)
+    .bottom_margin(0);
 
-    let rows: Vec<Row> = app.nip34_events.iter().map(|ev| {
-        let ts = chrono_fmt_unix(ev.created_at);
-        Row::new(vec![
-            Cell::from(ev.kind_name()),
-            Cell::from(format!("{:.8}", ev.id)),
-            Cell::from(format!("{:.8}", ev.pubkey)),
-            Cell::from(ts),
-            Cell::from(ev.content_preview.as_str()),
-        ])
-    }).collect();
+    let rows: Vec<Row> = app
+        .nip34_events
+        .iter()
+        .map(|ev| {
+            let ts = chrono_fmt_unix(ev.created_at);
+            Row::new(vec![
+                Cell::from(ev.kind_name()),
+                Cell::from(format!("{:.8}", ev.id)),
+                Cell::from(format!("{:.8}", ev.pubkey)),
+                Cell::from(ts),
+                Cell::from(ev.content_preview.as_str()),
+            ])
+        })
+        .collect();
 
     let total = rows.len();
     let table = Table::new(
         rows,
         [
-            Constraint::Length(13),  // kind name
-            Constraint::Length(9),   // id prefix
-            Constraint::Length(9),   // pubkey prefix
-            Constraint::Length(11),  // created_at
-            Constraint::Min(20),     // preview
+            Constraint::Length(13), // kind name
+            Constraint::Length(9),  // id prefix
+            Constraint::Length(9),  // pubkey prefix
+            Constraint::Length(11), // created_at
+            Constraint::Min(20),    // preview
         ],
     )
     .header(header)
@@ -1908,7 +2072,11 @@ pub fn draw_nip34_tab(f: &mut Frame, app: &mut App, area: Rect) {
             .title(format!(" NIP-34 Events ({total}) "))
             .border_style(Style::default().fg(COLOR_ACCENT)),
     )
-    .row_highlight_style(Style::default().bg(COLOR_SELECTED_BG).add_modifier(Modifier::BOLD));
+    .row_highlight_style(
+        Style::default()
+            .bg(COLOR_SELECTED_BG)
+            .add_modifier(Modifier::BOLD),
+    );
 
     f.render_stateful_widget(table, chunks[2], &mut app.nip34_events_table);
 }
@@ -2034,7 +2202,9 @@ pub fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
     } else {
         let hints = match app.tab {
             0 => " r:refresh  d:delete  o:download  m:mirror  s:sort  /:filter  ↑↓/jk  Tab  ?  q",
-            1 => " i:edit-path  p:toggle-nip94  R:relay-url  Enter:upload  Esc:clear  Tab:next  ?:help  q:quit",
+            1 => {
+                " i:edit-path  p:toggle-nip94  R:relay-url  Enter:upload  Esc:clear  Tab:next  ?:help  q:quit"
+            }
             2 => " i:edit  Enter:add/start  x:remove-last  Tab:next  ?:help  q:quit",
             3 => " r:refresh  Tab:next  ?:help  q:quit",
             4 => " r:refresh  Tab:next  ?:help  q:quit",
@@ -2059,12 +2229,13 @@ pub fn draw_modal_input(f: &mut Frame, app: &App, area: Rect) {
     let (title, label) = match &app.modal {
         Some(Modal::Download { sha256 }) => (
             " Download Blob ",
-            format!("Save path for {}…{}:", &sha256[..8.min(sha256.len())], &sha256[sha256.len().saturating_sub(4)..]),
+            format!(
+                "Save path for {}…{}:",
+                &sha256[..8.min(sha256.len())],
+                &sha256[sha256.len().saturating_sub(4)..]
+            ),
         ),
-        Some(Modal::Mirror) => (
-            " Mirror Blob ",
-            "Remote URL to mirror:".to_string(),
-        ),
+        Some(Modal::Mirror) => (" Mirror Blob ", "Remote URL to mirror:".to_string()),
         None => return,
     };
 
@@ -2078,7 +2249,11 @@ pub fn draw_modal_input(f: &mut Frame, app: &App, area: Rect) {
 
     let inner_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(3), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ])
         .margin(1)
         .split(popup_area);
 
@@ -2094,7 +2269,11 @@ pub fn draw_modal_input(f: &mut Frame, app: &App, area: Rect) {
     );
 
     let input = Paragraph::new(app.modal_input.as_str())
-        .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(COLOR_ACCENT)))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(COLOR_ACCENT)),
+        )
         .style(Style::default().fg(Color::White));
     f.render_widget(input, inner_chunks[1]);
 
@@ -2267,14 +2446,14 @@ pub async fn run_loop(
                             app.modal = None;
                             app.modal_input.clear();
                         }
-                        KeyCode::Enter => {
-                            match &app.modal {
-                                Some(Modal::Download { .. }) => app.confirm_download(),
-                                Some(Modal::Mirror) => app.confirm_mirror(),
-                                None => {}
-                            }
+                        KeyCode::Enter => match &app.modal {
+                            Some(Modal::Download { .. }) => app.confirm_download(),
+                            Some(Modal::Mirror) => app.confirm_mirror(),
+                            None => {}
+                        },
+                        KeyCode::Backspace => {
+                            app.modal_input.pop();
                         }
-                        KeyCode::Backspace => { app.modal_input.pop(); }
                         KeyCode::Char(c) => app.modal_input.push(c),
                         _ => {}
                     }
@@ -2286,7 +2465,9 @@ pub async fn run_loop(
                     match key.code {
                         KeyCode::Esc => app.clear_filter(),
                         KeyCode::Enter => app.exit_filter_mode(),
-                        KeyCode::Backspace => { app.filter_str.pop(); }
+                        KeyCode::Backspace => {
+                            app.filter_str.pop();
+                        }
                         KeyCode::Char(c) => {
                             app.filter_str.push(c);
                             app.blobs_table.select(Some(0));
@@ -2349,7 +2530,9 @@ pub async fn run_loop(
                 if app.publish_relay_edit {
                     match key.code {
                         KeyCode::Esc | KeyCode::Enter => app.publish_relay_edit = false,
-                        KeyCode::Backspace => { app.publish_relay.pop(); }
+                        KeyCode::Backspace => {
+                            app.publish_relay.pop();
+                        }
                         KeyCode::Char(c) => app.publish_relay.push(c),
                         _ => {}
                     }
@@ -2359,7 +2542,9 @@ pub async fn run_loop(
                 if app.nip34_relay_edit {
                     match key.code {
                         KeyCode::Esc | KeyCode::Enter => app.nip34_relay_edit = false,
-                        KeyCode::Backspace => { app.nip34_relay.pop(); }
+                        KeyCode::Backspace => {
+                            app.nip34_relay.pop();
+                        }
                         KeyCode::Char(c) => app.nip34_relay.push(c),
                         _ => {}
                     }
@@ -2373,7 +2558,9 @@ pub async fn run_loop(
                             app.add_batch_path();
                             app.batch_input_mode = false;
                         }
-                        KeyCode::Backspace => { app.batch_input.pop(); }
+                        KeyCode::Backspace => {
+                            app.batch_input.pop();
+                        }
                         KeyCode::Char(c) => app.batch_input.push(c),
                         _ => {}
                     }
@@ -2429,7 +2616,9 @@ pub async fn run_loop(
                         KeyCode::Char('c') => app.connect_nip34_relay(),
                         KeyCode::Up | KeyCode::Char('k') => {
                             let i = app.nip34_events_table.selected().unwrap_or(0);
-                            if i > 0 { app.nip34_events_table.select(Some(i - 1)); }
+                            if i > 0 {
+                                app.nip34_events_table.select(Some(i - 1));
+                            }
                         }
                         KeyCode::Down | KeyCode::Char('j') => {
                             let i = app.nip34_events_table.selected().unwrap_or(0);
@@ -2473,7 +2662,9 @@ pub fn chrono_fmt_unix(ts: u64) -> String {
     loop {
         let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
         let days_in_year = if leap { 366 } else { 365 };
-        if d < days_in_year { break; }
+        if d < days_in_year {
+            break;
+        }
         d -= days_in_year;
         y += 1;
     }
@@ -2485,7 +2676,9 @@ pub fn chrono_fmt_unix(ts: u64) -> String {
     };
     let mut mo = 0usize;
     for &dim in &months {
-        if d < dim { break; }
+        if d < dim {
+            break;
+        }
         d -= dim;
         mo += 1;
     }
@@ -2582,4 +2775,3 @@ pub fn decode_secret_key(input: &str) -> Result<String, String> {
         Ok(input.to_string())
     }
 }
-
