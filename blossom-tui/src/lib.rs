@@ -8,6 +8,7 @@
 //! - **Status** — fetch and display `/status` JSON
 //! - **Keygen** — generate a fresh BIP-340 keypair
 
+use std::cmp::Reverse;
 use std::io::Stdout;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -37,6 +38,36 @@ pub const COLOR_ERR: Color = Color::Red;
 pub const COLOR_DIM: Color = Color::DarkGray;
 pub const COLOR_SELECTED_BG: Color = Color::Blue;
 pub const COLOR_TITLE_BG: Color = Color::DarkGray;
+
+// ── Sort/Filter ───────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SortField {
+    #[default]
+    Date,
+    Size,
+    Hash,
+    ContentType,
+}
+
+impl SortField {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Date => Self::Size,
+            Self::Size => Self::Hash,
+            Self::Hash => Self::ContentType,
+            Self::ContentType => Self::Date,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Date => "Date",
+            Self::Size => "Size",
+            Self::Hash => "Hash",
+            Self::ContentType => "Type",
+        }
+    }
+}
 
 // ── Modal ─────────────────────────────────────────────────────────────────────
 
@@ -88,6 +119,9 @@ pub struct App {
     pub blobs_table: TableState,
     pub blobs_loading: bool,
     pub blobs_error: Option<String>,
+    pub sort_field: SortField,
+    pub filter_str: String,
+    pub filter_mode: bool,
 
     // Upload tab
     pub upload_path: String,
@@ -132,6 +166,9 @@ impl App {
             blobs_table,
             blobs_loading: false,
             blobs_error: None,
+            sort_field: SortField::default(),
+            filter_str: String::new(),
+            filter_mode: false,
             upload_path: String::new(),
             upload_loading: false,
             upload_msg: None,
@@ -443,6 +480,30 @@ impl App {
         }
     }
 
+    /// Cycle sort field.
+    pub fn cycle_sort(&mut self) {
+        self.sort_field = self.sort_field.next();
+        self.blobs_table.select(Some(0));
+    }
+
+    /// Enter filter mode.
+    pub fn enter_filter_mode(&mut self) {
+        self.filter_mode = true;
+        self.blobs_table.select(Some(0));
+    }
+
+    /// Exit filter mode.
+    pub fn exit_filter_mode(&mut self) {
+        self.filter_mode = false;
+    }
+
+    /// Clear the current filter.
+    pub fn clear_filter(&mut self) {
+        self.filter_str.clear();
+        self.filter_mode = false;
+        self.blobs_table.select(Some(0));
+    }
+
     /// Open the download path prompt for the selected blob.
     pub fn prompt_download(&mut self) {
         let Some(idx) = self.blobs_table.selected() else { return };
@@ -627,7 +688,13 @@ pub fn draw_blobs_tab(f: &mut Frame, app: &mut App, area: Rect) {
         .as_deref()
         .map(|pk| format!(" — {}", &pk[..16.min(pk.len())]))
         .unwrap_or_default();
-    let title = format!(" Blobs{pubkey_label}{loading_suffix} ");
+    let sort_label = app.sort_field.label();
+    let filter_label = if app.filter_str.is_empty() {
+        String::new()
+    } else {
+        format!(" [filter: {}]", app.filter_str)
+    };
+    let title = format!(" Blobs{pubkey_label}{loading_suffix} │ sort:{sort_label}{filter_label} ");
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -635,6 +702,18 @@ pub fn draw_blobs_tab(f: &mut Frame, app: &mut App, area: Rect) {
         .border_style(Style::default().fg(COLOR_ACCENT));
     let inner = block.inner(area);
     f.render_widget(block, area);
+
+    if app.filter_mode {
+        let filter_area = Rect {
+            x: inner.x,
+            y: inner.y + inner.height.saturating_sub(1),
+            width: inner.width,
+            height: 1,
+        };
+        let filter_bar = Paragraph::new(format!("/{}", app.filter_str))
+            .style(Style::default().fg(Color::Yellow));
+        f.render_widget(filter_bar, filter_area);
+    }
 
     if let Some(err) = app.blobs_error.clone() {
         let msg = Paragraph::new(Span::styled(
@@ -661,32 +740,63 @@ pub fn draw_blobs_tab(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
+    // Apply filter
+    let filter_lc = app.filter_str.to_lowercase();
+    let mut visible: Vec<&BlobDescriptor> = app
+        .blobs
+        .iter()
+        .filter(|b| {
+            if filter_lc.is_empty() {
+                return true;
+            }
+            b.sha256.to_lowercase().contains(&filter_lc)
+                || b.content_type
+                    .as_deref()
+                    .unwrap_or("")
+                    .to_lowercase()
+                    .contains(&filter_lc)
+        })
+        .collect();
+
+    // Apply sort
+    match app.sort_field {
+        SortField::Date => visible.sort_by_key(|b| Reverse(b.uploaded.unwrap_or(0))),
+        SortField::Size => visible.sort_by_key(|b| Reverse(b.size)),
+        SortField::Hash => visible.sort_by(|a, b| a.sha256.cmp(&b.sha256)),
+        SortField::ContentType => visible.sort_by(|a, b| {
+            a.content_type
+                .as_deref()
+                .unwrap_or("")
+                .cmp(b.content_type.as_deref().unwrap_or(""))
+        }),
+    }
+
+    let sha_header_label = format!("SHA256");
+    let size_header_label = if app.sort_field == SortField::Size {
+        "Size ▲".to_string()
+    } else {
+        "Size".to_string()
+    };
+    let type_header_label = if app.sort_field == SortField::ContentType {
+        "Content-Type ▲".to_string()
+    } else {
+        "Content-Type".to_string()
+    };
+    let date_header_label = if app.sort_field == SortField::Date {
+        "Uploaded ▼".to_string()
+    } else {
+        "Uploaded".to_string()
+    };
+
     let header = Row::new(vec![
-        Cell::from("SHA256").style(
-            Style::default()
-                .add_modifier(Modifier::BOLD)
-                .fg(COLOR_ACCENT),
-        ),
-        Cell::from("Size").style(
-            Style::default()
-                .add_modifier(Modifier::BOLD)
-                .fg(COLOR_ACCENT),
-        ),
-        Cell::from("Content-Type").style(
-            Style::default()
-                .add_modifier(Modifier::BOLD)
-                .fg(COLOR_ACCENT),
-        ),
-        Cell::from("Uploaded").style(
-            Style::default()
-                .add_modifier(Modifier::BOLD)
-                .fg(COLOR_ACCENT),
-        ),
+        Cell::from(sha_header_label).style(Style::default().add_modifier(Modifier::BOLD).fg(COLOR_ACCENT)),
+        Cell::from(size_header_label).style(Style::default().add_modifier(Modifier::BOLD).fg(COLOR_ACCENT)),
+        Cell::from(type_header_label).style(Style::default().add_modifier(Modifier::BOLD).fg(COLOR_ACCENT)),
+        Cell::from(date_header_label).style(Style::default().add_modifier(Modifier::BOLD).fg(COLOR_ACCENT)),
     ])
     .bottom_margin(1);
 
-    let rows: Vec<Row> = app
-        .blobs
+    let rows: Vec<Row> = visible
         .iter()
         .map(|b| {
             let sha = if b.sha256.len() > 20 {
@@ -961,7 +1071,7 @@ pub fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
         ))
     } else {
         let hints = match app.tab {
-            0 => " r:refresh  d:delete  o:download  m:mirror  ↑↓/jk:navigate  Tab:next  ?:help  q:quit",
+            0 => " r:refresh  d:delete  o:download  m:mirror  s:sort  /:filter  ↑↓/jk  Tab  ?  q",
             1 => " i:edit-path  Enter:upload  Esc:clear  Tab:next  ?:help  q:quit",
             2 => " r:refresh  Tab:next  ?:help  q:quit",
             3 => " g:generate  Tab:next  ?:help  q:quit",
@@ -1088,6 +1198,14 @@ pub fn draw_help_popup(f: &mut Frame, area: Rect) {
             Span::styled("  m                ", y),
             Span::raw("Mirror blob from URL"),
         ]),
+        Line::from(vec![
+            Span::styled("  s                ", y),
+            Span::raw("Cycle sort (Date/Size/Hash/Type)"),
+        ]),
+        Line::from(vec![
+            Span::styled("  /                ", y),
+            Span::raw("Filter blobs (Enter confirm, Esc clear)"),
+        ]),
         Line::from(""),
         Line::from(Span::styled("  Upload tab", h)),
         Line::from(""),
@@ -1174,6 +1292,21 @@ pub async fn run_loop(
                     continue;
                 }
 
+                // Filter mode intercepts keys in Blobs tab
+                if app.filter_mode && app.tab == 0 {
+                    match key.code {
+                        KeyCode::Esc => app.clear_filter(),
+                        KeyCode::Enter => app.exit_filter_mode(),
+                        KeyCode::Backspace => { app.filter_str.pop(); }
+                        KeyCode::Char(c) => {
+                            app.filter_str.push(c);
+                            app.blobs_table.select(Some(0));
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 if (!app.input_mode && key.code == KeyCode::Char('q'))
                     || (key.modifiers.contains(KeyModifiers::CONTROL)
                         && key.code == KeyCode::Char('c'))
@@ -1232,6 +1365,8 @@ pub async fn run_loop(
                         KeyCode::Char('d') => app.delete_selected(),
                         KeyCode::Char('o') => app.prompt_download(),
                         KeyCode::Char('m') => app.prompt_mirror(),
+                        KeyCode::Char('s') => app.cycle_sort(),
+                        KeyCode::Char('/') => app.enter_filter_mode(),
                         _ => {}
                     },
                     1 => match key.code {
