@@ -107,6 +107,8 @@ pub enum AppMsg {
     Nip96InfoError(String),
     Nip96FilesLoaded(serde_json::Value),
     Nip96FilesError(String),
+    Nip94Published(String),  // relay URL
+    Nip94PublishError(String),
 }
 
 // ── Batch upload ──────────────────────────────────────────────────────────────
@@ -157,6 +159,9 @@ pub struct App {
     pub upload_msg: Option<String>,
     pub upload_ok: bool,
     pub input_mode: bool,
+    pub publish_nip94: bool,          // toggle: publish NIP-94 after upload
+    pub publish_relay: String,        // relay URL for NIP-94 publishing
+    pub publish_relay_edit: bool,     // editing relay URL field
 
     // Status tab
     pub status_data: Option<serde_json::Value>,
@@ -229,6 +234,9 @@ impl App {
             upload_msg: None,
             upload_ok: false,
             input_mode: false,
+            publish_nip94: false,
+            publish_relay: String::new(),
+            publish_relay_edit: false,
             status_data: None,
             status_loading: false,
             status_error: None,
@@ -408,6 +416,12 @@ impl App {
                 self.nip96_files_loading = false;
                 self.nip96_files_error = Some(e);
             }
+            AppMsg::Nip94Published(relay) => {
+                self.notification = Some((format!("NIP-94 event published to {relay}"), false));
+            }
+            AppMsg::Nip94PublishError(e) => {
+                self.notification = Some((format!("NIP-94 publish failed: {e}"), true));
+            }
         }
     }
 
@@ -464,6 +478,8 @@ impl App {
         let key = self.secret_key.clone().unwrap();
         let path = std::path::PathBuf::from(path_str);
         let tx = self.tx.clone();
+        let publish_nip94 = self.publish_nip94;
+        let publish_relay = self.publish_relay.trim().to_string();
 
         tokio::spawn(async move {
             let signer = match Signer::from_secret_hex(&key) {
@@ -474,10 +490,23 @@ impl App {
                     return;
                 }
             };
-            let client = BlossomClient::new(vec![server], signer);
+            let client = BlossomClient::new(vec![server.clone()], signer.clone());
             let mime = mime_from_path(&path);
             match client.upload_file(&path, &mime).await {
                 Ok(desc) => {
+                    // Optionally publish NIP-94 kind:1063 event
+                    if publish_nip94 && !publish_relay.is_empty() {
+                        let event = blossom_rs::nostr_events::build_file_metadata_event(
+                            &signer,
+                            &desc,
+                            &server,
+                            &mime,
+                        );
+                        match blossom_rs::nostr_events::publish_to_relay(&publish_relay, &event).await {
+                            Ok(()) => tx.send(AppMsg::Nip94Published(publish_relay)).ok(),
+                            Err(e) => tx.send(AppMsg::Nip94PublishError(e)).ok(),
+                        };
+                    }
                     tx.send(AppMsg::UploadDone(desc)).ok();
                 }
                 Err(e) => {
@@ -1203,6 +1232,7 @@ pub fn draw_upload_tab(f: &mut Frame, app: &App, area: Rect) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // file path input
+            Constraint::Length(3), // nip-94 publish row
             Constraint::Length(3), // controls hint
             Constraint::Min(3),    // result
         ])
@@ -1236,7 +1266,51 @@ pub fn draw_upload_tab(f: &mut Frame, app: &App, area: Rect) {
         ));
     }
 
-    let hints = if app.input_mode {
+    // NIP-94 publish row
+    let nip94_toggle = if app.publish_nip94 { "[x]" } else { "[ ]" };
+    let relay_label = if app.publish_relay.is_empty() {
+        "(set relay URL)".to_string()
+    } else {
+        app.publish_relay.clone()
+    };
+    let relay_style = if app.publish_relay_edit {
+        Style::default().fg(COLOR_ACCENT).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    let nip94_line = Line::from(vec![
+        Span::styled(
+            "  p",
+            Style::default().fg(COLOR_ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!(": Publish NIP-94 event {nip94_toggle}  relay: ")),
+        Span::styled(relay_label, relay_style),
+        Span::raw("  "),
+        Span::styled(
+            "R",
+            Style::default().fg(COLOR_ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(": edit relay URL"),
+    ]);
+    f.render_widget(
+        Paragraph::new(nip94_line)
+            .block(Block::default().borders(Borders::ALL).title(" NIP-94 Publish ")),
+        chunks[1],
+    );
+    if app.publish_relay_edit {
+        f.set_cursor_position((
+            chunks[1].x + 1 + "  p: Publish NIP-94 event [x]  relay: ".len() as u16
+                + app.publish_relay.len() as u16,
+            chunks[1].y + 1,
+        ));
+    }
+
+    let hints = if app.publish_relay_edit {
+        Line::from(vec![
+            Span::styled("Enter/Esc", Style::default().fg(COLOR_ACCENT).add_modifier(Modifier::BOLD)),
+            Span::raw(": confirm relay URL"),
+        ])
+    } else if app.input_mode {
         Line::from(vec![
             Span::styled(
                 "Enter",
@@ -1280,13 +1354,13 @@ pub fn draw_upload_tab(f: &mut Frame, app: &App, area: Rect) {
     };
     let hints_para =
         Paragraph::new(hints).block(Block::default().borders(Borders::ALL).title(" Controls "));
-    f.render_widget(hints_para, chunks[1]);
+    f.render_widget(hints_para, chunks[2]);
 
     if app.upload_loading {
         let loading = Paragraph::new("Uploading…")
             .block(Block::default().borders(Borders::ALL).title(" Result "))
             .style(Style::default().fg(COLOR_DIM));
-        f.render_widget(loading, chunks[2]);
+        f.render_widget(loading, chunks[3]);
     } else if let Some(msg) = &app.upload_msg {
         let style = if app.upload_ok {
             Style::default().fg(COLOR_OK)
@@ -1297,12 +1371,12 @@ pub fn draw_upload_tab(f: &mut Frame, app: &App, area: Rect) {
             .block(Block::default().borders(Borders::ALL).title(" Result "))
             .style(style)
             .wrap(Wrap { trim: false });
-        f.render_widget(result_para, chunks[2]);
+        f.render_widget(result_para, chunks[3]);
     } else {
         let placeholder = Paragraph::new("No upload yet.")
             .block(Block::default().borders(Borders::ALL).title(" Result "))
             .style(Style::default().fg(COLOR_DIM));
-        f.render_widget(placeholder, chunks[2]);
+        f.render_widget(placeholder, chunks[3]);
     }
 }
 
@@ -1701,7 +1775,7 @@ pub fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
     } else {
         let hints = match app.tab {
             0 => " r:refresh  d:delete  o:download  m:mirror  s:sort  /:filter  ↑↓/jk  Tab  ?  q",
-            1 => " i:edit-path  Enter:upload  Esc:clear  Tab:next  ?:help  q:quit",
+            1 => " i:edit-path  p:toggle-nip94  R:relay-url  Enter:upload  Esc:clear  Tab:next  ?:help  q:quit",
             2 => " i:edit  Enter:add/start  x:remove-last  Tab:next  ?:help  q:quit",
             3 => " r:refresh  Tab:next  ?:help  q:quit",
             4 => " r:refresh  Tab:next  ?:help  q:quit",
@@ -1997,6 +2071,16 @@ pub async fn run_loop(
                     continue;
                 }
 
+                if app.publish_relay_edit {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Enter => app.publish_relay_edit = false,
+                        KeyCode::Backspace => { app.publish_relay.pop(); }
+                        KeyCode::Char(c) => app.publish_relay.push(c),
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 if app.batch_input_mode {
                     match key.code {
                         KeyCode::Esc => app.batch_input_mode = false,
@@ -2025,6 +2109,8 @@ pub async fn run_loop(
                     },
                     1 => match key.code {
                         KeyCode::Char('i') => app.input_mode = true,
+                        KeyCode::Char('p') => app.publish_nip94 = !app.publish_nip94,
+                        KeyCode::Char('R') => app.publish_relay_edit = true,
                         KeyCode::Enter => app.start_upload(),
                         KeyCode::Esc => {
                             app.upload_path.clear();
