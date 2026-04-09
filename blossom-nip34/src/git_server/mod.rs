@@ -4,6 +4,8 @@
 //! Repositories are organized as `{npub}/{repo_name}.git` on the filesystem.
 
 pub mod command;
+pub mod pktline;
+pub mod validation;
 
 use std::sync::Arc;
 
@@ -141,23 +143,65 @@ async fn upload_pack(
     }
 }
 
-/// POST /{npub}/{repo}/git-receive-pack (auth required — must be repo owner)
+/// POST /{npub}/{repo}/git-receive-pack
+///
+/// GRASP push validation: checks ref updates against Nostr relay state
+/// (kind:30617 maintainers + kind:30618 expected refs).
+/// Also accepts optional `Authorization: Nostr <base64>` header for
+/// additional auth (not required per GRASP spec).
 async fn receive_pack(
     State(state): State<Arc<Nip34State>>,
     Path((npub, repo)): Path<(String, String)>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
-    // Verify Nostr auth — pusher must be the repo owner
-    if let Err(e) = verify_push_auth(&headers, &npub) {
-        return (StatusCode::FORBIDDEN, e).into_response();
-    }
-
     let repo_name = repo.trim_end_matches(".git");
     let repo_path = match state.repo_path(&npub, repo_name) {
         Some(p) if p.join("HEAD").exists() => p,
         _ => return (StatusCode::NOT_FOUND, "repository not found").into_response(),
     };
+
+    // Parse ref updates from the pkt-line body
+    let ref_updates = match pktline::parse_ref_updates(&body) {
+        Ok(updates) => updates,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
+
+    // Resolve author pubkey from npub
+    let author_hex = if npub.starts_with("npub1") {
+        match nostr::nips::nip19::FromBech32::from_bech32(&npub) {
+            Ok(pk) => nostr::PublicKey::to_hex(&pk),
+            Err(_) => return (StatusCode::BAD_REQUEST, "invalid npub").into_response(),
+        }
+    } else {
+        npub.clone()
+    };
+
+    // GRASP validation: check against relay state
+    // Optional: if Nostr auth header present, verify it as additional auth
+    let has_nostr_auth = verify_push_auth(&headers, &npub).is_ok();
+
+    if !has_nostr_auth {
+        // Fall back to GRASP relay-based validation
+        match validation::validate_push(&ref_updates, &state.database, &author_hex, repo_name).await
+        {
+            Ok(errors) if errors.is_empty() => {
+                // All refs accepted
+            }
+            Ok(errors) => {
+                let msg = errors
+                    .iter()
+                    .map(|(r, e)| format!("{}: {}", r, e))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return (StatusCode::FORBIDDEN, msg).into_response();
+            }
+            Err((status, msg)) => {
+                let sc = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                return (sc, msg).into_response();
+            }
+        }
+    }
 
     let git_cmd = command::GitCommand::new(&state.config.git_path, &repo_path);
 
