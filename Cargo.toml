@@ -133,8 +133,3 @@ rand = "0.8"
 tempfile = "3"
 proptest = "1"
 serial_test = "3"
-
-[[bin]]
-name = "blossom-tui"
-path = "src/bin/blossom-tui.rs"
-required-features = ["tui"]
