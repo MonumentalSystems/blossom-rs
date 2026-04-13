@@ -1,5 +1,6 @@
 use std::env;
 use std::path::PathBuf;
+use std::process::Command;
 
 fn main() {
     compile_xdelta3();
@@ -45,13 +46,25 @@ fn compile_xdelta3() {
 
     // Generate FFI bindings
     let mut bg_builder = bindgen::Builder::default();
+
+    // Fix: Attempt to find the clang resource directory to locate stdarg.h
+    if let Ok(output) = Command::new("clang").args(["-print-resource-dir"]).output() {
+        let res_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !res_path.is_empty() {
+            bg_builder = bg_builder.clang_arg(format!("-I{}/include", res_path));
+        }
+    }
+
     for &(key, val) in &defines {
         bg_builder = bg_builder.clang_arg(format!("-D{key}={val}"));
     }
+
     let bindings = bg_builder
         .header("vendor/xdelta3/xdelta3.h")
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         .allowlist_function("xd3_.*")
+        // Fix: Use a layout compatible with older libclang if necessary
+        .size_t_is_usize(true)
         .generate()
         .expect("Unable to generate xdelta3 bindings");
 
