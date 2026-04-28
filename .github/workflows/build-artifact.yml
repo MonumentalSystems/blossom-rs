@@ -143,23 +143,44 @@ jobs:
         with:
           arch: ${{ matrix.os.arch }}
           run-tests: 'false'
-      - uses: actions/cache@v4
+      - uses: actions/cache/restore@v4
+        id: cache-index
         with:
           path: ~/.cargo/registry/index
           key: index-${{ runner.os }}-${{ github.run_number }}
           restore-keys: |
             index-${{ runner.os }}-
       - run: cargo generate-lockfile && git diff
-      - uses: actions/cache@v4
+      - uses: actions/cache/restore@v4
+        id: cache-registry
         with:
           path: ~/.cargo/registry/cache
           key: registry-${{ runner.os }}-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.lock') }}
       - run: cargo fetch
-      - uses: actions/cache@v4
+      - uses: actions/cache/restore@v4
+        id: cache-target
         with:
           path: target
           key: target-${{ github.job }}-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.lock') }}
       - run: cargo test -j8 ${{ matrix.os.cargo_test_args }}
+      - name: Save cargo index cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cargo/registry/index
+          key: index-${{ runner.os }}-${{ github.run_number }}
+      - name: Save cargo registry cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cargo/registry/cache
+          key: registry-${{ runner.os }}-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.lock') }}
+      - name: Save target cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: target
+          key: target-${{ github.job }}-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}
 
   build-artifacts:
     needs: setup
@@ -316,7 +337,7 @@ jobs:
           ~/.cargo/git
           target
         # We use a unique key (adding run_id) so we don't collide with existing immutable keys
-        key: ${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}-${{ github.run_id }}
+        key: ${{ runner.os }}-${{ runner.arch }}-${{ matrix.toolchain }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}-${{ github.run_id }}
 
     - name: Bundle release (Unix)
       if: matrix.build != 'windows-x64'
