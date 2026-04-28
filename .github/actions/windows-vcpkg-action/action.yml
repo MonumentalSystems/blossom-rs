@@ -1,0 +1,115 @@
+## - name: Setup and Test
+##   uses: ./.github/actions/windows-vcpkg-action
+##   with:
+##     arch: 'x64'
+##     run-tests: 'true'
+##     install: 'true'
+#
+name: 'windows-vcpkg-action'
+description: 'Setup vcpkg, OpenSSL, and Perl with caching and maximum verbosity'
+inputs:
+  arch:
+    description: 'Target architecture (e.g., x64)'
+    required: true
+  run-tests:
+    description: 'Whether to run cargo test'
+    required: false
+    default: 'false'
+  install:
+    description: 'whether to run cargo install'
+    required: false
+    default: 'false'
+  path:
+    description: 'whether to run cargo install --path <path>'
+    required: false
+    default: '.'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set Environment and Verbosity
+      shell: pwsh
+      run: |
+        echo "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" | Out-File -FilePath $env:GITHUB_ENV -Append
+        echo "OPENSSL_NO_VENDOR=1" | Out-File -FilePath $env:GITHUB_ENV -Append
+        echo "VCPKG_KEEP_ENV_VARS=OPENSSL_NO_VENDOR;VCPKG_ROOT" | Out-File -FilePath $env:GITHUB_ENV -Append
+        echo "VCVARSALL_DEBUG=1" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+    - name: Restore vcpkg Cache
+      id: cache-vcpkg
+      uses: actions/cache/restore@v4
+      with:
+        path: |
+          ${{ env.VCPKG_INSTALLATION_ROOT }}/installed
+          ${{ env.VCPKG_INSTALLATION_ROOT }}/packages
+        key: ${{ runner.os }}-vcpkg-${{ inputs.arch }}-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-vcpkg-${{ inputs.arch }}-
+
+    - name: Install OpenSSL with vcpkg
+      if: steps.cache-vcpkg.outputs.cache-hit != 'true'
+      shell: pwsh
+      run: |
+        vcpkg install openssl:${{ inputs.arch }}-windows-static-md
+
+    - name: Save vcpkg Cache
+      if: steps.cache-vcpkg.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: |
+          ${{ env.VCPKG_INSTALLATION_ROOT }}/installed
+          ${{ env.VCPKG_INSTALLATION_ROOT }}/packages
+        key: ${{ runner.os }}-vcpkg-${{ inputs.arch }}-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Cache Strawberry Perl
+      id: cache-perl
+      uses: actions/cache@v4
+      with:
+        path: C:\Strawberry
+        key: ${{ runner.os }}-strawberry-perl-v1
+
+    - name: Install Strawberry Perl
+      # Combined conditions into a single 'if' key
+      if: runner.os == 'Windows' && steps.cache-perl.outputs.cache-hit != 'true'
+      shell: pwsh
+      run: |
+        choco install strawberryperl -y --verbose
+
+    - name: Set Perl Path
+      shell: pwsh
+      run: |
+        echo "C:\Strawberry\perl\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        echo "C:\Strawberry\c\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      if: runner.os == 'Windows'
+
+    - name: Install Perl modules
+      shell: pwsh
+      run: perl -MCPAN -e "install Locale::Maketext::Simple"
+      if: runner.os == 'Windows'
+
+    - name: Cache Cargo
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/bin/
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+          target/
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-
+
+    - name: Run cargo test -j8 --all-features
+      shell: pwsh
+      run: |
+        $env:VCPKGRS_DYNAMIC = "1"
+        cargo test --path . -vv --all-features
+      if: ${{ inputs.run-tests == 'true' }}
+
+    - name: Run cargo install --path .
+      shell: pwsh
+      run: |
+        $env:VCPKGRS_DYNAMIC = "1"
+        cargo install --path ${{ inputs.path }} -vv --all-features
+      if: ${{ inputs.install == 'true' }}
