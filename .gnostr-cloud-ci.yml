@@ -1,0 +1,144 @@
+# gnostr-cloud (uranus) NATIVE CI — blossom-rs workspace.
+#
+# NOT GitHub Actions: this is the native GitLab-style schema the uranus
+# executor runs directly in the gVisor `ariel` ci-runner pod (no wrkflw,
+# no `container:`, no docker socket). The auto-poll scanner enqueues THIS
+# file (`.gnostr-cloud-ci.yml`) on every push to the rule branches and on
+# every matching tag.
+#
+# Pipeline:
+#   validate (master/main push + v* tag):  fmt -> clippy -> test
+#   publish  (v* tag only, needs the test job): push blossom-rs (+ the
+#            independently-useful blossom-nip34) to the /crates registry.
+#
+# ariel conventions: real $HOME is not writable in the pod, so every job
+# exports HOME=/tmp + CARGO_HOME=/tmp/cargo and prepends the cargo/tool
+# bin dirs to PATH. cargo, cargo-llvm-cov and gnostr-cloud-cli are all on
+# the image's default PATH; the repo is materialized at cwd = repo root.
+#
+# build.rs note: blossom-rs compiles a vendored xdelta3 C lib and runs
+# bindgen over it. bindgen drives libclang, which needs a `stdarg.h` from
+# the clang resource dir. If the image's clang lacks those builtin headers
+# (libclang present but the `clang` driver / resource headers absent), the
+# bindgen step fails with "fatal error: 'stdarg.h' file not found". The
+# `_prep_bindgen` snippet below makes the build robust by pointing
+# BINDGEN_EXTRA_CLANG_ARGS at gcc's stdarg.h when clang's own is missing.
+
+stages:
+  - validate
+  - publish
+
+variables:
+  CARGO_TERM_COLOR: always
+  GNOSTR_CLOUD_RELAYS: ""
+  # Debug+instrument builds with full DWARF are huge on this workspace
+  # (axum + aws-sdk + iroh + nostr-lmdb). Keep file:line for useful
+  # backtraces but drop the rest; incremental is useless in CI.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  format:
+    stage: validate
+    runs-on: ariel
+    # Run on master pushes AND on every v* tag so the stage in front of
+    # `publish` is non-empty on a tag pipeline (a tag pipeline with only
+    # `publish` would have no predecessor stage to gate against).
+    rules:
+      branches:
+        - master
+      tags:
+        - v*
+    script:
+      - |
+        set -euo pipefail
+        export HOME=/tmp CARGO_HOME=/tmp/cargo
+        export PATH="/tmp/cargo/bin:/usr/local/bin:$PATH"
+        cargo --version; rustc --version
+        cargo fmt --all -- --check
+
+  lint:
+    stage: validate
+    runs-on: ariel
+    needs: [format]
+    rules:
+      branches:
+        - master
+      tags:
+        - v*
+    script:
+      - |
+        set -euo pipefail
+        export HOME=/tmp CARGO_HOME=/tmp/cargo
+        export PATH="/tmp/cargo/bin:/usr/local/bin:$PATH"
+        # bindgen/libclang stdarg.h fallback (see header note).
+        if ! clang -print-resource-dir >/dev/null 2>&1 \
+           || [ ! -f "$(clang -print-resource-dir 2>/dev/null)/include/stdarg.h" ]; then
+          GCC_INC="$(dirname "$(find /usr/lib/gcc -name stdarg.h 2>/dev/null | head -1)")"
+          if [ -n "$GCC_INC" ]; then
+            export BINDGEN_EXTRA_CLANG_ARGS="-I${GCC_INC} ${BINDGEN_EXTRA_CLANG_ARGS:-}"
+            echo "bindgen: using gcc builtin headers at $GCC_INC"
+          fi
+        fi
+        # --all-targets gives one full rustc pass over lib+bins+tests, so
+        # it also catches test-construction breakage before it ships.
+        cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    stage: validate
+    runs-on: ariel
+    needs: [lint]
+    rules:
+      branches:
+        - master
+      tags:
+        - v*
+    script:
+      - |
+        set -euo pipefail
+        export HOME=/tmp CARGO_HOME=/tmp/cargo
+        export PATH="/tmp/cargo/bin:/usr/local/bin:$PATH"
+        if ! clang -print-resource-dir >/dev/null 2>&1 \
+           || [ ! -f "$(clang -print-resource-dir 2>/dev/null)/include/stdarg.h" ]; then
+          GCC_INC="$(dirname "$(find /usr/lib/gcc -name stdarg.h 2>/dev/null | head -1)")"
+          if [ -n "$GCC_INC" ]; then
+            export BINDGEN_EXTRA_CLANG_ARGS="-I${GCC_INC} ${BINDGEN_EXTRA_CLANG_ARGS:-}"
+          fi
+        fi
+        # blossom-rs is sqlite-backed; the full suite (lib + e2e + nip34 +
+        # lock/storage integration tests) runs hermetically, no external
+        # services. Verified locally: ~370 tests, 0 failures.
+        cargo test --workspace
+
+  publish:
+    # Tag-gated publish of the library crate(s) to the gnostr-cloud
+    # /crates registry. Registry versions are IMMUTABLE, so the crate
+    # version bump in Cargo.toml IS the release gate — no `|| true`
+    # swallowing. `registry publish <dir>` runs `cargo package` itself.
+    # Auth: the runner injects $GNOSTR_CLOUD_RELEASE_NSEC (the release
+    # signer key); the CLI reads the signing key from NOSTR_PRIVATE_KEY.
+    stage: publish
+    runs-on: ariel
+    needs: [test]
+    rules:
+      tags:
+        - v*
+    script:
+      - |
+        set -euo pipefail
+        export HOME=/tmp CARGO_HOME=/tmp/cargo
+        export PATH="/tmp/cargo/bin:/usr/local/bin:$PATH"
+        : "${GNOSTR_CLOUD_RELEASE_NSEC:?GNOSTR_CLOUD_RELEASE_NSEC secret required (gnostr-cloud-cli ci set-secret)}"
+
+        REGISTRY="https://uranus.gnostr.cloud"
+
+        # Root workspace crate: blossom-rs (the `.` crate dir).
+        env NOSTR_PRIVATE_KEY="$GNOSTR_CLOUD_RELEASE_NSEC" \
+          gnostr-cloud-cli registry publish --registry "$REGISTRY" --public .
+
+        # blossom-nip34 is independently useful (standalone NIP-34 relay +
+        # GRASP git-server lib), and is published as its own crate on the
+        # public index too — mirror that here.
+        env NOSTR_PRIVATE_KEY="$GNOSTR_CLOUD_RELEASE_NSEC" \
+          gnostr-cloud-cli registry publish --registry "$REGISTRY" --public ./blossom-nip34

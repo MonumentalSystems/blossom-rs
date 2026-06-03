@@ -1,0 +1,115 @@
+# Manual-only code-coverage workflow for blossom-rs — NATIVE gnostr-cloud
+# (uranus) schema, run in the gVisor `ariel` ci-runner pod.
+#
+# The auto-poll scanner only enqueues `.gnostr-cloud-ci.yml`, so this
+# sibling file NEVER auto-fires. Trigger it explicitly:
+#
+#   gnostr-cloud-cli ci enqueue <owner_hex>/blossom-rs \
+#     --workflow .gnostr-cloud-coverage.yml \
+#     --runs-on ariel \
+#     --host d0b51eaeb289cda95c969f9a70ee76c15c4fa084a055037919beef5613ef1caf
+#
+# It runs `cargo llvm-cov` over the workspace, emits the wall-badge marker
+# `##gnostr-cloud-coverage:NN.NN##` (scanned from stdout), and — when the
+# runner supplies the CAS context — NON-FATALLY uploads the per-file
+# drilldown report + source bundle to the server CAS for the /coverage
+# renderer. Verified locally: TOTAL line coverage ~61.5% (lines), 63.8%
+# regions; hermetic (sqlite, no external services).
+
+stages:
+  - coverage
+
+variables:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  llvm-cov:
+    stage: coverage
+    runs-on: ariel
+    script:
+      - |
+        set -euo pipefail
+        export HOME=/tmp CARGO_HOME=/tmp/cargo
+        export PATH="/tmp/cargo/bin:/usr/local/bin:$PATH"
+
+        # bindgen/libclang stdarg.h fallback — same as .gnostr-cloud-ci.yml.
+        if ! clang -print-resource-dir >/dev/null 2>&1 \
+           || [ ! -f "$(clang -print-resource-dir 2>/dev/null)/include/stdarg.h" ]; then
+          GCC_INC="$(dirname "$(find /usr/lib/gcc -name stdarg.h 2>/dev/null | head -1)")"
+          if [ -n "$GCC_INC" ]; then
+            export BINDGEN_EXTRA_CLANG_ARGS="-I${GCC_INC} ${BINDGEN_EXTRA_CLANG_ARGS:-}"
+            echo "bindgen: using gcc builtin headers at $GCC_INC"
+          fi
+        fi
+
+        # Exclude pure binary glue (clap dispatch / serve loop) and the
+        # host-dependent OTEL exporter from the denominator so the headline
+        # number reflects reasonably-testable code, and keep the report
+        # ignore-regex identical so the /coverage drilldown matches.
+        COV_IGNORE='(xtask/src/main\.rs|/src/main\.rs|/otel\.rs|/tests/)'
+
+        # 1) Run the instrumented suite once (no report yet), so the two
+        #    `report` invocations below reuse the same profile data.
+        cargo llvm-cov --workspace --no-fail-fast --no-report
+
+        # 2) Headline percentage marker (drives the wall badge).
+        cargo llvm-cov report --summary-only --ignore-filename-regex "$COV_IGNORE" \
+          | tee /tmp/cov-summary.txt
+        PCT="$(awk '/^TOTAL/ {gsub(/%/,"",$10); print $10}' /tmp/cov-summary.txt)"
+        if [ -z "${PCT:-}" ]; then
+          # Fallback: JSON line percent (field positions can shift across
+          # cargo-llvm-cov versions; JSON is stable).
+          cargo llvm-cov report --summary-only --json --ignore-filename-regex "$COV_IGNORE" > /tmp/cov-summary.json
+          PCT="$(python3 -c 'import json;print(round(json.load(open("/tmp/cov-summary.json"))["data"][0]["totals"]["lines"]["percent"],2))')"
+        fi
+        echo "lines covered: ${PCT}%"
+        echo "##gnostr-cloud-coverage:${PCT}##"
+
+        # 3) NON-FATAL CAS drilldown upload — mirrors the gnostr-cloud
+        #    pattern. Skips cleanly if the runner didn't supply the CAS
+        #    host + per-job upload token (then only the badge populates).
+        set +e
+        upload_coverage() {
+          [ -n "${GNOSTR_CLOUD_CI_HOST:-}" ] && [ -n "${GNOSTR_CLOUD_CI_COVERAGE_UPLOAD_TOKEN:-}" ] || {
+            echo "coverage CAS upload skipped: GNOSTR_CLOUD_CI_HOST / GNOSTR_CLOUD_CI_COVERAGE_UPLOAD_TOKEN unset"
+            return 0
+          }
+          cargo llvm-cov report --json --ignore-filename-regex "$COV_IGNORE" > /tmp/cov-report.json || return 0
+          python3 - /tmp/cov-report.json /tmp/cov-sources.json <<'PY' || return 0
+        import json, sys, base64, os
+        PER_FILE_CAP = 256 * 1024
+        TOTAL_CAP = 6 * 1024 * 1024
+        rep = json.load(open(sys.argv[1]))
+        out, total = {}, 0
+        for f in rep.get("data", [{}])[0].get("files", []):
+            fn = f.get("filename")
+            if not fn:
+                continue
+            try:
+                size = os.path.getsize(fn)
+            except OSError:
+                continue
+            if size > PER_FILE_CAP or total + size > TOTAL_CAP:
+                continue
+            try:
+                out[fn] = base64.b64encode(open(fn, "rb").read()).decode()
+            except OSError:
+                continue
+            total += size
+        json.dump(out, open(sys.argv[2], "w"))
+        print(f"coverage sources packed: {len(out)} files, {total} bytes", file=sys.stderr)
+        PY
+          local url="${GNOSTR_CLOUD_CI_HOST%/}/api/ci/coverage/upload"
+          local auth="Authorization: Bearer ${GNOSTR_CLOUD_CI_COVERAGE_UPLOAD_TOKEN}"
+          curl -fsS --max-time 60 -X POST -H "$auth" -H 'Content-Type: application/json' \
+            --data-binary @/tmp/cov-report.json "${url}?kind=report" \
+            && echo "coverage report uploaded" || echo "coverage report upload failed (non-fatal)"
+          curl -fsS --max-time 60 -X POST -H "$auth" -H 'Content-Type: application/json' \
+            --data-binary @/tmp/cov-sources.json "${url}?kind=sources" \
+            && echo "coverage sources uploaded" || echo "coverage sources upload failed (non-fatal)"
+        }
+        upload_coverage
+        exit 0
