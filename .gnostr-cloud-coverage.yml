@@ -36,6 +36,11 @@ jobs:
         export PATH="/tmp/cargo/bin:/usr/local/bin:$PATH"
 
         # bindgen/libclang stdarg.h fallback — same as .gnostr-cloud-ci.yml.
+        LIBCLANG_DIR="$(dirname "$(find /usr/lib /usr/lib64 -name 'libclang*.so*' 2>/dev/null | head -1)")"
+        if [ -n "$LIBCLANG_DIR" ] && [ "$LIBCLANG_DIR" != "." ]; then
+          export LIBCLANG_PATH="$LIBCLANG_DIR"
+          echo "bindgen: LIBCLANG_PATH=$LIBCLANG_DIR"
+        fi
         if ! clang -print-resource-dir >/dev/null 2>&1 \
            || [ ! -f "$(clang -print-resource-dir 2>/dev/null)/include/stdarg.h" ]; then
           GCC_INC="$(dirname "$(find /usr/lib/gcc -name stdarg.h 2>/dev/null | head -1)")"
