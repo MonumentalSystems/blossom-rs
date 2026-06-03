@@ -57,8 +57,10 @@ jobs:
         COV_IGNORE='(xtask/src/main\.rs|/src/main\.rs|/otel\.rs|/tests/)'
 
         # 1) Run the instrumented suite once (no report yet), so the two
-        #    `report` invocations below reuse the same profile data.
-        cargo llvm-cov --workspace --no-fail-fast --no-report
+        #    `report` invocations below reuse the same profile data. Skip the
+        #    iroh n0-discovery e2e (test_iroh_*) — they can't NAT-punch in the
+        #    gVisor pod (hang ~440s then fail; see .gnostr-cloud-ci.yml).
+        cargo llvm-cov --workspace --no-fail-fast --no-report -- --skip test_iroh
 
         # 2) Headline percentage marker (drives the wall badge).
         cargo llvm-cov report --summary-only --ignore-filename-regex "$COV_IGNORE" \
