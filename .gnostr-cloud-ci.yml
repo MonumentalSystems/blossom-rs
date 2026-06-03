@@ -156,3 +156,13 @@ jobs:
         # public index too — mirror that here.
         env NOSTR_PRIVATE_KEY="$GNOSTR_CLOUD_RELEASE_NSEC" \
           gnostr-cloud-cli registry publish --registry "$REGISTRY" --public ./blossom-nip34
+
+        # blossom-server + blossom-cli (the API server + CLI client). Published
+        # AFTER blossom-rs/blossom-nip34 since they depend on them by
+        # version — the registry must already have those versions. The CLI
+        # resolves each member's exact .crate via `cargo metadata`, so naming
+        # the subdir is enough even in a workspace.
+        env NOSTR_PRIVATE_KEY="$GNOSTR_CLOUD_RELEASE_NSEC" \
+          gnostr-cloud-cli registry publish --registry "$REGISTRY" --public ./blossom-server
+        env NOSTR_PRIVATE_KEY="$GNOSTR_CLOUD_RELEASE_NSEC" \
+          gnostr-cloud-cli registry publish --registry "$REGISTRY" --public ./blossom-cli
