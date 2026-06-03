@@ -115,10 +115,15 @@ jobs:
             export BINDGEN_EXTRA_CLANG_ARGS="-I${GCC_INC} ${BINDGEN_EXTRA_CLANG_ARGS:-}"
           fi
         fi
-        # blossom-rs is sqlite-backed; the full suite (lib + e2e + nip34 +
-        # lock/storage integration tests) runs hermetically, no external
-        # services. Verified locally: ~370 tests, 0 failures.
-        cargo test --workspace
+        # blossom-rs is sqlite-backed; the lib + e2e + nip34 + lock/storage
+        # suites run hermetically (255 tests, 0 failures on ariel). The
+        # tests/iroh_integration.rs cases (test_iroh_*) need two iroh endpoints
+        # to discover each other over n0 DERP/QUIC — which the gVisor (runsc)
+        # ci-runner pod can't do (no UDP/NAT hole-punching; same in-pod iroh
+        # discovery limitation we hit elsewhere), so they hang on discovery
+        # timeouts (~440s) then fail. Skip them by name here; they're meant for
+        # a host with real networking (run locally / on a non-gVisor runner).
+        cargo test --workspace -- --skip test_iroh
 
   publish:
     # Tag-gated publish of the library crate(s) to the gnostr-cloud
