@@ -157,12 +157,13 @@ jobs:
         env NOSTR_PRIVATE_KEY="$GNOSTR_CLOUD_RELEASE_NSEC" \
           gnostr-cloud-cli registry publish --registry "$REGISTRY" --public ./blossom-nip34
 
-        # blossom-server + blossom-cli (the API server + CLI client). Published
-        # AFTER blossom-rs/blossom-nip34 since they depend on them by
-        # version — the registry must already have those versions. The CLI
-        # resolves each member's exact .crate via `cargo metadata`, so naming
-        # the subdir is enough even in a workspace.
-        env NOSTR_PRIVATE_KEY="$GNOSTR_CLOUD_RELEASE_NSEC" \
-          gnostr-cloud-cli registry publish --registry "$REGISTRY" --public ./blossom-server
-        env NOSTR_PRIVATE_KEY="$GNOSTR_CLOUD_RELEASE_NSEC" \
-          gnostr-cloud-cli registry publish --registry "$REGISTRY" --public ./blossom-cli
+        # NOTE: blossom-server + blossom-cli are NOT auto-published here. They
+        # depend on blossom-rs/blossom-nip34 BY VERSION, and `cargo package`
+        # resolves those deps against crates.io (their primary index, which
+        # lags our registry), so a fresh-version publish fails
+        # "failed to select a version for blossom-nip34". Publishing the apps
+        # to our registry would need their inter-crate deps pinned to
+        # `registry = "gnostr"` (which would break their crates.io release).
+        # The libraries (blossom-rs, blossom-nip34) are the registry-consumable
+        # artifacts; the apps live on crates.io. (They're on our /crates at
+        # 0.5.6 from the initial bootstrap, with descriptions.)
