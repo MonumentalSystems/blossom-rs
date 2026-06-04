@@ -38,6 +38,19 @@ variables:
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
   CARGO_PROFILE_TEST_DEBUG: line-tables-only
   CARGO_INCREMENTAL: "0"
+  # STABLE target dir = the actual sccache Rust-hit fix. The runner hands
+  # every job a fresh per-commit workdir; with the default `<workdir>/target`
+  # the dependency `-L`/`--extern`/`--out-dir` paths differ every run, so
+  # every Rust compile is a fresh sccache key -> "Cache hits rate (Rust)
+  # 0.00%" even with a warm cache. Pinning CARGO_TARGET_DIR to a persistent
+  # path under /cache (mounted on the ariel runner — these jobs run natively
+  # on ariel with no `container:`, so /cache is the host cache dir sccache
+  # writes to) makes all the registry-dep compiles — the bulk —
+  # sccache-cacheable across runs. The scripts export HOME=/tmp +
+  # CARGO_HOME=/tmp/cargo but NOT CARGO_TARGET_DIR, so this survives. The
+  # path is per-repo (ariel runs EVERY repo's lint job — a shared dir would
+  # thrash/corrupt across repos), so the leaf is this repo's slug.
+  CARGO_TARGET_DIR: /cache/ci-target/blossom-rs
 
 jobs:
   format:
