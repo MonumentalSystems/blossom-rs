@@ -27,6 +27,7 @@
 stages:
   - validate
   - publish
+  - release
 
 variables:
   CARGO_TERM_COLOR: always
@@ -157,13 +158,78 @@ jobs:
         env NOSTR_PRIVATE_KEY="$GNOSTR_CLOUD_RELEASE_NSEC" \
           gnostr-cloud-cli registry publish --registry "$REGISTRY" --public ./blossom-nip34
 
-        # NOTE: blossom-server + blossom-cli are NOT auto-published here. They
-        # depend on blossom-rs/blossom-nip34 BY VERSION, and `cargo package`
-        # resolves those deps against crates.io (their primary index, which
-        # lags our registry), so a fresh-version publish fails
-        # "failed to select a version for blossom-nip34". Publishing the apps
-        # to our registry would need their inter-crate deps pinned to
-        # `registry = "gnostr"` (which would break their crates.io release).
-        # The libraries (blossom-rs, blossom-nip34) are the registry-consumable
-        # artifacts; the apps live on crates.io. (They're on our /crates at
-        # 0.5.6 from the initial bootstrap, with descriptions.)
+        # NOTE: blossom-server + blossom-cli are NOT auto-published here as
+        # CRATES. They depend on blossom-rs/blossom-nip34 BY VERSION, and
+        # `cargo package` resolves those deps against crates.io (their primary
+        # index, which lags our registry), so a fresh-version crate publish
+        # fails "failed to select a version for blossom-nip34". Publishing the
+        # apps as crates to our registry would need their inter-crate deps
+        # pinned to `registry = "gnostr"` (which would break their crates.io
+        # release). The libraries (blossom-rs, blossom-nip34) are the
+        # registry-consumable CRATES; the apps live on crates.io. Their
+        # prebuilt EXECUTABLES are published as PUBLIC release BINARIES by the
+        # `release` stage below (attached to the blossom-rs crate version) — no
+        # cargo-package dep resolution involved, so the dual-registry wall
+        # doesn't apply.
+
+  release:
+    # Tag-gated PUBLIC binary release of the two executables (blossom-server
+    # daemon + blossom-cli) for this runner's native target, surfaced on
+    # /releases. A release binary is keyed by (crate, version, target); both
+    # executables attach to the already-published `blossom-rs` crate version
+    # (created by the `publish` job this stage `needs:`), distinguished by a
+    # binary-name-prefixed target label. `--public` makes them anonymously
+    # downloadable even though some blossom apps' source isn't on our index.
+    #
+    # Native target only (the ariel runner is aarch64-unknown-linux-gnu under
+    # gVisor); an x86_64 build would need a cross-toolchain stage / a non-gVisor
+    # x86_64 runner. Add more target jobs when those runners exist.
+    stage: release
+    runs-on: ariel
+    needs: [publish]
+    rules:
+      tags:
+        - v*
+    script:
+      - |
+        set -euo pipefail
+        export HOME=/tmp CARGO_HOME=/tmp/cargo
+        export PATH="/tmp/cargo/bin:/usr/local/bin:$PATH"
+        : "${GNOSTR_CLOUD_RELEASE_NSEC:?GNOSTR_CLOUD_RELEASE_NSEC secret required (gnostr-cloud-cli ci set-secret)}"
+
+        REGISTRY="https://uranus.gnostr.cloud"
+
+        # bindgen/libclang stdarg.h fallback — blossom-rs (a build dep of both
+        # apps) compiles vendored xdelta3 via bindgen (see header note).
+        LIBCLANG_DIR="$(dirname "$(find /usr/lib /usr/lib64 -name 'libclang*.so*' 2>/dev/null | head -1)")"
+        if [ -n "$LIBCLANG_DIR" ] && [ "$LIBCLANG_DIR" != "." ]; then
+          export LIBCLANG_PATH="$LIBCLANG_DIR"
+        fi
+        if ! clang -print-resource-dir >/dev/null 2>&1 \
+           || [ ! -f "$(clang -print-resource-dir 2>/dev/null)/include/stdarg.h" ]; then
+          GCC_INC="$(dirname "$(find /usr/lib/gcc -name stdarg.h 2>/dev/null | head -1)")"
+          if [ -n "$GCC_INC" ]; then
+            export BINDGEN_EXTRA_CLANG_ARGS="-I${GCC_INC} ${BINDGEN_EXTRA_CLANG_ARGS:-}"
+          fi
+        fi
+
+        # The crate version the binaries attach to = the just-published
+        # blossom-rs version (root Cargo.toml [package] version).
+        VERSION="$(cargo metadata --no-deps --format-version 1 \
+          | python3 -c 'import json,sys; m=json.load(sys.stdin); print(next(p["version"] for p in m["packages"] if p["name"]=="blossom-rs"))')"
+        TRIPLE="$(rustc -vV | awk '/^host:/ {print $2}')"
+        echo "release: blossom-rs@$VERSION target=$TRIPLE"
+
+        cargo build --release -p blossom-server -p blossom-cli
+
+        STAGE="$(mktemp -d)"
+        for BIN in blossom-server blossom-cli; do
+          test -x "target/release/$BIN"
+          tar czf "$STAGE/$BIN-$TRIPLE.tar.gz" -C target/release "$BIN"
+          env NOSTR_PRIVATE_KEY="$GNOSTR_CLOUD_RELEASE_NSEC" \
+            gnostr-cloud-cli registry upload-binary \
+              blossom-rs "$VERSION" "$BIN-$TRIPLE" \
+              "$STAGE/$BIN-$TRIPLE.tar.gz" \
+              --registry "$REGISTRY" --public
+          echo "published release binary: blossom-rs $VERSION $BIN-$TRIPLE"
+        done
