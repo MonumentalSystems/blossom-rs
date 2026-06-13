@@ -1,5 +1,18 @@
 name: build-artifact
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 on:
+  push:
+    branches:
+      - '**'
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - '**'
   workflow_call:
     inputs:
       os:
@@ -7,6 +20,16 @@ on:
         required: false
         default: 'all'
         type: string
+      toolchain:
+        description: 'Rust toolchain to use'
+        required: false
+        default: 'stable'
+        type: string
+      upload_to_release:
+        description: 'Upload packaged artifacts to GitHub release'
+        required: false
+        default: false
+        type: boolean
   workflow_dispatch:
     inputs:
       os:
@@ -23,10 +46,19 @@ on:
           - windows-x64
           - macos-x64
           - macos-arm64
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+      toolchain:
+        description: 'Rust toolchain to use'
+        required: false
+        default: stable
+        type: choice
+        options:
+          - stable
+          - nightly
+      upload_to_release:
+        description: 'Upload packaged artifacts to GitHub release'
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   setup:
@@ -42,9 +74,9 @@ jobs:
 
           ALL_TARGETS = [
             {"build": "linux-x64",       "os": "ubuntu-latest",  "target": "x86_64-unknown-linux-gnu",    "native": True},
-            #{"build": "linux-x64-musl",  "os": "ubuntu-latest",  "target": "x86_64-unknown-linux-musl",   "native": False},
-            #{"build": "linux-arm64",     "os": "ubuntu-latest",  "target": "aarch64-unknown-linux-gnu",   "native": False},
-            #{"build": "linux-arm64-musl","os": "ubuntu-latest",  "target": "aarch64-unknown-linux-musl",  "native": False},
+            {"build": "linux-x64-musl",  "os": "ubuntu-latest",  "target": "x86_64-unknown-linux-musl",   "native": False},
+            {"build": "linux-arm64",     "os": "ubuntu-latest",  "target": "aarch64-unknown-linux-gnu",   "native": False},
+            {"build": "linux-arm64-musl","os": "ubuntu-latest",  "target": "aarch64-unknown-linux-musl",  "native": False},
             {"build": "windows-x64",     "os": "windows-latest", "target": "x86_64-pc-windows-msvc",      "native": True},
             {"build": "macos-x64",       "os": "macos-15-intel", "target": "x86_64-apple-darwin",         "native": True},
             {"build": "macos-arm64",     "os": "macos-latest",   "target": "aarch64-apple-darwin",        "native": True},
@@ -52,16 +84,109 @@ jobs:
 
           selected = "${{ inputs.os }}" or "all"
           targets = ALL_TARGETS if selected == "all" else [t for t in ALL_TARGETS if t["build"] == selected]
-          matrix = {"build": [t["build"] for t in targets], "include": targets}
+          selected_toolchain = "${{ inputs.toolchain }}" or "stable"
+          matrix = {
+            "build": [t["build"] for t in targets],
+            "include": [{**t, "toolchain": selected_toolchain} for t in targets],
+          }
 
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
             f.write(f"matrix={json.dumps(matrix)}\n")
+
+  vcpkg-test:
+    strategy:
+      matrix:
+        os:
+          - runner: windows-latest
+            arch: x64
+            # All features supported on x64 Windows.
+            cargo_test_args: '--all-features'
+          - runner: windows-11-arm
+            arch: arm64
+            # Exclude the `labels` feature: its candle-* deps pull in
+            # gemm-f16 which emits `fullfp16` ARM SIMD instructions not
+            # available on the windows-11-arm runner.
+            cargo_test_args: '--features server,client,filesystem,s3,s3-compat,db-sqlite,db-postgres,media,iroh-transport,pkarr-discovery,otel'
+          - runner: ubuntu-latest
+            arch: x64
+            # All features supported on x64 Windows.
+            cargo_test_args: '--all-features'
+          - runner: ubuntu-latest
+            arch: arm64
+            # All features supported on x64 Windows.
+            cargo_test_args: '--all-features'
+          - runner: macos-latest
+            arch: x64
+            # All features supported on x64 Windows.
+            cargo_test_args: '--all-features'
+          - runner: macos-latest
+            arch: arm64
+            # All features supported on x64 Windows.
+            cargo_test_args: '--all-features'
+          - runner: macos-15-intel
+            arch: x64
+            # All features supported on x64 Windows.
+            cargo_test_args: '--all-features'
+          - runner: macos-15-intel
+            arch: arm64
+            # All features supported on x64 Windows.
+            cargo_test_args: '--all-features'
+      fail-fast: false
+    name: vcpkg-${{ matrix.os.runner }}-${{ matrix.os.arch }}
+    runs-on: ${{ matrix.os.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: sfackler/actions/rustup@master
+      - run: echo "version=$(rustc --version)" >> $GITHUB_OUTPUT
+        id: rust-version
+      - uses: ./.github/actions/vcpkg-action
+        with:
+          arch: ${{ matrix.os.arch }}
+          run-tests: 'false'
+      - uses: actions/cache/restore@v4
+        id: cache-index
+        with:
+          path: ~/.cargo/registry/index
+          key: index-${{ runner.os }}-${{ github.run_number }}
+          restore-keys: |
+            index-${{ runner.os }}-
+      - run: cargo generate-lockfile && git diff
+      - uses: actions/cache/restore@v4
+        id: cache-registry
+        with:
+          path: ~/.cargo/registry/cache
+          key: registry-${{ runner.os }}-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.lock') }}
+      - run: cargo fetch
+      - uses: actions/cache/restore@v4
+        id: cache-target
+        with:
+          path: target
+          key: target-${{ github.job }}-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.lock') }}
+      - run: cargo test -j8 ${{ matrix.os.cargo_test_args }}
+      - name: Save cargo index cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cargo/registry/index
+          key: index-${{ runner.os }}-${{ github.run_number }}
+      - name: Save cargo registry cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cargo/registry/cache
+          key: registry-${{ runner.os }}-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.lock') }}
+      - name: Save target cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: target
+          key: target-${{ github.job }}-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}
 
   build-artifacts:
     needs: setup
     runs-on: ${{ matrix.os }}
     permissions:
-      contents: read
+      contents: write
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
@@ -73,47 +198,66 @@ jobs:
         fetch-depth: 50
 
     - name: Set build name
-      shell: bash
-      run: |
-        SAFE_REF="${GITHUB_REF_NAME//\//-}"
-        echo "BUILD_NAME=blossom-${SAFE_REF}-${{ matrix.target }}" >> "$GITHUB_ENV"
+      uses: ./.github/actions/set-build-name
+      with:
+        toolchain: ${{ matrix.toolchain }}
+        target: ${{ matrix.target }}
 
     - name: Fetch tags
       run: git fetch --tags --force
 
-    - name: Cache
-      uses: actions/cache@v4
+    - name: Restore Cache
+      uses: actions/cache/restore@v4
       with:
         path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-        key: ${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-${{ runner.arch }}-${{ matrix.toolchain }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Install Linux system dependencies
       if: runner.os == 'Linux'
       run: |
         sudo apt-get update
         sudo apt-get install -y \
+          clang \
           libssl-dev \
           pkg-config \
           musl-tools \
           build-essential \
           llvm-dev \
-          libclang-dev \
-          clang \
+          musl-tools \
+          g++ \
+          musl-dev \
           clang-5.0 \
-          libclang-5.0-dev || sudo apt-get install -y libclang-dev
+          gcc-aarch64-linux-gnu \
+          g++-aarch64-linux-gnu \
+          libclang-5.0-dev || sudo apt-get install -y \
+          libclang-dev \
+          libssl-dev \
+          pkg-config \
+          gcc-aarch64-linux-gnu \
+          g++-aarch64-linux-gnu \
+          musl-tools \
+          build-essential \
+          llvm-dev \
+          musl-tools \
+          g++ \
+          musl-dev \
+          clang || echo "failed fall back "
 
     - name: Install macOS system dependencies
       if: runner.os == 'macOS'
       run: |
-        brew update
+        brew update && brew search llvm && brew search libclang
 
     - name: Install Windows system dependencies
       if: runner.os == 'Windows'
-      run: |
-        echo "TODO: install Windows specific deps if neccesary"
+      uses: ./.github/actions/vcpkg-action
+      with:
+        arch: x64
+        run-tests: 'false'
+        install: 'false'
 
     - name: Verify Xcode Command Line Tools
       if: runner.os == 'macOS'
@@ -124,29 +268,75 @@ jobs:
       with:
         tool: cross
 
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: ${{ matrix.toolchain }}
+
     - name: Set Clang Environment Variables
       shell: bash
       run: |
         if [[ "${{ runner.os }}" == "Linux" ]]; then
-          # Find the actual path of libclang.so to avoid 3.8.x fallbacks
-          SO_PATH=$(find /usr/lib -name "libclang.so*" | head -n 1)
-          if [ -n "$SO_PATH" ]; then
-            LIB_DIR=$(dirname "$SO_PATH")
+          if command -v llvm-config >/dev/null 2>&1; then
+            LIB_DIR="$(llvm-config --libdir)"
+          else
+            # Pick the newest installed libclang to avoid 3.8.x fallbacks.
+            SO_PATH=$(find /usr /usr/local -name "libclang.so*" 2>/dev/null | sort -V | tail -n 1)
+            LIB_DIR="$(dirname "$SO_PATH")"
+          fi
+          if [ -n "${LIB_DIR:-}" ] && [ -d "$LIB_DIR" ]; then
+            CLANG_RESOURCE_DIR=$(clang -print-resource-dir)
+            GCC_INCLUDE_DIR=$(gcc -print-file-name=include)
             echo "LIBCLANG_PATH=$LIB_DIR" >> $GITHUB_ENV
             # This helps bindgen find stdarg.h and other built-ins
-            echo "BINDGEN_EXTRA_CLANG_ARGS=-I$(clang -print-resource-dir)/include" >> $GITHUB_ENV
+            echo "BINDGEN_EXTRA_CLANG_ARGS=-I${CLANG_RESOURCE_DIR}/include -isystem ${GCC_INCLUDE_DIR}" >> $GITHUB_ENV
           fi
         fi
         echo $GITHUB_ENV && printenv
 
     - name: Build release binary
       shell: bash
+      env:
+        CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+        CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
       run: |
-        if [[ "${{ matrix.target }}" == "x86_64-unknown-linux-gnu" ]]; then
-          cargo build --verbose --release --locked --target ${{ matrix.target }} -p blossom-server -p blossom-cli
-        else
-          cross build --verbose --release --locked --target ${{ matrix.target }} -p blossom-server -p blossom-cli
+        if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" ]]; then
+          rustup target add ${{ matrix.target }} || true
+          cross build --verbose --release --locked --target ${{ matrix.target }} -p blossom-server -p blossom-cli --all-features || \
+          cargo build --verbose --release --locked --target ${{ matrix.target }} -p blossom-server -p blossom-cli --all-features
         fi
+        if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-musl" ]]; then
+          rustup target add ${{ matrix.target }} || true
+          rustup target add aarch64-linux-musl-gcc || true
+          cross build --verbose --release --locked --target ${{ matrix.target }} -p blossom-server -p blossom-cli --all-features || \
+          cargo build --verbose --release --locked --target ${{ matrix.target }} -p blossom-server -p blossom-cli --all-features
+        fi
+        if [[ "${{ matrix.target }}" == "x86_64-unknown-linux-musl" ]]; then
+          rustup target add ${{ matrix.target }} || true
+          rustup target add x86_64-unknown-linux-musl || true
+          cargo build --verbose --release --locked --target ${{ matrix.target }} -p blossom-server -p blossom-cli --all-features || \
+          cross build --verbose --release --locked --target ${{ matrix.target }} -p blossom-server -p blossom-cli --all-features
+        fi
+        if [[ "${{ matrix.target }}" == "x86_64-unknown-linux-gnu" ]]; then
+          rustup target add ${{ matrix.target }} || true
+          cargo build --verbose --release --locked --target ${{ matrix.target }} -p blossom-server -p blossom-cli --all-features || \
+          cargo build --verbose --release --locked --target ${{ matrix.target }} -p blossom-server -p blossom-cli --all-features
+        else
+          rustup target add ${{ matrix.target }} || true
+          cross build --verbose --release --locked --target ${{ matrix.target }} -p blossom-server -p blossom-cli --all-features || \
+          cargo build --verbose --release --locked --target ${{ matrix.target }} -p blossom-server -p blossom-cli --all-features
+        fi
+
+    - name: Save Cache
+      if: always() # This ensures cache is saved on failure, success, or cancel
+      uses: actions/cache/save@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        # We use a unique key (adding run_id) so we don't collide with existing immutable keys
+        key: ${{ runner.os }}-${{ runner.arch }}-${{ matrix.toolchain }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}-${{ github.run_id }}
 
     - name: Bundle release (Unix)
       if: matrix.build != 'windows-x64'
@@ -154,8 +344,8 @@ jobs:
       run: |
         mkdir -p "$BUILD_NAME"
         cp README.md LICENSE "$BUILD_NAME/"
-        cp "target/${{ matrix.target }}/release/blossom-server" "$BUILD_NAME/"
         cp "target/${{ matrix.target }}/release/blossom-cli" "$BUILD_NAME/"
+        cp "target/${{ matrix.target }}/release/blossom-server" "$BUILD_NAME/"
 
     - name: Bundle release (Windows)
       if: matrix.build == 'windows-x64'
@@ -163,25 +353,45 @@ jobs:
       run: |
         mkdir -p "$BUILD_NAME"
         cp README.md LICENSE "$BUILD_NAME/"
-        cp "target/${{ matrix.target }}/release/blossom-server.exe" "$BUILD_NAME/"
         cp "target/${{ matrix.target }}/release/blossom-cli.exe" "$BUILD_NAME/"
+        cp "target/${{ matrix.target }}/release/blossom-server.exe" "$BUILD_NAME/"
 
     - name: Run smoke test (Unix)
       if: matrix.native && matrix.build != 'windows-x64'
       shell: bash
       run: |
-        "$BUILD_NAME/blossom-server" --version
         "$BUILD_NAME/blossom-cli" --version
+        "$BUILD_NAME/blossom-server" --version
 
     - name: Run smoke test (Windows)
       if: matrix.native && matrix.build == 'windows-x64'
       shell: bash
       run: |
-        "$BUILD_NAME/blossom-server.exe" --version
         "$BUILD_NAME/blossom-cli.exe" --version
+        "$BUILD_NAME/blossom-server.exe" --version
 
     - name: Upload asset
       uses: actions/upload-artifact@v4
       with:
         name: ${{ env.BUILD_NAME }}
         path: ${{ env.BUILD_NAME }}
+
+    - name: Package and upload release asset
+      if: >-
+        startsWith(github.ref, 'refs/tags/v') ||
+        inputs.upload_to_release == true
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        TAG="${GITHUB_REF#refs/tags/}"
+        if [[ "${{ matrix.build }}" == "windows-x64" ]]; then
+          ASSET="${BUILD_NAME}.zip"
+          zip -r "$ASSET" "$BUILD_NAME"
+        else
+          ASSET="${BUILD_NAME}.tar.gz"
+          tar czf "$ASSET" "$BUILD_NAME"
+        fi
+        gh release view "$TAG" >/dev/null 2>&1 || \
+          gh release create "$TAG" --draft --title "$TAG" --notes ""
+        gh release upload "$TAG" "$ASSET" --clobber
