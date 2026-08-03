@@ -10,7 +10,7 @@ use tracing::{info, instrument, warn};
 
 use super::wire::{self, Op, Request, Response, Status};
 use crate::access::{Action, Role};
-use crate::auth::{verify_blossom_auth, verify_nip98_auth};
+use crate::auth::verify_blossom_auth;
 use crate::db::UploadRecord;
 use crate::lfs::{compress, reconstruct_blob, LfsContext, LfsFileVersion, LfsStorageType};
 use crate::locks::LockFilters;
@@ -19,6 +19,10 @@ use crate::server::{ServerState, SharedState};
 
 /// ALPN protocol identifier for Blossom over iroh.
 pub const BLOSSOM_ALPN: &[u8] = b"/blossom/1";
+const MAX_WIRE_HEADER: usize = 16 * 1024;
+const DEFAULT_MAX_IROH_BODY: u64 = 256 * 1024 * 1024;
+const STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const MAX_CONCURRENT_STREAMS: usize = 64;
 
 /// Blossom protocol handler for iroh connections.
 ///
@@ -30,12 +34,16 @@ pub const BLOSSOM_ALPN: &[u8] = b"/blossom/1";
 #[derive(Debug, Clone)]
 pub struct BlossomProtocol {
     state: SharedState,
+    streams: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 impl BlossomProtocol {
     /// Create a new protocol handler sharing the given `SharedState`.
     pub fn new(state: SharedState) -> Self {
-        Self { state }
+        Self {
+            state,
+            streams: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_STREAMS)),
+        }
     }
 }
 
@@ -45,6 +53,7 @@ impl ProtocolHandler for BlossomProtocol {
         conn: Connection,
     ) -> impl std::future::Future<Output = Result<(), AcceptError>> + Send {
         let state = self.state.clone();
+        let streams = self.streams.clone();
         async move {
             let remote = conn.remote_id();
             info!(peer.id = %remote, "iroh connection accepted");
@@ -55,7 +64,18 @@ impl ProtocolHandler for BlossomProtocol {
                     Err(_) => break,
                 };
                 let state = state.clone();
-                tokio::spawn(handle_stream(send, recv, state));
+                let permit = match streams.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        warn!(peer.id = %remote, "iroh stream concurrency limit reached");
+                        continue;
+                    }
+                };
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    let _ = tokio::time::timeout(STREAM_TIMEOUT, handle_stream(send, recv, state))
+                        .await;
+                });
             }
 
             Ok(())
@@ -77,6 +97,10 @@ async fn handle_stream(
         match recv.read(&mut tmp).await {
             Ok(Some(n)) => {
                 buf.extend_from_slice(&tmp[..n]);
+                if buf.len() > MAX_WIRE_HEADER {
+                    warn!("iroh request header exceeds limit");
+                    return;
+                }
                 if buf.contains(&b'\n') {
                     break;
                 }
@@ -105,10 +129,36 @@ async fn handle_stream(
         }
     };
 
-    // Read remaining body bytes for UPLOAD.
+    let max_body = state
+        .lock()
+        .await
+        .requirements
+        .max_size
+        .unwrap_or(DEFAULT_MAX_IROH_BODY);
+    if req.body_len > max_body {
+        let resp = Response {
+            status: Status::Error,
+            body_len: 0,
+            content_type: String::new(),
+            error: format!("body exceeds maximum of {max_body} bytes"),
+            descriptor: None,
+        };
+        let _ = send.write_all(&wire::encode_response(&resp)).await;
+        let _ = send.finish();
+        return;
+    }
+
+    // Read remaining body bytes for UPLOAD only after validating the length.
     let body = if req.op == Op::Upload && req.body_len > 0 {
         let mut already_read = buf[header_len..].to_vec();
-        let remaining = (req.body_len as usize).saturating_sub(already_read.len());
+        let body_len = match usize::try_from(req.body_len) {
+            Ok(len) => len,
+            Err(_) => return,
+        };
+        if already_read.len() > body_len {
+            return;
+        }
+        let remaining = body_len - already_read.len();
         if remaining > 0 {
             let mut rest = vec![0u8; remaining];
             if let Err(e) = recv.read_exact(&mut rest).await {
@@ -124,7 +174,7 @@ async fn handle_stream(
 
     // Verify auth if provided.
     let auth_pubkey = if !req.auth.is_empty() {
-        match verify_auth(&req.auth, &req.op) {
+        match verify_auth(&req.auth, &req) {
             Ok(pk) => Some(pk),
             Err(e) => {
                 let resp = Response {
@@ -142,6 +192,21 @@ async fn handle_stream(
     } else {
         None
     };
+
+    if matches!(req.op, Op::Get | Op::Head | Op::Delete | Op::Upload)
+        && !crate::server::is_valid_sha256(&req.sha256)
+    {
+        let resp = Response {
+            status: Status::Error,
+            body_len: 0,
+            content_type: String::new(),
+            error: "invalid SHA256 hash".into(),
+            descriptor: None,
+        };
+        let _ = send.write_all(&wire::encode_response(&resp)).await;
+        let _ = send.finish();
+        return;
+    }
 
     // Dispatch by operation.
     let mut s = state.lock().await;
@@ -185,15 +250,16 @@ fn parse_lfs_from_request(req: &Request) -> LfsContext {
     }
 }
 
-/// Verify auth from the wire protocol. Accepts both kind:24242 and kind:27235.
-fn verify_auth(auth_header: &str, op: &Op) -> Result<String, String> {
+/// Verify transport-specific Blossom auth. NIP-98 is HTTP-only and is not
+/// accepted on the iroh protocol.
+fn verify_auth(auth_header: &str, req: &Request) -> Result<String, String> {
     let b64 = auth_header.strip_prefix("Nostr ").unwrap_or(auth_header);
 
     let json_bytes = base64url_decode(b64).map_err(|e| format!("invalid auth encoding: {e}"))?;
     let event: NostrEvent =
         serde_json::from_slice(&json_bytes).map_err(|e| format!("invalid auth event: {e}"))?;
 
-    let action = match op {
+    let action = match &req.op {
         Op::Upload => "upload",
         Op::Delete => "delete",
         Op::Get => "get",
@@ -202,13 +268,107 @@ fn verify_auth(auth_header: &str, op: &Op) -> Result<String, String> {
         Op::LockCreate | Op::LockDelete | Op::LockList | Op::LockVerify => "lock",
     };
 
-    match event.kind {
-        24242 => verify_blossom_auth(&event, Some(action)).map_err(|e| e.to_string())?,
-        27235 => verify_nip98_auth(&event, None, None).map_err(|e| e.to_string())?,
-        _ => return Err(format!("unsupported auth kind: {}", event.kind)),
+    if event.kind != 24242 {
+        return Err("iroh requires a Blossom kind:24242 authorization event".into());
+    }
+    verify_blossom_auth(&event, Some(action)).map_err(|e| e.to_string())?;
+    if let Some(expected_binding) = request_auth_binding(req) {
+        let hashes: Vec<_> = event
+            .tags
+            .iter()
+            .filter(|tag| tag.len() == 2 && tag[0] == "x")
+            .collect();
+        if hashes.len() != 1 || hashes[0][1] != expected_binding {
+            return Err("authorization is not bound to this request".into());
+        }
+    }
+    if req.op == Op::Upload {
+        verify_lfs_auth_binding(&event, req)?;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if !mark_auth_event_once(&event.id, now) {
+        return Err("authorization event has already been used".into());
     }
 
     Ok(event.pubkey)
+}
+
+pub(super) fn request_auth_binding(req: &Request) -> Option<String> {
+    match &req.op {
+        Op::Upload | Op::Delete => Some(req.sha256.clone()),
+        Op::LockCreate => Some(crate::protocol::sha256_hex(
+            serde_json::to_vec(&("lock-create", &req.repo_id, &req.lock_path))
+                .unwrap_or_default()
+                .as_slice(),
+        )),
+        Op::LockDelete => Some(crate::protocol::sha256_hex(
+            serde_json::to_vec(&("lock-delete", &req.repo_id, &req.lock_id, req.force))
+                .unwrap_or_default()
+                .as_slice(),
+        )),
+        Op::LockVerify => Some(crate::protocol::sha256_hex(
+            serde_json::to_vec(&("lock-verify", &req.repo_id, &req.cursor, req.limit))
+                .unwrap_or_default()
+                .as_slice(),
+        )),
+        _ => None,
+    }
+}
+
+fn verify_lfs_auth_binding(event: &NostrEvent, req: &Request) -> Result<(), String> {
+    let unique = |name: &str| -> Result<Option<&str>, String> {
+        let tags: Vec<_> = event
+            .tags
+            .iter()
+            .filter(|tag| tag.first().is_some_and(|value| value == name))
+            .collect();
+        match tags.as_slice() {
+            [] => Ok(None),
+            [tag] if tag.len() == 2 => Ok(Some(tag[1].as_str())),
+            _ => Err(format!("malformed or duplicate {name} authorization tag")),
+        }
+    };
+    let lfs_tags = event
+        .tags
+        .iter()
+        .filter(|tag| {
+            tag.first()
+                .is_some_and(|value| value == "t" && tag.get(1).is_some_and(|value| value == "lfs"))
+        })
+        .count();
+    let manifest_tags = event
+        .tags
+        .iter()
+        .filter(|tag| tag.as_slice() == ["manifest"])
+        .count();
+    let matches = lfs_tags == usize::from(!req.lfs_path.is_empty() || !req.lfs_repo.is_empty())
+        && unique("path")? == (!req.lfs_path.is_empty()).then_some(req.lfs_path.as_str())
+        && unique("repo")? == (!req.lfs_repo.is_empty()).then_some(req.lfs_repo.as_str())
+        && unique("base")? == (!req.lfs_base.is_empty()).then_some(req.lfs_base.as_str())
+        && manifest_tags == usize::from(req.lfs_manifest);
+    if matches {
+        Ok(())
+    } else {
+        Err("authorization is not bound to this LFS context".into())
+    }
+}
+
+fn mark_auth_event_once(event_id: &str, now: u64) -> bool {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u64>>> =
+        std::sync::OnceLock::new();
+    let mut seen = SEEN
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    seen.retain(|_, expires_at| *expires_at > now);
+    if seen.contains_key(event_id) || seen.len() >= 10_000 {
+        return false;
+    }
+    seen.insert(event_id.to_string(), now.saturating_add(120));
+    true
 }
 
 async fn handle_get(send: &mut iroh::endpoint::SendStream, sha256: &str, state: &ServerState) {
@@ -347,7 +507,16 @@ async fn handle_upload(
         }
     }
 
-    if let Err(e) = state.database.check_quota(&pubkey, size) {
+    let additional_bytes = if state
+        .database
+        .is_upload_owner(&req.sha256, &pubkey)
+        .unwrap_or(false)
+    {
+        0
+    } else {
+        size
+    };
+    if let Err(e) = state.database.check_quota(&pubkey, additional_bytes) {
         let resp = Response {
             status: Status::Forbidden,
             body_len: 0,
@@ -361,6 +530,17 @@ async fn handle_upload(
 
     let original_sha256 = crate::protocol::sha256_hex(&data);
     let original_size = size;
+    if original_sha256 != req.sha256 {
+        let resp = Response {
+            status: Status::Error,
+            body_len: 0,
+            content_type: String::new(),
+            error: "upload body SHA256 does not match request".into(),
+            descriptor: None,
+        };
+        let _ = send.write_all(&wire::encode_response(&resp)).await;
+        return;
+    }
 
     let lfs_ctx = parse_lfs_from_request(req);
 
@@ -435,9 +615,22 @@ async fn handle_upload(
         let desc =
             crate::storage::make_descriptor_from_hash(&original_sha256, original_size, &base_url);
         if !state.backend.exists(&original_sha256) {
-            state
-                .backend
-                .insert_with_hash(stored_data, &original_sha256, original_size, &base_url);
+            if let Err(error) = state.backend.try_insert_with_hash(
+                stored_data,
+                &original_sha256,
+                original_size,
+                &base_url,
+            ) {
+                let resp = Response {
+                    status: Status::Error,
+                    body_len: 0,
+                    content_type: String::new(),
+                    error: format!("storage write failed: {error}"),
+                    descriptor: None,
+                };
+                let _ = send.write_all(&wire::encode_response(&resp)).await;
+                return;
+            }
         }
         desc
     };
@@ -488,7 +681,17 @@ async fn handle_upload(
         created_at: descriptor.uploaded.unwrap_or(0),
         phash: None,
     };
-    let _ = state.database.record_upload(&record);
+    if let Err(error) = state.database.record_upload(&record) {
+        let resp = Response {
+            status: Status::Error,
+            body_len: 0,
+            content_type: String::new(),
+            error: format!("metadata write failed: {error}"),
+            descriptor: None,
+        };
+        let _ = send.write_all(&wire::encode_response(&resp)).await;
+        return;
+    }
 
     info!(
         blob.sha256 = %descriptor.sha256,
@@ -541,21 +744,59 @@ async fn handle_delete(
         return;
     }
 
-    // Members may only delete their own blobs. Anonymous uploads can be
-    // deleted by anyone.
+    // Members remove only their own ownership reference. Keep shared content
+    // until its final owner removes it.
     if role != Role::Admin {
-        if let Ok(record) = state.database.get_upload(sha256) {
-            if record.pubkey != "anonymous" && record.pubkey != pubkey {
+        if !state
+            .database
+            .is_upload_owner(sha256, &pubkey)
+            .unwrap_or(false)
+        {
+            let resp = Response {
+                status: Status::Forbidden,
+                body_len: 0,
+                content_type: String::new(),
+                error: "not the blob owner".into(),
+                descriptor: None,
+            };
+            let _ = send.write_all(&wire::encode_response(&resp)).await;
+            return;
+        }
+        let owner_count = match state.database.upload_owner_count(sha256) {
+            Ok(count) => count,
+            Err(_) => {
                 let resp = Response {
-                    status: Status::Forbidden,
+                    status: Status::Error,
                     body_len: 0,
                     content_type: String::new(),
-                    error: "not the blob owner".into(),
+                    error: "failed to count blob owners".into(),
                     descriptor: None,
                 };
                 let _ = send.write_all(&wire::encode_response(&resp)).await;
                 return;
             }
+        };
+        if owner_count > 1 && state.database.delete_upload_owner(sha256, &pubkey).is_err() {
+            let resp = Response {
+                status: Status::Error,
+                body_len: 0,
+                content_type: String::new(),
+                error: "failed to update blob ownership".into(),
+                descriptor: None,
+            };
+            let _ = send.write_all(&wire::encode_response(&resp)).await;
+            return;
+        }
+        if owner_count > 1 {
+            let resp = Response {
+                status: Status::Ok,
+                body_len: 0,
+                content_type: String::new(),
+                error: String::new(),
+                descriptor: None,
+            };
+            let _ = send.write_all(&wire::encode_response(&resp)).await;
+            return;
         }
     }
 
@@ -580,48 +821,91 @@ async fn handle_delete(
             if let Some(base_decompressed) = base_decompressed_opt {
                 let compressed = compress::compress(&base_decompressed)
                     .unwrap_or_else(|_| base_decompressed.clone());
-                state.backend.insert_with_hash(
+                if let Err(error) = state.backend.try_insert_with_hash(
                     compressed,
                     &delta_version.sha256,
                     delta_version.original_size as u64,
                     &base_url_clone,
-                );
+                ) {
+                    let resp = Response {
+                        status: Status::Error,
+                        body_len: 0,
+                        content_type: String::new(),
+                        error: format!("delta rebase storage failed: {error}"),
+                        descriptor: None,
+                    };
+                    let _ = send.write_all(&wire::encode_response(&resp)).await;
+                    return;
+                }
                 if let Some(ref mut lfs_db) = state.lfs_version_db {
-                    let _ = lfs_db.update_version(
+                    if let Err(error) = lfs_db.update_version(
                         &delta_version.sha256,
                         LfsStorageType::Compressed,
                         None,
                         base_decompressed.len() as i64,
-                    );
+                    ) {
+                        let resp = Response {
+                            status: Status::Error,
+                            body_len: 0,
+                            content_type: String::new(),
+                            error: format!("delta metadata update failed: {error}"),
+                            descriptor: None,
+                        };
+                        let _ = send.write_all(&wire::encode_response(&resp)).await;
+                        return;
+                    }
                 }
             }
         }
     }
 
-    if state.backend.delete(sha256) {
-        let _ = state.database.delete_upload(sha256);
+    match state.backend.try_delete(sha256) {
+        Ok(true) => {
+            if let Err(error) = state.database.delete_upload(sha256) {
+                let resp = Response {
+                    status: Status::Error,
+                    body_len: 0,
+                    content_type: String::new(),
+                    error: format!("metadata delete failed: {error}"),
+                    descriptor: None,
+                };
+                let _ = send.write_all(&wire::encode_response(&resp)).await;
+                return;
+            }
 
-        if let Some(ref mut lfs_db) = state.lfs_version_db {
-            let _ = lfs_db.delete_by_sha256(sha256);
+            if let Some(ref mut lfs_db) = state.lfs_version_db {
+                let _ = lfs_db.delete_by_sha256(sha256);
+            }
+
+            let resp = Response {
+                status: Status::Ok,
+                body_len: 0,
+                content_type: String::new(),
+                error: String::new(),
+                descriptor: None,
+            };
+            let _ = send.write_all(&wire::encode_response(&resp)).await;
         }
-
-        let resp = Response {
-            status: Status::Ok,
-            body_len: 0,
-            content_type: String::new(),
-            error: String::new(),
-            descriptor: None,
-        };
-        let _ = send.write_all(&wire::encode_response(&resp)).await;
-    } else {
-        let resp = Response {
-            status: Status::NotFound,
-            body_len: 0,
-            content_type: String::new(),
-            error: "not found".into(),
-            descriptor: None,
-        };
-        let _ = send.write_all(&wire::encode_response(&resp)).await;
+        Ok(false) => {
+            let resp = Response {
+                status: Status::NotFound,
+                body_len: 0,
+                content_type: String::new(),
+                error: "not found".into(),
+                descriptor: None,
+            };
+            let _ = send.write_all(&wire::encode_response(&resp)).await;
+        }
+        Err(error) => {
+            let resp = Response {
+                status: Status::Error,
+                body_len: 0,
+                content_type: String::new(),
+                error: format!("storage delete failed: {error}"),
+                descriptor: None,
+            };
+            let _ = send.write_all(&wire::encode_response(&resp)).await;
+        }
     }
 }
 
@@ -783,7 +1067,7 @@ async fn handle_lock_delete(
         }
     };
 
-    let force = req.force || is_admin;
+    let force = req.force && is_admin;
 
     match lock_db.delete_lock(&req.repo_id, &req.lock_id, force, &pubkey) {
         Ok(record) => {

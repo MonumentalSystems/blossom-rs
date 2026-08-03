@@ -3,7 +3,7 @@
 //! Tests the full HTTP lock API against an in-memory Blossom server
 //! with a MemoryLockDatabase.
 
-use blossom_rs::auth::{auth_header_value, build_blossom_auth, Signer};
+use blossom_rs::auth::{auth_header_value, build_blossom_auth_for_request, Signer};
 use blossom_rs::locks::MemoryLockDatabase;
 use blossom_rs::server::BlobServer;
 use blossom_rs::storage::MemoryBackend;
@@ -19,16 +19,25 @@ fn no_lock_server() -> BlobServer {
     BlobServer::new(MemoryBackend::new(), "http://localhost:3000")
 }
 
-fn lock_auth(signer: &Signer) -> String {
-    let event = build_blossom_auth(signer, "lock", None, None, "");
+fn lock_auth(signer: &Signer, server_url: &str, path: &str, method: &str) -> String {
+    let event = build_blossom_auth_for_request(
+        signer,
+        "lock",
+        None,
+        server_url,
+        &format!("{server_url}{path}"),
+        method,
+        "",
+    );
     auth_header_value(&event)
 }
 
 async fn spawn_server(server: BlobServer) -> String {
-    let app = server.router();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let url = format!("http://{}", addr);
+    server.shared_state().lock().await.set_base_url(url.clone());
+    let app = server.router();
     tokio::spawn(async move { axum::serve(listener, app).await.ok() });
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     url
@@ -39,7 +48,7 @@ async fn test_create_lock() {
     let server = lock_server();
     let url = spawn_server(server).await;
     let signer = Signer::generate();
-    let auth = lock_auth(&signer);
+    let auth = lock_auth(&signer, &url, "/lfs/myrepo/locks", "POST");
 
     let resp = reqwest::Client::new()
         .post(format!("{}/lfs/myrepo/locks", url))
@@ -63,14 +72,15 @@ async fn test_create_lock_conflict() {
     let server = lock_server();
     let url = spawn_server(server).await;
     let signer = Signer::generate();
-    let auth = lock_auth(&signer);
-
     let client = reqwest::Client::new();
     let path = format!("{}/lfs/myrepo/locks", url);
 
     let resp1 = client
         .post(&path)
-        .header("Authorization", &auth)
+        .header(
+            "Authorization",
+            lock_auth(&signer, &url, "/lfs/myrepo/locks", "POST"),
+        )
         .json(&serde_json::json!({"path": "file.txt"}))
         .send()
         .await
@@ -79,7 +89,10 @@ async fn test_create_lock_conflict() {
 
     let resp2 = client
         .post(&path)
-        .header("Authorization", &auth)
+        .header(
+            "Authorization",
+            lock_auth(&signer, &url, "/lfs/myrepo/locks", "POST"),
+        )
         .json(&serde_json::json!({"path": "file.txt"}))
         .send()
         .await
@@ -107,13 +120,14 @@ async fn test_create_lock_different_repos_same_path() {
     let server = lock_server();
     let url = spawn_server(server).await;
     let signer = Signer::generate();
-    let auth = lock_auth(&signer);
-
     let client = reqwest::Client::new();
 
     let resp1 = client
         .post(format!("{}/lfs/repo1/locks", url))
-        .header("Authorization", &auth)
+        .header(
+            "Authorization",
+            lock_auth(&signer, &url, "/lfs/repo1/locks", "POST"),
+        )
         .json(&serde_json::json!({"path": "file.txt"}))
         .send()
         .await
@@ -122,7 +136,10 @@ async fn test_create_lock_different_repos_same_path() {
 
     let resp2 = client
         .post(format!("{}/lfs/repo2/locks", url))
-        .header("Authorization", &auth)
+        .header(
+            "Authorization",
+            lock_auth(&signer, &url, "/lfs/repo2/locks", "POST"),
+        )
         .json(&serde_json::json!({"path": "file.txt"}))
         .send()
         .await
@@ -135,13 +152,14 @@ async fn test_unlock_by_owner() {
     let server = lock_server();
     let url = spawn_server(server).await;
     let signer = Signer::generate();
-    let auth = lock_auth(&signer);
-
     let client = reqwest::Client::new();
 
     let create_resp: serde_json::Value = client
         .post(format!("{}/lfs/myrepo/locks", url))
-        .header("Authorization", &auth)
+        .header(
+            "Authorization",
+            lock_auth(&signer, &url, "/lfs/myrepo/locks", "POST"),
+        )
         .json(&serde_json::json!({"path": "file.txt"}))
         .send()
         .await
@@ -154,7 +172,15 @@ async fn test_unlock_by_owner() {
 
     let unlock_resp = client
         .post(format!("{}/lfs/myrepo/locks/{}/unlock", url, lock_id))
-        .header("Authorization", &auth)
+        .header(
+            "Authorization",
+            lock_auth(
+                &signer,
+                &url,
+                &format!("/lfs/myrepo/locks/{lock_id}/unlock"),
+                "POST",
+            ),
+        )
         .json(&serde_json::json!({"force": false}))
         .send()
         .await
@@ -176,7 +202,10 @@ async fn test_unlock_by_non_owner_forbidden() {
 
     let create_resp: serde_json::Value = client
         .post(format!("{}/lfs/myrepo/locks", url))
-        .header("Authorization", lock_auth(&owner))
+        .header(
+            "Authorization",
+            lock_auth(&owner, &url, "/lfs/myrepo/locks", "POST"),
+        )
         .json(&serde_json::json!({"path": "file.txt"}))
         .send()
         .await
@@ -189,7 +218,15 @@ async fn test_unlock_by_non_owner_forbidden() {
 
     let unlock_resp = client
         .post(format!("{}/lfs/myrepo/locks/{}/unlock", url, lock_id))
-        .header("Authorization", lock_auth(&other))
+        .header(
+            "Authorization",
+            lock_auth(
+                &other,
+                &url,
+                &format!("/lfs/myrepo/locks/{lock_id}/unlock"),
+                "POST",
+            ),
+        )
         .json(&serde_json::json!({"force": false}))
         .send()
         .await
@@ -203,11 +240,17 @@ async fn test_unlock_not_found() {
     let server = lock_server();
     let url = spawn_server(server).await;
     let signer = Signer::generate();
-    let auth = lock_auth(&signer);
-
     let resp = reqwest::Client::new()
         .post(format!("{}/lfs/myrepo/locks/nonexistent-id/unlock", url))
-        .header("Authorization", auth)
+        .header(
+            "Authorization",
+            lock_auth(
+                &signer,
+                &url,
+                "/lfs/myrepo/locks/nonexistent-id/unlock",
+                "POST",
+            ),
+        )
         .json(&serde_json::json!({"force": false}))
         .send()
         .await
@@ -221,12 +264,14 @@ async fn test_list_locks() {
     let server = lock_server();
     let url = spawn_server(server).await;
     let signer = Signer::generate();
-    let auth = lock_auth(&signer);
     let client = reqwest::Client::new();
 
     client
         .post(format!("{}/lfs/myrepo/locks", url))
-        .header("Authorization", &auth)
+        .header(
+            "Authorization",
+            lock_auth(&signer, &url, "/lfs/myrepo/locks", "POST"),
+        )
         .json(&serde_json::json!({"path": "a.txt"}))
         .send()
         .await
@@ -234,7 +279,10 @@ async fn test_list_locks() {
 
     client
         .post(format!("{}/lfs/myrepo/locks", url))
-        .header("Authorization", &auth)
+        .header(
+            "Authorization",
+            lock_auth(&signer, &url, "/lfs/myrepo/locks", "POST"),
+        )
         .json(&serde_json::json!({"path": "b.txt"}))
         .send()
         .await
@@ -242,7 +290,10 @@ async fn test_list_locks() {
 
     let resp = client
         .get(format!("{}/lfs/myrepo/locks", url))
-        .header("Authorization", &auth)
+        .header(
+            "Authorization",
+            lock_auth(&signer, &url, "/lfs/myrepo/locks", "GET"),
+        )
         .send()
         .await
         .unwrap();
@@ -258,12 +309,14 @@ async fn test_list_locks_with_path_filter() {
     let server = lock_server();
     let url = spawn_server(server).await;
     let signer = Signer::generate();
-    let auth = lock_auth(&signer);
     let client = reqwest::Client::new();
 
     client
         .post(format!("{}/lfs/myrepo/locks", url))
-        .header("Authorization", &auth)
+        .header(
+            "Authorization",
+            lock_auth(&signer, &url, "/lfs/myrepo/locks", "POST"),
+        )
         .json(&serde_json::json!({"path": "a.txt"}))
         .send()
         .await
@@ -271,7 +324,10 @@ async fn test_list_locks_with_path_filter() {
 
     client
         .post(format!("{}/lfs/myrepo/locks", url))
-        .header("Authorization", &auth)
+        .header(
+            "Authorization",
+            lock_auth(&signer, &url, "/lfs/myrepo/locks", "POST"),
+        )
         .json(&serde_json::json!({"path": "b.txt"}))
         .send()
         .await
@@ -279,7 +335,10 @@ async fn test_list_locks_with_path_filter() {
 
     let resp = client
         .get(format!("{}/lfs/myrepo/locks?path=a.txt", url))
-        .header("Authorization", &auth)
+        .header(
+            "Authorization",
+            lock_auth(&signer, &url, "/lfs/myrepo/locks", "GET"),
+        )
         .send()
         .await
         .unwrap();
@@ -302,7 +361,10 @@ async fn test_verify_locks_splits_ours_and_theirs() {
 
     client
         .post(format!("{}/lfs/myrepo/locks", url))
-        .header("Authorization", lock_auth(&owner))
+        .header(
+            "Authorization",
+            lock_auth(&owner, &url, "/lfs/myrepo/locks", "POST"),
+        )
         .json(&serde_json::json!({"path": "owner-file.txt"}))
         .send()
         .await
@@ -310,7 +372,10 @@ async fn test_verify_locks_splits_ours_and_theirs() {
 
     client
         .post(format!("{}/lfs/myrepo/locks", url))
-        .header("Authorization", lock_auth(&other))
+        .header(
+            "Authorization",
+            lock_auth(&other, &url, "/lfs/myrepo/locks", "POST"),
+        )
         .json(&serde_json::json!({"path": "other-file.txt"}))
         .send()
         .await
@@ -318,7 +383,10 @@ async fn test_verify_locks_splits_ours_and_theirs() {
 
     let resp = client
         .post(format!("{}/lfs/myrepo/locks/verify", url))
-        .header("Authorization", lock_auth(&owner))
+        .header(
+            "Authorization",
+            lock_auth(&owner, &url, "/lfs/myrepo/locks/verify", "POST"),
+        )
         .json(&serde_json::json!({}))
         .send()
         .await
@@ -344,13 +412,14 @@ async fn test_lock_endpoints_return_404_without_lock_db() {
     let server = no_lock_server();
     let url = spawn_server(server).await;
     let signer = Signer::generate();
-    let auth = lock_auth(&signer);
-
     let client = reqwest::Client::new();
 
     let create_resp = client
         .post(format!("{}/lfs/myrepo/locks", url))
-        .header("Authorization", &auth)
+        .header(
+            "Authorization",
+            lock_auth(&signer, &url, "/lfs/myrepo/locks", "POST"),
+        )
         .json(&serde_json::json!({"path": "file.txt"}))
         .send()
         .await
@@ -359,7 +428,10 @@ async fn test_lock_endpoints_return_404_without_lock_db() {
 
     let list_resp = client
         .get(format!("{}/lfs/myrepo/locks", url))
-        .header("Authorization", &auth)
+        .header(
+            "Authorization",
+            lock_auth(&signer, &url, "/lfs/myrepo/locks", "GET"),
+        )
         .send()
         .await
         .unwrap();
@@ -367,7 +439,10 @@ async fn test_lock_endpoints_return_404_without_lock_db() {
 
     let verify_resp = client
         .post(format!("{}/lfs/myrepo/locks/verify", url))
-        .header("Authorization", &auth)
+        .header(
+            "Authorization",
+            lock_auth(&signer, &url, "/lfs/myrepo/locks/verify", "POST"),
+        )
         .json(&serde_json::json!({}))
         .send()
         .await
@@ -380,11 +455,12 @@ async fn test_list_locks_empty_repo() {
     let server = lock_server();
     let url = spawn_server(server).await;
     let signer = Signer::generate();
-    let auth = lock_auth(&signer);
-
     let resp = reqwest::Client::new()
         .get(format!("{}/lfs/empty-repo/locks", url))
-        .header("Authorization", auth)
+        .header(
+            "Authorization",
+            lock_auth(&signer, &url, "/lfs/empty-repo/locks", "GET"),
+        )
         .send()
         .await
         .unwrap();
@@ -399,13 +475,15 @@ async fn test_lock_lifecycle() {
     let server = lock_server();
     let url = spawn_server(server).await;
     let signer = Signer::generate();
-    let auth = lock_auth(&signer);
     let client = reqwest::Client::new();
     let repo = "lifecycle-test";
 
     let create_resp = client
         .post(format!("{}/lfs/{}/locks", url, repo))
-        .header("Authorization", &auth)
+        .header(
+            "Authorization",
+            lock_auth(&signer, &url, &format!("/lfs/{repo}/locks"), "POST"),
+        )
         .json(&serde_json::json!({"path": "big-file.bin"}))
         .send()
         .await
@@ -416,7 +494,10 @@ async fn test_lock_lifecycle() {
 
     let verify_resp = client
         .post(format!("{}/lfs/{}/locks/verify", url, repo))
-        .header("Authorization", &auth)
+        .header(
+            "Authorization",
+            lock_auth(&signer, &url, &format!("/lfs/{repo}/locks/verify"), "POST"),
+        )
         .json(&serde_json::json!({}))
         .send()
         .await
@@ -428,7 +509,10 @@ async fn test_lock_lifecycle() {
 
     let list_resp = client
         .get(format!("{}/lfs/{}/locks", url, repo))
-        .header("Authorization", &auth)
+        .header(
+            "Authorization",
+            lock_auth(&signer, &url, &format!("/lfs/{repo}/locks"), "GET"),
+        )
         .send()
         .await
         .unwrap();
@@ -438,7 +522,15 @@ async fn test_lock_lifecycle() {
 
     let unlock_resp = client
         .post(format!("{}/lfs/{}/locks/{}/unlock", url, repo, lock_id))
-        .header("Authorization", &auth)
+        .header(
+            "Authorization",
+            lock_auth(
+                &signer,
+                &url,
+                &format!("/lfs/{repo}/locks/{lock_id}/unlock"),
+                "POST",
+            ),
+        )
         .json(&serde_json::json!({"force": false}))
         .send()
         .await
@@ -447,7 +539,10 @@ async fn test_lock_lifecycle() {
 
     let list_after_resp = client
         .get(format!("{}/lfs/{}/locks", url, repo))
-        .header("Authorization", &auth)
+        .header(
+            "Authorization",
+            lock_auth(&signer, &url, &format!("/lfs/{repo}/locks"), "GET"),
+        )
         .send()
         .await
         .unwrap();

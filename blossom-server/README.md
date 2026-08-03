@@ -16,15 +16,19 @@ A plain `cargo install blossom-server && blossom-server` gives you:
 - **Build integrity** — source hash embedded at compile time, signed release manifests in CI
 - **BUD-20 compression** — server-side zstd + xdelta3 delta encoding for LFS blobs
 - **LFS version tracking** — automatic, shares the same SQLite/Postgres database. Query with `GET /admin/lfs-stats`
-- **Rate limiting, CORS, TLS, graceful shutdown** — production-ready defaults
+- **Secure network defaults** — loopback bind, authenticated uploads, explicit CORS and relay opt-in
+- **Rate limiting, TLS, graceful shutdown** — production-ready controls
 
 ## Quick Start
 
 ```bash
 cargo install blossom-server
 
-# Default: filesystem storage + SQLite + locks enabled
+# Default: loopback-only, authenticated uploads, filesystem + SQLite + locks
 blossom-server
+
+# Deliberately allow anonymous uploads for local development
+blossom-server --allow-anonymous-uploads
 
 # With iroh P2P + PKARR DHT advertisement
 blossom-server --iroh --pkarr
@@ -32,14 +36,15 @@ blossom-server --iroh --pkarr
 # In-memory (no persistence, good for testing)
 blossom-server --memory
 
-# Custom bind address and base URL
-blossom-server --bind 0.0.0.0:8080 --base-url https://blobs.example.com
+# Public bind behind a trusted TLS-terminating reverse proxy
+blossom-server --bind 0.0.0.0:8080 \
+  --base-url https://blobs.example.com \
+  --allow-insecure-public-http
 
 # Full production setup
 blossom-server \
   --bind 0.0.0.0:3000 \
   --base-url https://blobs.example.com \
-  --require-auth \
   --admin npub1... \
   --enable-admin \
   --iroh --pkarr \
@@ -64,14 +69,17 @@ Database:
       --db-postgres <URL>        PostgreSQL connection URL (overrides SQLite)
 
 Network:
-  -b, --bind <ADDR>              Listen address [default: 0.0.0.0:3000]
+  -b, --bind <ADDR>              Listen address [default: 127.0.0.1:3000]
   -u, --base-url <URL>           Public base URL [default: http://localhost:3000]
       --tls-cert <FILE>          TLS certificate (PEM)
       --tls-key <FILE>           TLS private key (PEM)
-      --cors-origins <ORIGINS>   CORS allowed origins (comma-separated, default: all)
+      --allow-insecure-public-http
+                                  Permit a public plaintext listener behind a trusted proxy
+      --cors-origins <ORIGINS>   CORS allowed origins (disabled when omitted)
 
 Auth & Access:
-      --require-auth             Require BIP-340 auth for uploads
+      --require-auth             Explicitly require BIP-340 auth for uploads
+      --allow-anonymous-uploads  Permit unauthenticated uploads (unsafe publicly)
       --whitelist <FILE>         Path to pubkey whitelist file
       --whitelist-reload-secs <N> Whitelist hot-reload interval [default: 0]
       --admin <PUBKEY>           Bootstrap admin pubkey (hex or npub, repeatable)
@@ -85,6 +93,9 @@ P2P Transport:
       --iroh-key-file <PATH>     Iroh secret key file [default: ./iroh_secret.key]
       --pkarr                    Enable PKARR DHT endpoint discovery (requires --iroh)
       --pkarr-republish-secs <N> PKARR republish interval [default: 3600]
+
+NIP-34:
+      --enable-relay             Enable the Nostr relay and GRASP git server
 
 Limits:
       --max-upload-size <BYTES>  Max upload size in bytes
@@ -159,10 +170,10 @@ The server embeds a deterministic source hash at compile time and reports it via
 
 | Flags | Behavior |
 |-------|----------|
-| *(none)* | Open server — anyone can upload/download |
-| `--require-auth` | Auth required for uploads, downloads public |
-| `--require-auth --whitelist keys.txt` | Only whitelisted pubkeys upload |
-| `--require-auth --admin npub1... --enable-admin` | Role-based access with admin API |
+| *(none)* | Authenticated uploads; downloads remain public |
+| `--allow-anonymous-uploads` | Open uploads (only appropriate for controlled deployments) |
+| `--whitelist keys.txt` | Only whitelisted pubkeys upload |
+| `--admin npub1... --enable-admin` | Role-based access with admin API |
 
 ## License
 

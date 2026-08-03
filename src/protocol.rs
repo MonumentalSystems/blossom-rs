@@ -41,17 +41,12 @@ pub fn compute_event_id(
     tags: &[Vec<String>],
     content: &str,
 ) -> [u8; 32] {
-    let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_string());
-    let serialized = format!(
-        "[0,\"{}\",{},{},{},\"{}\"]",
-        pubkey,
-        created_at,
-        kind,
-        tags_json,
-        content.replace('\\', "\\\\").replace('"', "\\\"")
-    );
+    // Serialize the exact NIP-01 tuple with serde_json so all control
+    // characters and Unicode are encoded canonically.
+    let serialized = serde_json::to_vec(&(0u8, pubkey, created_at, kind, tags, content))
+        .expect("Nostr event components are serializable");
     let mut hasher = Sha256::new();
-    hasher.update(serialized.as_bytes());
+    hasher.update(&serialized);
     let result = hasher.finalize();
     let mut out = [0u8; 32];
     out.copy_from_slice(&result);
@@ -172,6 +167,24 @@ mod tests {
 
         let id3 = compute_event_id(&pubkey, 1700000000, 24242, &tags, "other");
         assert_ne!(id1, id3);
+    }
+
+    #[test]
+    fn test_event_id_uses_canonical_json_escaping() {
+        let pubkey = "a".repeat(64);
+        let tags = vec![vec!["tag".to_string(), "line\n\t\u{0001}".to_string()]];
+        let actual = compute_event_id(&pubkey, 1, 24242, &tags, "quote \" slash \\ newline\n");
+        let canonical = serde_json::to_vec(&(
+            0u8,
+            pubkey,
+            1u64,
+            24242u32,
+            tags,
+            "quote \" slash \\ newline\n",
+        ))
+        .unwrap();
+        let expected: [u8; 32] = Sha256::digest(canonical).into();
+        assert_eq!(actual, expected);
     }
 
     #[test]

@@ -7,7 +7,8 @@ pub mod batch;
 pub mod multi;
 
 use crate::auth::{
-    auth_header_value, build_blossom_auth, build_blossom_auth_with_extra_tags, BlossomSigner,
+    auth_header_value, build_blossom_auth, build_blossom_auth_for_request,
+    build_blossom_auth_for_request_with_extra_tags, BlossomSigner,
 };
 use crate::protocol::{sha256_hex, BlobDescriptor, STREAM_CHUNK_SIZE};
 use tracing::{info, instrument, warn};
@@ -61,12 +62,18 @@ impl BlossomClient {
         let our_sha256 = sha256_hex(data);
         tracing::Span::current().record("blob.sha256", our_sha256.as_str());
 
-        let auth_event =
-            build_blossom_auth(self.signer.as_ref(), "upload", Some(&our_sha256), None, "");
-        let auth_header = auth_header_value(&auth_event);
-
         for server in &self.servers {
             let url = format!("{}/upload", server.trim_end_matches('/'));
+            let auth_event = build_blossom_auth_for_request(
+                self.signer.as_ref(),
+                "upload",
+                Some(&our_sha256),
+                server.trim_end_matches('/'),
+                &url,
+                "PUT",
+                "",
+            );
+            let auth_header = auth_header_value(&auth_event);
             let result = self
                 .http
                 .put(&url)
@@ -158,18 +165,19 @@ impl BlossomClient {
             extra_tags.push(vec!["manifest".into()]);
         }
 
-        let auth_event = build_blossom_auth_with_extra_tags(
-            self.signer.as_ref(),
-            "upload",
-            Some(&our_sha256),
-            None,
-            "",
-            &extra_tags,
-        );
-        let auth_header = auth_header_value(&auth_event);
-
         for server in &self.servers {
             let url = format!("{}/upload", server.trim_end_matches('/'));
+            let auth_event = build_blossom_auth_for_request_with_extra_tags(
+                self.signer.as_ref(),
+                "upload",
+                Some(&our_sha256),
+                server.trim_end_matches('/'),
+                &url,
+                "PUT",
+                "",
+                &extra_tags,
+            );
+            let auth_header = auth_header_value(&auth_event);
             let result = self
                 .http
                 .put(&url)
@@ -320,11 +328,18 @@ impl BlossomClient {
     /// Returns `Ok(true)` if deleted, `Ok(false)` if not found.
     #[instrument(name = "blossom.client.delete", skip_all, fields(blob.sha256 = %sha256))]
     pub async fn delete(&self, sha256: &str) -> Result<bool, String> {
-        let auth_event = build_blossom_auth(self.signer.as_ref(), "delete", None, None, "");
-        let auth_header = auth_header_value(&auth_event);
-
         for server in &self.servers {
             let url = format!("{}/{}", server.trim_end_matches('/'), sha256);
+            let auth_event = build_blossom_auth_for_request(
+                self.signer.as_ref(),
+                "delete",
+                Some(sha256),
+                server.trim_end_matches('/'),
+                &url,
+                "DELETE",
+                "",
+            );
+            let auth_header = auth_header_value(&auth_event);
             let result = self
                 .http
                 .delete(&url)
@@ -428,13 +443,19 @@ impl BlossomClient {
         tracing::Span::current().record("blob.sha256", our_sha256.as_str());
         tracing::Span::current().record("blob.size", file_size);
 
-        let auth_event =
-            build_blossom_auth(self.signer.as_ref(), "upload", Some(&our_sha256), None, "");
-        let auth_header = auth_header_value(&auth_event);
-
         // Second pass: stream file to server.
         for server in &self.servers {
             let url = format!("{}/upload", server.trim_end_matches('/'));
+            let auth_event = build_blossom_auth_for_request(
+                self.signer.as_ref(),
+                "upload",
+                Some(&our_sha256),
+                server.trim_end_matches('/'),
+                &url,
+                "PUT",
+                "",
+            );
+            let auth_header = auth_header_value(&auth_event);
 
             let file = tokio::fs::File::open(path)
                 .await

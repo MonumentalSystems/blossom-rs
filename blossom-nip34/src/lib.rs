@@ -36,7 +36,7 @@ pub async fn build_nip34_router(
             axum::routing::get(relay::dispatch::main_handler).post(relay::dispatch::main_handler),
         )
         .merge(git_routes)
-        .merge(relay::admin::relay_admin_router())
+        .merge(relay::admin::relay_admin_router(state.clone()))
         .with_state(state);
 
     Ok(app)

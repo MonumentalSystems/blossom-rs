@@ -33,7 +33,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 )]
 struct Args {
     /// Listen address.
-    #[arg(short, long, default_value = "0.0.0.0:3000")]
+    #[arg(short, long, default_value = "127.0.0.1:3000")]
     bind: String,
 
     /// Public base URL for blob URLs in responses.
@@ -74,9 +74,13 @@ struct Args {
     #[arg(long)]
     db_postgres: Option<String>,
 
-    /// Require BIP-340 Nostr auth for uploads.
+    /// Require BIP-340 Nostr auth for uploads (the default unless anonymous uploads are allowed).
     #[arg(long)]
     require_auth: bool,
+
+    /// Allow unauthenticated uploads. This is unsafe on public listeners.
+    #[arg(long)]
+    allow_anonymous_uploads: bool,
 
     /// Maximum upload size in bytes.
     #[arg(long)]
@@ -114,6 +118,11 @@ struct Args {
     #[arg(long)]
     tls_key: Option<PathBuf>,
 
+    /// Allow a non-loopback listener without application TLS (for a trusted
+    /// terminating reverse proxy). Use only with strict network controls.
+    #[arg(long)]
+    allow_insecure_public_http: bool,
+
     /// Rate limit: max requests per bucket.
     #[arg(long, default_value = "60")]
     rate_limit_max: u64,
@@ -130,7 +139,7 @@ struct Args {
     #[arg(long, value_delimiter = ',')]
     webhook_urls: Vec<String>,
 
-    /// CORS allowed origins (comma-separated). Default: * (all).
+    /// CORS allowed origins (comma-separated). CORS is disabled when omitted.
     #[arg(long, value_delimiter = ',')]
     cors_origins: Vec<String>,
 
@@ -169,10 +178,10 @@ struct Args {
     #[arg(long, default_value = "3600")]
     pkarr_republish_secs: u64,
 
-    /// Disable NIP-34 Nostr relay + GRASP git server (enabled by default).
+    /// Enable NIP-34 Nostr relay + GRASP git server.
     #[cfg(feature = "nip34")]
     #[arg(long)]
-    no_relay: bool,
+    enable_relay: bool,
 
     /// NIP-34 relay domain (e.g., relay.example.com).
     #[cfg(feature = "nip34")]
@@ -201,6 +210,15 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+
+    let bind_addr: std::net::SocketAddr = args
+        .bind
+        .parse()
+        .map_err(|e| format!("invalid --bind address: {e}"))?;
+    let application_tls = args.tls_cert.is_some() && args.tls_key.is_some();
+    if !bind_addr.ip().is_loopback() && !application_tls && !args.allow_insecure_public_http {
+        return Err("refusing non-loopback plaintext listener; configure --tls-cert/--tls-key or explicitly use --allow-insecure-public-http behind a trusted proxy".into());
+    }
 
     // Keygen mode — print a keypair and exit.
     if args.keygen {
@@ -297,9 +315,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     builder = builder.role_based_access(role_access.clone());
     builder = builder.database_boxed(database);
 
-    if args.require_auth {
+    if args.require_auth || !args.allow_anonymous_uploads {
         builder = builder.require_auth();
         info!("auth required for uploads");
+    } else {
+        warn!("anonymous uploads explicitly enabled");
     }
 
     if let Some(max) = args.max_upload_size {
@@ -376,22 +396,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server = builder.build();
     let state = server.shared_state();
 
-    // CORS — configurable origins or allow all.
-    let cors = if args.cors_origins.is_empty() {
-        CorsLayer::new()
-            .allow_origin(tower_http::cors::Any)
-            .allow_methods(tower_http::cors::Any)
-            .allow_headers(tower_http::cors::Any)
-    } else {
+    // CORS is disabled unless explicit origins are configured.
+    let cors = if !args.cors_origins.is_empty() {
         let origins: Vec<axum::http::HeaderValue> = args
             .cors_origins
             .iter()
             .filter_map(|o| o.parse().ok())
             .collect();
-        CorsLayer::new()
-            .allow_origin(origins)
-            .allow_methods(tower_http::cors::Any)
-            .allow_headers(tower_http::cors::Any)
+        Some(
+            CorsLayer::new()
+                .allow_origin(origins)
+                .allow_methods(tower_http::cors::Any)
+                .allow_headers(tower_http::cors::Any),
+        )
+    } else {
+        None
     };
 
     // Build router — main + NIP-96 + optional admin.
@@ -402,13 +421,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("admin endpoints enabled at /admin/*");
     }
 
-    // NIP-34 relay + GRASP git server (enabled by default)
+    // NIP-34 relay + GRASP git server (explicit opt-in)
     #[cfg(feature = "nip34")]
-    if !args.no_relay {
+    if args.enable_relay {
         let nip34_config = blossom_nip34::Nip34Config {
             domain: args.nip34_domain.clone(),
             lmdb_path: args.nip34_lmdb_path.clone(),
             repos_path: args.nip34_repos_path.clone(),
+            admin_pubkeys: args
+                .admin_pubkeys
+                .iter()
+                .filter_map(|key| normalize_pubkey(key))
+                .collect(),
             ..Default::default()
         };
         let nip34_router = blossom_nip34::build_nip34_router(nip34_config)
@@ -422,7 +446,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let app = app.layer(cors);
+    if let Some(cors) = cors {
+        app = app.layer(cors);
+    }
 
     // Spawn stats flush loop.
     if args.stats_flush_secs > 0 {
@@ -451,20 +477,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Start iroh P2P transport if enabled.
     let _iroh_router: Option<IrohRouter> = if args.iroh {
         // Load or generate secret key for stable node ID.
-        let secret_key = if args.iroh_key_file.exists() {
-            let bytes =
-                std::fs::read(&args.iroh_key_file).map_err(|e| format!("read iroh key: {e}"))?;
-            let bytes: [u8; 32] = bytes
-                .try_into()
-                .map_err(|_| "iroh key file must be exactly 32 bytes")?;
-            iroh::SecretKey::from_bytes(&bytes)
-        } else {
-            let key = iroh::SecretKey::generate(&mut rand::rng());
-            std::fs::write(&args.iroh_key_file, key.to_bytes())
-                .map_err(|e| format!("write iroh key: {e}"))?;
-            info!(path = %args.iroh_key_file.display(), "generated new iroh secret key");
-            key
-        };
+        let secret_key = load_or_create_iroh_key(&args.iroh_key_file)?;
 
         let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
             .secret_key(secret_key)
@@ -514,7 +527,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     http_url: Some(args.base_url.clone()),
                     iroh_node_id: Some(node_id.to_string()),
                     #[cfg(feature = "nip34")]
-                    nostr_relay_url: if !args.no_relay {
+                    nostr_relay_url: if args.enable_relay {
                         Some(format!("wss://{}", args.nip34_domain))
                     } else {
                         None
@@ -568,19 +581,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let addr: std::net::SocketAddr = args.bind.parse()?;
             axum_server::bind_rustls(addr, tls_config)
                 .handle(handle)
-                .serve(app.into_make_service())
+                .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
                 .await?;
         }
         _ => {
             let listener = tokio::net::TcpListener::bind(&args.bind).await?;
-            axum::serve(listener, app)
-                .with_graceful_shutdown(shutdown_signal(shutdown_state))
-                .await?;
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown_signal(shutdown_state))
+            .await?;
         }
     }
 
     info!("server shut down");
     Ok(())
+}
+
+fn load_or_create_iroh_key(
+    path: &std::path::Path,
+) -> Result<iroh::SecretKey, Box<dyn std::error::Error>> {
+    use std::io::Write;
+    if path.exists() {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err("iroh key path must be a regular, non-symlink file".into());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o077 != 0 {
+                return Err("iroh key file permissions must be 0600 or stricter".into());
+            }
+        }
+        let bytes: [u8; 32] = std::fs::read(path)?
+            .try_into()
+            .map_err(|_| "iroh key file must be exactly 32 bytes")?;
+        return Ok(iroh::SecretKey::from_bytes(&bytes));
+    }
+
+    let key = iroh::SecretKey::generate();
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(&key.to_bytes())?;
+    file.sync_all()?;
+    info!(path = %path.display(), "generated new iroh secret key");
+    Ok(key)
 }
 
 /// Wait for Ctrl+C, then flush stats before exiting.

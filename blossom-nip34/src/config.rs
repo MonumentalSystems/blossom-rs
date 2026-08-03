@@ -52,7 +52,7 @@ impl Default for Nip34Config {
             repos_path: PathBuf::from("./repos"),
             git_path: "git".into(),
             max_event_size: 150 * 1024, // 150 KB
-            max_connections: None,
+            max_connections: Some(256),
             rate_limit_events_per_min: 120,
             admin_pubkeys: Vec::new(),
             whitelist_pubkeys: Vec::new(),

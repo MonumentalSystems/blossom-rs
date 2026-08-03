@@ -15,11 +15,16 @@ RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/
 
 COPY --from=builder /build/target/release/blossom-server /usr/local/bin/blossom-server
 
-RUN mkdir -p /data/blobs
+RUN groupadd --system blossom \
+    && useradd --system --gid blossom --home-dir /data --shell /usr/sbin/nologin blossom \
+    && mkdir -p /data/blobs \
+    && chown -R blossom:blossom /data
+
+USER blossom:blossom
 
 ENV RUST_LOG=info
 
 EXPOSE 3000
 
 ENTRYPOINT ["blossom-server"]
-CMD ["--bind", "0.0.0.0:3000", "--data-dir", "/data/blobs", "--db-path", "/data/blossom.db"]
+CMD ["--bind", "0.0.0.0:3000", "--allow-insecure-public-http", "--data-dir", "/data/blobs", "--db-path", "/data/blossom.db"]

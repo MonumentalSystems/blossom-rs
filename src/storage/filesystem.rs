@@ -35,7 +35,7 @@ impl FilesystemBackend {
             let name = entry.file_name().to_string_lossy().to_string();
             if name.ends_with(".blob") {
                 let hash = name.trim_end_matches(".blob").to_string();
-                if hash.len() == 64 {
+                if Self::valid_hash(&hash) && entry.file_type()?.is_file() {
                     let size = entry.metadata()?.len();
                     index.insert(hash, size);
                 }
@@ -56,25 +56,65 @@ impl FilesystemBackend {
         })
     }
 
-    fn blob_path(&self, sha256: &str) -> PathBuf {
-        self.data_dir.join(format!("{}.blob", sha256))
+    fn valid_hash(sha256: &str) -> bool {
+        sha256.len() == 64
+            && sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+
+    fn blob_path(&self, sha256: &str) -> Option<PathBuf> {
+        Self::valid_hash(sha256).then(|| self.data_dir.join(format!("{}.blob", sha256)))
+    }
+
+    fn atomic_write(&self, hash: &str, data: &[u8]) -> Result<(), String> {
+        use std::io::Write;
+
+        let final_path = self
+            .blob_path(hash)
+            .ok_or_else(|| "invalid SHA256 storage key".to_string())?;
+        let tmp_path = self.data_dir.join(format!(".tmp_{}", uuid::Uuid::new_v4()));
+        let result = (|| {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)
+                .map_err(|e| format!("create temp blob: {e}"))?;
+            file.write_all(data)
+                .map_err(|e| format!("write temp blob: {e}"))?;
+            file.sync_all()
+                .map_err(|e| format!("sync temp blob: {e}"))?;
+            std::fs::rename(&tmp_path, &final_path).map_err(|e| format!("commit blob: {e}"))?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp_path);
+        }
+        result
     }
 }
 
 impl BlobBackend for FilesystemBackend {
     fn insert(&mut self, data: Vec<u8>, base_url: &str) -> BlobDescriptor {
         let desc = make_descriptor(&data, base_url);
-        let path = self.blob_path(&desc.sha256);
-        if let Err(e) = std::fs::write(&path, &data) {
+        if let Err(e) = self.atomic_write(&desc.sha256, &data) {
             warn!(
                 storage.backend = "filesystem",
                 blob.sha256 = %desc.sha256,
                 error.message = %e,
                 "failed to write blob to disk"
             );
+        } else {
+            self.index.insert(desc.sha256.clone(), desc.size);
         }
-        self.index.insert(desc.sha256.clone(), desc.size);
         desc
+    }
+
+    fn try_insert(&mut self, data: Vec<u8>, base_url: &str) -> Result<BlobDescriptor, String> {
+        let desc = make_descriptor(&data, base_url);
+        self.atomic_write(&desc.sha256, &data)?;
+        self.index.insert(desc.sha256.clone(), desc.size);
+        Ok(desc)
     }
 
     fn insert_with_hash(
@@ -85,22 +125,35 @@ impl BlobBackend for FilesystemBackend {
         base_url: &str,
     ) -> BlobDescriptor {
         let desc = make_descriptor_from_hash(hash, original_size, base_url);
-        let path = self.blob_path(&desc.sha256);
-        if let Err(e) = std::fs::write(&path, &data) {
+        if let Err(e) = self.atomic_write(&desc.sha256, &data) {
             warn!(
                 storage.backend = "filesystem",
                 blob.sha256 = %desc.sha256,
                 error.message = %e,
                 "failed to write blob to disk"
             );
+        } else {
+            self.index.insert(desc.sha256.clone(), desc.size);
         }
-        self.index.insert(desc.sha256.clone(), desc.size);
         desc
     }
 
+    fn try_insert_with_hash(
+        &mut self,
+        data: Vec<u8>,
+        hash: &str,
+        original_size: u64,
+        base_url: &str,
+    ) -> Result<BlobDescriptor, String> {
+        let desc = make_descriptor_from_hash(hash, original_size, base_url);
+        self.atomic_write(hash, &data)?;
+        self.index.insert(desc.sha256.clone(), desc.size);
+        Ok(desc)
+    }
+
     fn get(&self, sha256: &str) -> Option<Vec<u8>> {
-        let path = self.blob_path(sha256);
-        if path.exists() {
+        let path = self.blob_path(sha256)?;
+        if path.is_file() {
             std::fs::read(&path).ok()
         } else {
             None
@@ -108,13 +161,23 @@ impl BlobBackend for FilesystemBackend {
     }
 
     fn exists(&self, sha256: &str) -> bool {
-        self.index.contains_key(sha256) || self.blob_path(sha256).exists()
+        self.index.contains_key(sha256) || self.blob_path(sha256).is_some_and(|path| path.is_file())
     }
 
     fn delete(&mut self, sha256: &str) -> bool {
-        let removed = self.index.remove(sha256).is_some();
-        let _ = std::fs::remove_file(self.blob_path(sha256));
-        removed
+        self.try_delete(sha256).unwrap_or(false)
+    }
+
+    fn try_delete(&mut self, sha256: &str) -> Result<bool, String> {
+        let path = self
+            .blob_path(sha256)
+            .ok_or_else(|| "invalid SHA256 storage key".to_string())?;
+        let existed = self.index.contains_key(sha256) || path.is_file();
+        if existed {
+            std::fs::remove_file(&path).map_err(|e| format!("delete blob: {e}"))?;
+            self.index.remove(sha256);
+        }
+        Ok(existed)
     }
 
     fn len(&self) -> usize {
@@ -164,7 +227,9 @@ impl BlobBackend for FilesystemBackend {
             file.flush().map_err(|e| format!("flush temp: {e}"))?;
 
             let hash = hex::encode(hasher.finalize());
-            let final_path = self.blob_path(&hash);
+            let final_path = self
+                .blob_path(&hash)
+                .ok_or_else(|| "invalid computed SHA256".to_string())?;
             std::fs::rename(&tmp_path, &final_path)
                 .map_err(|e| format!("rename temp to blob: {e}"))?;
 

@@ -372,6 +372,31 @@ impl RoleBasedAccess {
         self.members.write().await.insert(normalized);
         Ok(())
     }
+
+    /// Persist and immediately apply a role change.
+    pub async fn set_role(
+        &self,
+        pubkey: &str,
+        role: &str,
+        db: &mut dyn crate::db::BlobDatabase,
+    ) -> Result<(), crate::db::DbError> {
+        let normalized = normalize_pubkey(pubkey).unwrap_or_else(|| pubkey.to_string());
+        db.set_role(&normalized, role)?;
+        let mut admins = self.admins.write().await;
+        let mut members = self.members.write().await;
+        admins.remove(&normalized);
+        members.remove(&normalized);
+        match role {
+            "admin" => {
+                admins.insert(normalized);
+            }
+            "member" => {
+                members.insert(normalized);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

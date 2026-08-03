@@ -118,12 +118,16 @@ async fn handle_nip96_upload(
     if data.is_empty() {
         return (StatusCode::BAD_REQUEST, error_json("empty body"));
     }
+    let sha256 = crate::protocol::sha256_hex(&data);
+    let base_url = state.lock().await.base_url.clone();
 
     // NIP-96 requires NIP-98 auth (kind:27235) or Blossom auth (kind:24242).
     // We support Blossom auth for simplicity.
     let pubkey = match extract_auth_event(&headers) {
         Ok(event) => {
-            if let Err(e) = verify_auth_event(&event, Some("upload")) {
+            if let Err(e) =
+                verify_auth_event(&event, "upload", &base_url, "/n96", "POST", Some(&sha256))
+            {
                 return (StatusCode::UNAUTHORIZED, error_json(&e.to_string()));
             }
             event.pubkey
@@ -134,6 +138,14 @@ async fn handle_nip96_upload(
     };
 
     let mut s = state.lock().await;
+    let content_type =
+        super::extract_content_type(&headers).unwrap_or_else(|| super::detect_mime(&data));
+    if !super::mime_allowed(&s.requirements, &content_type) {
+        return (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            error_json("content type is not allowed"),
+        );
+    }
 
     // Size check.
     if let Some(max) = s.requirements.max_size {
@@ -151,11 +163,20 @@ async fn handle_nip96_upload(
     }
 
     // Quota check.
+    let additional_bytes = if s
+        .database
+        .is_upload_owner(&sha256, &pubkey)
+        .unwrap_or(false)
+    {
+        0
+    } else {
+        data.len() as u64
+    };
     if let Err(DbError::QuotaExceeded {
         used,
         requested,
         limit,
-    }) = s.database.check_quota(&pubkey, data.len() as u64)
+    }) = s.database.check_quota(&pubkey, additional_bytes)
     {
         return (
             StatusCode::INSUFFICIENT_STORAGE,
@@ -167,21 +188,31 @@ async fn handle_nip96_upload(
     }
 
     let base_url = s.base_url.clone();
-    let descriptor = s.backend.insert(data, &base_url);
+    let descriptor = match s.backend.try_insert(data, &base_url) {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_json(&format!("storage write failed: {error}")),
+            );
+        }
+    };
 
     // Record in database.
     let record = UploadRecord {
         sha256: descriptor.sha256.clone(),
         size: descriptor.size,
-        mime_type: descriptor
-            .content_type
-            .clone()
-            .unwrap_or_else(|| "application/octet-stream".to_string()),
+        mime_type: content_type,
         pubkey,
         created_at: descriptor.uploaded.unwrap_or(0),
         phash: None,
     };
-    let _ = s.database.record_upload(&record);
+    if let Err(error) = s.database.record_upload(&record) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_json(&format!("metadata write failed: {error}")),
+        );
+    }
 
     let url = descriptor
         .url
@@ -217,10 +248,11 @@ async fn handle_nip96_list(
     headers: HeaderMap,
     Query(params): Query<Nip96ListQuery>,
 ) -> impl IntoResponse {
+    let base_url = state.lock().await.base_url.clone();
     // List requires auth to identify the user.
     let pubkey = match extract_auth_event(&headers) {
         Ok(event) => {
-            if let Err(e) = verify_auth_event(&event, Some("get")) {
+            if let Err(e) = verify_auth_event(&event, "get", &base_url, "/n96", "GET", None) {
                 return (StatusCode::UNAUTHORIZED, error_json(&e.to_string()));
             }
             event.pubkey
@@ -281,9 +313,20 @@ async fn handle_nip96_delete(
     Path(sha256): Path<String>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    if !super::is_valid_sha256(&sha256) {
+        return (StatusCode::BAD_REQUEST, error_json("invalid SHA256 hash"));
+    }
+    let base_url = state.lock().await.base_url.clone();
     let pubkey = match extract_auth_event(&headers) {
         Ok(event) => {
-            if let Err(e) = verify_auth_event(&event, Some("delete")) {
+            if let Err(e) = verify_auth_event(
+                &event,
+                "delete",
+                &base_url,
+                &format!("/n96/{sha256}"),
+                "DELETE",
+                Some(&sha256),
+            ) {
                 return (StatusCode::UNAUTHORIZED, error_json(&e.to_string()));
             }
             event.pubkey
@@ -299,24 +342,60 @@ async fn handle_nip96_delete(
     if role == Role::Denied {
         return (StatusCode::FORBIDDEN, error_json("delete not allowed"));
     }
-    // Members may only delete their own blobs. Anonymous uploads
-    // (pubkey "anonymous") have no owner, so anyone may delete them.
+    // Members remove only their own reference; shared content remains until
+    // the final owner deletes it.
     if role != Role::Admin {
-        if let Ok(record) = s.database.get_upload(&sha256) {
-            if record.pubkey != "anonymous" && record.pubkey != pubkey {
-                return (StatusCode::FORBIDDEN, error_json("not the blob owner"));
+        if !s
+            .database
+            .is_upload_owner(&sha256, &pubkey)
+            .unwrap_or(false)
+        {
+            return (StatusCode::FORBIDDEN, error_json("not the blob owner"));
+        }
+        let owner_count = match s.database.upload_owner_count(&sha256) {
+            Ok(count) => count,
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error_json(&error.to_string()),
+                )
             }
+        };
+        if owner_count > 1 {
+            if let Err(error) = s.database.delete_upload_owner(&sha256, &pubkey) {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error_json(&error.to_string()),
+                );
+            }
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "success",
+                    "message": "Ownership reference deleted; shared file retained"
+                })),
+            );
         }
     }
 
-    if s.backend.delete(&sha256) {
-        let _ = s.database.delete_upload(&sha256);
-        (
-            StatusCode::OK,
-            Json(serde_json::json!({"status": "success", "message": "File deleted"})),
-        )
-    } else {
-        (StatusCode::NOT_FOUND, error_json("file not found"))
+    match s.backend.try_delete(&sha256) {
+        Ok(true) => {
+            if let Err(error) = s.database.delete_upload(&sha256) {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error_json(&error.to_string()),
+                );
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"status": "success", "message": "File deleted"})),
+            )
+        }
+        Ok(false) => (StatusCode::NOT_FOUND, error_json("file not found")),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_json(&format!("storage delete failed: {error}")),
+        ),
     }
 }
 
@@ -327,16 +406,36 @@ mod tests {
     use crate::storage::MemoryBackend;
 
     async fn spawn_nip96_server() -> String {
-        let server = BlobServer::new(MemoryBackend::new(), "http://localhost:3000");
-        let state = server.shared_state();
-        let app = server.router().merge(nip96_router(state));
-
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let url = format!("http://{}", addr);
+        let server = BlobServer::new(MemoryBackend::new(), &url);
+        let state = server.shared_state();
+        let app = server.router().merge(nip96_router(state));
+
         tokio::spawn(async move { axum::serve(listener, app).await.ok() });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         url
+    }
+
+    fn request_auth(
+        signer: &crate::auth::Signer,
+        base_url: &str,
+        path: &str,
+        method: &str,
+        action: &str,
+        hash: Option<&str>,
+    ) -> String {
+        let event = crate::auth::build_blossom_auth_for_request(
+            signer,
+            action,
+            hash,
+            base_url,
+            &format!("{base_url}{path}"),
+            method,
+            "",
+        );
+        crate::auth::auth_header_value(&event)
     }
 
     #[tokio::test]
@@ -378,14 +477,8 @@ mod tests {
         let signer = crate::auth::Signer::generate();
 
         let data = b"nip96 test blob";
-        let auth_event = crate::auth::build_blossom_auth(
-            &signer,
-            "upload",
-            Some(&crate::protocol::sha256_hex(data)),
-            None,
-            "",
-        );
-        let auth_header = crate::auth::auth_header_value(&auth_event);
+        let hash = crate::protocol::sha256_hex(data);
+        let auth_header = request_auth(&signer, &url, "/n96", "POST", "upload", Some(&hash));
 
         let resp = http
             .post(format!("{}/n96", url))
@@ -407,14 +500,8 @@ mod tests {
         signer: &crate::auth::Signer,
         data: &[u8],
     ) -> String {
-        let auth_event = crate::auth::build_blossom_auth(
-            signer,
-            "upload",
-            Some(&crate::protocol::sha256_hex(data)),
-            None,
-            "",
-        );
-        let auth_header = crate::auth::auth_header_value(&auth_event);
+        let hash = crate::protocol::sha256_hex(data);
+        let auth_header = request_auth(signer, url, "/n96", "POST", "upload", Some(&hash));
 
         let resp = http
             .post(format!("{}/n96", url))
@@ -445,8 +532,7 @@ mod tests {
         assert_ne!(sha1, sha2);
 
         // List — requires auth with "get" action.
-        let list_event = crate::auth::build_blossom_auth(&signer, "get", None, None, "");
-        let list_header = crate::auth::auth_header_value(&list_event);
+        let list_header = request_auth(&signer, &url, "/n96", "GET", "get", None);
 
         let resp = http
             .get(format!("{}/n96", url))
@@ -460,8 +546,14 @@ mod tests {
         assert_eq!(body["files"].as_array().unwrap().len(), 2);
 
         // Delete one.
-        let del_event = crate::auth::build_blossom_auth(&signer, "delete", None, None, "");
-        let del_header = crate::auth::auth_header_value(&del_event);
+        let del_header = request_auth(
+            &signer,
+            &url,
+            &format!("/n96/{sha1}"),
+            "DELETE",
+            "delete",
+            Some(&sha1),
+        );
 
         let resp = http
             .delete(format!("{}/n96/{}", url, sha1))
@@ -474,16 +566,23 @@ mod tests {
         assert_eq!(body["status"], "success");
 
         // Delete nonexistent.
-        let del_event2 = crate::auth::build_blossom_auth(&signer, "delete", None, None, "");
-        let del_header2 = crate::auth::auth_header_value(&del_event2);
+        let missing = "0".repeat(64);
+        let del_header2 = request_auth(
+            &signer,
+            &url,
+            &format!("/n96/{missing}"),
+            "DELETE",
+            "delete",
+            Some(&missing),
+        );
 
         let resp = http
-            .delete(format!("{}/n96/{}", url, "0".repeat(64)))
+            .delete(format!("{}/n96/{}", url, missing))
             .header("Authorization", &del_header2)
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), 404);
+        assert_eq!(resp.status(), 403);
     }
 
     #[tokio::test]
@@ -538,8 +637,7 @@ mod tests {
             nip96_upload(&http, &url, &signer, &[i; 20]).await;
         }
 
-        let list_event = crate::auth::build_blossom_auth(&signer, "get", None, None, "");
-        let list_header = crate::auth::auth_header_value(&list_event);
+        let list_header = request_auth(&signer, &url, "/n96", "GET", "get", None);
 
         // Page 1, count 2.
         let resp = http
@@ -557,15 +655,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_nip96_size_limit() {
-        let server = BlobServer::builder(MemoryBackend::new(), "http://localhost:3000")
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{}", addr);
+        let server = BlobServer::builder(MemoryBackend::new(), &url)
             .max_upload_size(10)
             .build();
         let state = server.shared_state();
         let app = server.router().merge(nip96_router(state));
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let url = format!("http://{}", addr);
         tokio::spawn(async move { axum::serve(listener, app).await.ok() });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -573,14 +671,8 @@ mod tests {
         let signer = crate::auth::Signer::generate();
 
         let data = b"this exceeds 10 bytes limit!";
-        let auth_event = crate::auth::build_blossom_auth(
-            &signer,
-            "upload",
-            Some(&crate::protocol::sha256_hex(data)),
-            None,
-            "",
-        );
-        let auth_header = crate::auth::auth_header_value(&auth_event);
+        let hash = crate::protocol::sha256_hex(data);
+        let auth_header = request_auth(&signer, &url, "/n96", "POST", "upload", Some(&hash));
 
         let resp = http
             .post(format!("{}/n96", url))

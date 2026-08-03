@@ -1,6 +1,9 @@
 //! Integration tests for BUD-20: LFS-aware storage efficiency.
 
-use blossom_rs::auth::{auth_header_value, build_blossom_auth, Signer};
+use blossom_rs::auth::{
+    auth_header_value, build_blossom_auth_for_request,
+    build_blossom_auth_for_request_with_extra_tags, Signer,
+};
 use blossom_rs::lfs::LfsContext;
 use blossom_rs::server::BlobServer;
 use blossom_rs::storage::MemoryBackend;
@@ -15,17 +18,23 @@ fn lfs_server() -> BlobServer {
 }
 
 async fn spawn(server: BlobServer) -> String {
-    let app = server.router();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let url = format!("http://{}", addr);
+    server.shared_state().lock().await.set_base_url(url.clone());
+    let app = server.router();
     tokio::spawn(async move { axum::serve(listener, app).await.ok() });
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     url
 }
 
-fn lfs_upload_auth(signer: &Signer, sha256: &str, lfs_ctx: &LfsContext) -> String {
-    let mut tags = vec![vec!["t".into(), "upload".into()]];
+fn lfs_upload_auth(
+    signer: &Signer,
+    sha256: &str,
+    lfs_ctx: &LfsContext,
+    server_url: &str,
+) -> String {
+    let mut tags = Vec::new();
     if lfs_ctx.is_lfs {
         tags.push(vec!["t".into(), "lfs".into()]);
     }
@@ -42,28 +51,16 @@ fn lfs_upload_auth(signer: &Signer, sha256: &str, lfs_ctx: &LfsContext) -> Strin
         tags.push(vec!["manifest".into()]);
     }
 
-    let pubkey = signer.public_key_hex();
-    let created_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let expiration = created_at + 60;
-    tags.push(vec!["x".into(), sha256.to_string()]);
-    tags.push(vec!["expiration".into(), expiration.to_string()]);
-
-    let id_bytes = blossom_rs::protocol::compute_event_id(&pubkey, created_at, 24242, &tags, "");
-    let id = hex::encode(id_bytes);
-    let sig = signer.sign_schnorr(&id_bytes);
-
-    let event = blossom_rs::NostrEvent {
-        id,
-        pubkey,
-        created_at,
-        kind: 24242,
-        tags,
-        content: String::new(),
-        sig,
-    };
+    let event = build_blossom_auth_for_request_with_extra_tags(
+        signer,
+        "upload",
+        Some(sha256),
+        server_url,
+        &format!("{server_url}/upload"),
+        "PUT",
+        "",
+        &tags,
+    );
 
     auth_header_value(&event)
 }
@@ -84,7 +81,7 @@ async fn test_lfs_upload_and_download_compressed() {
         repo: Some("github.com/org/repo".into()),
         ..Default::default()
     };
-    let auth = lfs_upload_auth(&signer, &sha256, &ctx);
+    let auth = lfs_upload_auth(&signer, &sha256, &ctx, &url);
 
     let resp = http
         .put(format!("{}/upload", url))
@@ -105,7 +102,15 @@ async fn test_lfs_upload_and_download_compressed() {
     assert_eq!(desc.size, 10_000);
 
     // Download and verify
-    let get_auth = build_blossom_auth(&signer, "get", None, None, "");
+    let get_auth = build_blossom_auth_for_request(
+        &signer,
+        "get",
+        None,
+        &url,
+        &format!("{url}/{sha256}"),
+        "GET",
+        "",
+    );
     let resp = http
         .get(format!("{}/{}", url, sha256))
         .header("Authorization", auth_header_value(&get_auth))
@@ -136,7 +141,7 @@ async fn test_lfs_delta_upload_and_download() {
         repo: Some("github.com/org/repo".into()),
         ..Default::default()
     };
-    let auth_v1 = lfs_upload_auth(&signer, &v1_sha, &ctx_v1);
+    let auth_v1 = lfs_upload_auth(&signer, &v1_sha, &ctx_v1, &url);
 
     let resp = http
         .put(format!("{}/upload", url))
@@ -161,7 +166,7 @@ async fn test_lfs_delta_upload_and_download() {
         base: Some(v1_sha.clone()),
         ..Default::default()
     };
-    let auth_v2 = lfs_upload_auth(&signer, &v2_sha, &ctx_v2);
+    let auth_v2 = lfs_upload_auth(&signer, &v2_sha, &ctx_v2, &url);
 
     let resp = http
         .put(format!("{}/upload", url))
@@ -176,7 +181,15 @@ async fn test_lfs_delta_upload_and_download() {
     assert_eq!(desc.sha256, v2_sha);
 
     // Download v2 and verify roundtrip
-    let get_auth = build_blossom_auth(&signer, "get", None, None, "");
+    let get_auth = build_blossom_auth_for_request(
+        &signer,
+        "get",
+        None,
+        &url,
+        &format!("{url}/{v2_sha}"),
+        "GET",
+        "",
+    );
     let resp = http
         .get(format!("{}/{}", url, v2_sha))
         .header("Authorization", auth_header_value(&get_auth))
@@ -205,7 +218,15 @@ async fn test_non_lfs_upload_unchanged() {
     let data = vec![42u8; 1000];
     let sha256 = blossom_rs::protocol::sha256_hex(&data);
 
-    let auth = build_blossom_auth(&signer, "upload", Some(&sha256), None, "");
+    let auth = build_blossom_auth_for_request(
+        &signer,
+        "upload",
+        Some(&sha256),
+        &url,
+        &format!("{url}/upload"),
+        "PUT",
+        "",
+    );
     let auth_header = auth_header_value(&auth);
 
     let resp = http
@@ -221,7 +242,15 @@ async fn test_non_lfs_upload_unchanged() {
     let desc: blossom_rs::BlobDescriptor = resp.json().await.unwrap();
     assert_eq!(desc.sha256, sha256);
 
-    let get_auth = build_blossom_auth(&signer, "get", None, None, "");
+    let get_auth = build_blossom_auth_for_request(
+        &signer,
+        "get",
+        None,
+        &url,
+        &format!("{url}/{sha256}"),
+        "GET",
+        "",
+    );
     let resp = http
         .get(format!("{}/{}", url, sha256))
         .header("Authorization", auth_header_value(&get_auth))
@@ -252,7 +281,7 @@ async fn test_lfs_manifest_stored_raw() {
         repo: Some("github.com/org/repo".into()),
         ..Default::default()
     };
-    let auth = lfs_upload_auth(&signer, &sha256, &ctx);
+    let auth = lfs_upload_auth(&signer, &sha256, &ctx, &url);
 
     let resp = http
         .put(format!("{}/upload", url))
@@ -268,7 +297,15 @@ async fn test_lfs_manifest_stored_raw() {
     assert_eq!(desc.sha256, sha256);
 
     // Download and verify raw content
-    let get_auth = build_blossom_auth(&signer, "get", None, None, "");
+    let get_auth = build_blossom_auth_for_request(
+        &signer,
+        "get",
+        None,
+        &url,
+        &format!("{url}/{sha256}"),
+        "GET",
+        "",
+    );
     let resp = http
         .get(format!("{}/{}", url, sha256))
         .header("Authorization", auth_header_value(&get_auth))
@@ -297,7 +334,7 @@ async fn test_lfs_version_tracking() {
         repo: Some("github.com/test/repo".into()),
         ..Default::default()
     };
-    let auth = lfs_upload_auth(&signer, &v1_sha, &ctx);
+    let auth = lfs_upload_auth(&signer, &v1_sha, &ctx, &url);
     let resp = http
         .put(format!("{}/upload", url))
         .header("Authorization", auth)
@@ -325,7 +362,7 @@ async fn test_lfs_head_returns_original_size() {
         repo: Some("github.com/org/repo".into()),
         ..Default::default()
     };
-    let auth = lfs_upload_auth(&signer, &sha256, &ctx);
+    let auth = lfs_upload_auth(&signer, &sha256, &ctx, &url);
 
     http.put(format!("{}/upload", url))
         .header("Authorization", auth)
@@ -335,7 +372,15 @@ async fn test_lfs_head_returns_original_size() {
         .await
         .unwrap();
 
-    let get_auth = build_blossom_auth(&signer, "get", None, None, "");
+    let get_auth = build_blossom_auth_for_request(
+        &signer,
+        "get",
+        None,
+        &url,
+        &format!("{url}/{sha256}"),
+        "GET",
+        "",
+    );
     let resp = http
         .head(format!("{}/{}", url, sha256))
         .header("Authorization", auth_header_value(&get_auth))
@@ -371,7 +416,7 @@ async fn test_lfs_delete_rebases_delta() {
         repo: Some("github.com/org/repo".into()),
         ..Default::default()
     };
-    let auth_v1 = lfs_upload_auth(&signer, &v1_sha, &ctx_v1);
+    let auth_v1 = lfs_upload_auth(&signer, &v1_sha, &ctx_v1, &url);
     let resp = http
         .put(format!("{}/upload", url))
         .header("Authorization", auth_v1)
@@ -393,7 +438,7 @@ async fn test_lfs_delete_rebases_delta() {
         base: Some(v1_sha.clone()),
         ..Default::default()
     };
-    let auth_v2 = lfs_upload_auth(&signer, &v2_sha, &ctx_v2);
+    let auth_v2 = lfs_upload_auth(&signer, &v2_sha, &ctx_v2, &url);
     let resp = http
         .put(format!("{}/upload", url))
         .header("Authorization", auth_v2)
@@ -404,7 +449,15 @@ async fn test_lfs_delete_rebases_delta() {
         .unwrap();
     assert_eq!(resp.status(), 200);
 
-    let get_auth = build_blossom_auth(&signer, "get", None, None, "");
+    let get_auth = build_blossom_auth_for_request(
+        &signer,
+        "get",
+        None,
+        &url,
+        &format!("{url}/{v2_sha}"),
+        "GET",
+        "",
+    );
     let resp = http
         .get(format!("{}/{}", url, v2_sha))
         .header("Authorization", auth_header_value(&get_auth))
@@ -415,7 +468,15 @@ async fn test_lfs_delete_rebases_delta() {
     let body = resp.bytes().await.unwrap();
     assert_eq!(&body[..], &v2_data[..], "v2 mismatch before delete");
 
-    let delete_auth = build_blossom_auth(&signer, "delete", Some(&v1_sha), None, "");
+    let delete_auth = build_blossom_auth_for_request(
+        &signer,
+        "delete",
+        Some(&v1_sha),
+        &url,
+        &format!("{url}/{v1_sha}"),
+        "DELETE",
+        "",
+    );
     let resp = http
         .delete(format!("{}/{}", url, v1_sha))
         .header("Authorization", auth_header_value(&delete_auth))
@@ -424,7 +485,15 @@ async fn test_lfs_delete_rebases_delta() {
         .unwrap();
     assert_eq!(resp.status(), 200);
 
-    let get_auth = build_blossom_auth(&signer, "get", None, None, "");
+    let get_auth = build_blossom_auth_for_request(
+        &signer,
+        "get",
+        None,
+        &url,
+        &format!("{url}/{v2_sha}"),
+        "GET",
+        "",
+    );
     let resp = http
         .get(format!("{}/{}", url, v2_sha))
         .header("Authorization", auth_header_value(&get_auth))
@@ -452,7 +521,7 @@ async fn test_lfs_delta_chain_max_depth() {
         repo: Some("github.com/org/repo".into()),
         ..Default::default()
     };
-    let auth_v1 = lfs_upload_auth(&signer, &prev_sha, &ctx_v1);
+    let auth_v1 = lfs_upload_auth(&signer, &prev_sha, &ctx_v1, &url);
     let resp = http
         .put(format!("{}/upload", url))
         .header("Authorization", auth_v1)
@@ -477,7 +546,7 @@ async fn test_lfs_delta_chain_max_depth() {
             base: Some(prev_sha.clone()),
             ..Default::default()
         };
-        let auth = lfs_upload_auth(&signer, &new_sha, &ctx);
+        let auth = lfs_upload_auth(&signer, &new_sha, &ctx, &url);
         let resp = http
             .put(format!("{}/upload", url))
             .header("Authorization", auth)
@@ -492,7 +561,15 @@ async fn test_lfs_delta_chain_max_depth() {
         prev_sha = new_sha;
     }
 
-    let get_auth = build_blossom_auth(&signer, "get", None, None, "");
+    let get_auth = build_blossom_auth_for_request(
+        &signer,
+        "get",
+        None,
+        &url,
+        &format!("{url}/{prev_sha}"),
+        "GET",
+        "",
+    );
     let resp = http
         .get(format!("{}/{}", url, prev_sha))
         .header("Authorization", auth_header_value(&get_auth))
@@ -523,6 +600,10 @@ async fn test_auth_expired_event_rejected() {
     let tags = vec![
         vec!["t".into(), "upload".into()],
         vec!["x".into(), sha256.clone()],
+        vec!["server".into(), url.clone()],
+        vec!["u".into(), format!("{url}/upload")],
+        vec!["method".into(), "PUT".into()],
+        vec!["nonce".into(), uuid::Uuid::new_v4().to_string()],
         vec!["expiration".into(), expiration.to_string()],
     ];
     let id_bytes = blossom_rs::protocol::compute_event_id(&pubkey, created_at, 24242, &tags, "");
@@ -549,7 +630,15 @@ async fn test_auth_expired_event_rejected() {
         .unwrap();
     assert_eq!(resp.status(), 401, "expired auth should be rejected");
 
-    let valid_auth = build_blossom_auth(&signer, "upload", Some(&sha256), None, "");
+    let valid_auth = build_blossom_auth_for_request(
+        &signer,
+        "upload",
+        Some(&sha256),
+        &url,
+        &format!("{url}/upload"),
+        "PUT",
+        "",
+    );
     let resp = http
         .put(format!("{}/upload", url))
         .header("Authorization", auth_header_value(&valid_auth))
@@ -571,7 +660,15 @@ async fn test_auth_wrong_action_rejected() {
     let data = vec![42u8; 1000];
     let sha256 = blossom_rs::protocol::sha256_hex(&data);
 
-    let wrong_auth = build_blossom_auth(&signer, "get", Some(&sha256), None, "");
+    let wrong_auth = build_blossom_auth_for_request(
+        &signer,
+        "get",
+        Some(&sha256),
+        &url,
+        &format!("{url}/upload"),
+        "PUT",
+        "",
+    );
     let resp = http
         .put(format!("{}/upload", url))
         .header("Authorization", auth_header_value(&wrong_auth))

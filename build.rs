@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=BLOSSOM_TRUSTED_RELEASE_SIGNERS");
     compile_xdelta3();
 }
 

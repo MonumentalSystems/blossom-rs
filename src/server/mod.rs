@@ -19,7 +19,7 @@ pub mod nip96;
 use std::sync::Arc;
 
 use crate::access::{AccessControl, Action, OpenAccess, Role};
-use crate::auth::{verify_blossom_auth, verify_nip98_auth, AuthError};
+use crate::auth::{verify_blossom_auth_bound, verify_nip98_auth, AuthError};
 use crate::db::{BlobDatabase, DbError, MemoryDatabase, UploadRecord};
 use crate::lfs::{
     compress, reconstruct_blob, LfsContext, LfsFileVersion, LfsStorageType, LfsVersionDatabase,
@@ -63,12 +63,13 @@ pub struct ServerState {
     pub(crate) backend: Box<dyn BlobBackend>,
     pub(crate) database: Box<dyn BlobDatabase>,
     pub(crate) access: Box<dyn AccessControl>,
+    pub(crate) role_based_access: Option<Arc<crate::access::RoleBasedAccess>>,
     /// Live whitelist handle for runtime add/remove (if whitelist is in use).
     pub whitelist: Option<Arc<crate::access::Whitelist>>,
     pub(crate) stats: StatsAccumulator,
     pub(crate) rate_limiter: Option<RateLimiter>,
     pub(crate) notifier: Box<dyn WebhookNotifier>,
-    pub(crate) media_processor: Option<Box<dyn MediaProcessor>>,
+    pub(crate) media_processor: Option<Arc<dyn MediaProcessor>>,
     pub(crate) base_url: String,
     pub(crate) requirements: UploadRequirements,
     pub lock_db: Option<Box<dyn LockDatabase>>,
@@ -84,6 +85,12 @@ impl std::fmt::Debug for ServerState {
 }
 
 impl ServerState {
+    /// Update the externally visible base URL, for example after binding an
+    /// ephemeral port in an embedded server.
+    pub fn set_base_url(&mut self, base_url: impl Into<String>) {
+        self.base_url = base_url.into();
+    }
+
     /// Flush accumulated access statistics to the database.
     ///
     /// Call this periodically (e.g., every 60s) or on graceful shutdown
@@ -106,12 +113,13 @@ pub struct BlobServerBuilder {
     base_url: String,
     database: Option<Box<dyn BlobDatabase>>,
     access: Option<Box<dyn AccessControl>>,
+    role_based_access: Option<Arc<crate::access::RoleBasedAccess>>,
     whitelist: Option<Arc<crate::access::Whitelist>>,
     requirements: UploadRequirements,
     body_limit: usize,
     rate_limiter: Option<RateLimiter>,
     notifier: Option<Box<dyn WebhookNotifier>>,
-    media_processor: Option<Box<dyn MediaProcessor>>,
+    media_processor: Option<Arc<dyn MediaProcessor>>,
     lock_db: Option<Box<dyn LockDatabase>>,
     lfs_version_db: Option<Box<dyn LfsVersionDatabase>>,
 }
@@ -146,7 +154,8 @@ impl BlobServerBuilder {
     /// Set a role-based access control policy with a live handle for
     /// runtime admin/member management.
     pub fn role_based_access(mut self, rba: Arc<crate::access::RoleBasedAccess>) -> Self {
-        self.access = Some(Box::new(rba));
+        self.access = Some(Box::new(rba.clone()));
+        self.role_based_access = Some(rba);
         self
     }
 
@@ -188,7 +197,7 @@ impl BlobServerBuilder {
 
     /// Set a media processor for image/video handling on `PUT /media` (BUD-05).
     pub fn media_processor(mut self, processor: impl MediaProcessor + 'static) -> Self {
-        self.media_processor = Some(Box::new(processor));
+        self.media_processor = Some(Arc::new(processor));
         self
     }
 
@@ -216,6 +225,7 @@ impl BlobServerBuilder {
                 .database
                 .unwrap_or_else(|| Box::new(MemoryDatabase::new())),
             access: self.access.unwrap_or_else(|| Box::new(OpenAccess)),
+            role_based_access: self.role_based_access,
             whitelist: self.whitelist,
             stats: StatsAccumulator::new(),
             rate_limiter: self.rate_limiter,
@@ -280,6 +290,7 @@ impl BlobServer {
             base_url: base_url.to_string(),
             database: None,
             access: None,
+            role_based_access: None,
             whitelist: None,
             requirements: UploadRequirements::default(),
             body_limit: 256 * 1024 * 1024, // 256 MB default
@@ -416,12 +427,49 @@ fn extract_auth_event(headers: &HeaderMap) -> Result<NostrEvent, AuthError> {
 }
 
 /// Verify an auth event, accepting either kind:24242 (Blossom) or kind:27235 (NIP-98).
-fn verify_auth_event(event: &NostrEvent, expected_action: Option<&str>) -> Result<(), AuthError> {
+pub(crate) fn verify_auth_event(
+    event: &NostrEvent,
+    expected_action: &str,
+    base_url: &str,
+    path: &str,
+    method: &str,
+    expected_hash: Option<&str>,
+) -> Result<(), AuthError> {
+    let server = base_url.trim_end_matches('/');
+    let request_url = format!("{server}{path}");
     match event.kind {
-        24242 => verify_blossom_auth(event, expected_action),
-        27235 => verify_nip98_auth(event, None, None),
+        24242 => verify_blossom_auth_bound(
+            event,
+            expected_action,
+            server,
+            &request_url,
+            method,
+            expected_hash,
+        ),
+        27235 => verify_nip98_auth(event, Some(&request_url), Some(method)),
         other => Err(AuthError::WrongKind(other)),
+    }?;
+
+    static SEEN_AUTH_EVENTS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    > = std::sync::OnceLock::new();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let mut seen = SEEN_AUTH_EVENTS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    seen.retain(|_, expires_at| *expires_at > now);
+    if seen.contains_key(&event.id) {
+        return Err(AuthError::Replay);
     }
+    if seen.len() >= 10_000 {
+        return Err(AuthError::Replay);
+    }
+    seen.insert(event.id.clone(), now.saturating_add(120));
+    Ok(())
 }
 
 fn error_json(msg: &str) -> Json<serde_json::Value> {
@@ -440,8 +488,10 @@ fn to_json_response(value: &impl serde::Serialize) -> (StatusCode, Json<serde_js
 }
 
 /// Validate that a string is a valid SHA256 hex hash (64 lowercase hex chars).
-fn is_valid_sha256(s: &str) -> bool {
-    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
+pub(crate) fn is_valid_sha256(s: &str) -> bool {
+    s.len() == 64
+        && s.bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
 }
 
 /// Extract Content-Type from request headers. If missing or generic
@@ -477,6 +527,126 @@ fn detect_mime(data: &[u8]) -> String {
     .to_string()
 }
 
+pub(crate) fn mime_allowed(requirements: &UploadRequirements, mime: &str) -> bool {
+    let normalized = mime
+        .split(';')
+        .next()
+        .unwrap_or(mime)
+        .trim()
+        .to_ascii_lowercase();
+    requirements.allowed_types.is_empty()
+        || requirements
+            .allowed_types
+            .iter()
+            .any(|allowed| allowed.trim().eq_ignore_ascii_case(&normalized))
+}
+
+fn is_blocked_mirror_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ip) => {
+            let [a, b, c, _] = ip.octets();
+            a == 0
+                || a == 10
+                || a == 127
+                || a >= 224
+                || (a == 100 && (64..=127).contains(&b))
+                || (a == 169 && b == 254)
+                || (a == 172 && (16..=31).contains(&b))
+                || (a == 192 && b == 168)
+                || (a == 192 && b == 0)
+                || (a == 192 && b == 88 && c == 99)
+                || (a == 198 && (18..=19).contains(&b))
+                || (a == 198 && b == 51 && c == 100)
+                || (a == 203 && b == 0 && c == 113)
+        }
+        std::net::IpAddr::V6(ip) => {
+            if let Some(v4) = ip.to_ipv4() {
+                return is_blocked_mirror_ip(v4.into());
+            }
+            let segments = ip.segments();
+            let first = segments[0];
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || (first & 0xfe00) == 0xfc00
+                || (first & 0xffc0) == 0xfe80
+                || (first & 0xffc0) == 0xfec0
+                || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+        }
+    }
+}
+
+async fn fetch_mirror_blob(source: &str, max_bytes: u64) -> Result<Vec<u8>, String> {
+    let mut url = reqwest::Url::parse(source).map_err(|e| format!("invalid mirror URL: {e}"))?;
+    for _ in 0..=3 {
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err("mirror URL must use http or https".into());
+        }
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err("mirror URL must not contain credentials".into());
+        }
+        let host = url
+            .host_str()
+            .ok_or("mirror URL must have a host")?
+            .to_string();
+        let port = url
+            .port_or_known_default()
+            .ok_or("mirror URL has no usable port")?;
+        let addresses: Vec<_> = tokio::net::lookup_host((host.as_str(), port))
+            .await
+            .map_err(|e| format!("mirror DNS lookup failed: {e}"))?
+            .collect();
+        if addresses.is_empty() || addresses.iter().any(|addr| is_blocked_mirror_ip(addr.ip())) {
+            return Err("mirror destination resolves to a blocked network".into());
+        }
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(60))
+            .resolve(&host, addresses[0])
+            .build()
+            .map_err(|e| format!("mirror client: {e}"))?;
+        let mut response = client
+            .get(url.clone())
+            .send()
+            .await
+            .map_err(|e| format!("failed to fetch remote: {e}"))?;
+        if response.status().is_redirection() {
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .ok_or("mirror redirect missing Location")?;
+            url = url
+                .join(location)
+                .map_err(|e| format!("invalid redirect: {e}"))?;
+            continue;
+        }
+        if !response.status().is_success() {
+            return Err(format!("remote returned status {}", response.status()));
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > max_bytes)
+        {
+            return Err(format!("remote body exceeds maximum of {max_bytes} bytes"));
+        }
+        let mut data = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| format!("failed to read remote body: {e}"))?
+        {
+            if (data.len() as u64).saturating_add(chunk.len() as u64) > max_bytes {
+                return Err(format!("remote body exceeds maximum of {max_bytes} bytes"));
+            }
+            data.extend_from_slice(&chunk);
+        }
+        return Ok(data);
+    }
+    Err("too many mirror redirects".into())
+}
+
 // ---------------------------------------------------------------------------
 // BUD-01: Upload
 // ---------------------------------------------------------------------------
@@ -496,20 +666,6 @@ async fn handle_upload(
 
     let mut s = state.lock().await;
 
-    // Rate limit check (keyed by source IP placeholder — use pubkey if available).
-    if let Some(ref limiter) = s.rate_limiter {
-        let key = extract_auth_event(&headers)
-            .ok()
-            .map(|e| e.pubkey)
-            .unwrap_or_else(|| "anonymous".to_string());
-        if !limiter.check(&key) {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                error_json("rate limit exceeded"),
-            );
-        }
-    }
-
     // BUD-06: Check upload requirements.
     if let Some(max) = s.requirements.max_size {
         if data.len() as u64 > max {
@@ -520,11 +676,23 @@ async fn handle_upload(
         }
     }
 
+    // Compute the content identity before auth so authorization is bound to
+    // the exact bytes supplied in this request.
+    let original_sha256 = crate::protocol::sha256_hex(&data);
+    let original_size = data.len() as u64;
+
     // Auth check.
     let pubkey = if s.requirements.require_auth {
         match extract_auth_event(&headers) {
             Ok(event) => {
-                if let Err(e) = verify_auth_event(&event, Some("upload")) {
+                if let Err(e) = verify_auth_event(
+                    &event,
+                    "upload",
+                    &s.base_url,
+                    "/upload",
+                    "PUT",
+                    Some(&original_sha256),
+                ) {
                     return (StatusCode::UNAUTHORIZED, error_json(&e.to_string()));
                 }
                 // Access control check.
@@ -535,11 +703,20 @@ async fn handle_upload(
                     );
                 }
                 // Quota check.
+                let additional_bytes = if s
+                    .database
+                    .is_upload_owner(&original_sha256, &event.pubkey)
+                    .unwrap_or(false)
+                {
+                    0
+                } else {
+                    data.len() as u64
+                };
                 if let Err(DbError::QuotaExceeded {
                     used,
                     requested,
                     limit,
-                }) = s.database.check_quota(&event.pubkey, data.len() as u64)
+                }) = s.database.check_quota(&event.pubkey, additional_bytes)
                 {
                     return (
                         StatusCode::INSUFFICIENT_STORAGE,
@@ -556,16 +733,73 @@ async fn handle_upload(
             }
         }
     } else {
-        // Try to extract pubkey if auth header is present (optional).
-        extract_auth_event(&headers).ok().map(|e| e.pubkey)
+        // Optional auth still has to be valid before it can assign ownership.
+        if headers.contains_key("authorization") {
+            match extract_auth_event(&headers) {
+                Ok(event) => {
+                    if let Err(error) = verify_auth_event(
+                        &event,
+                        "upload",
+                        &s.base_url,
+                        "/upload",
+                        "PUT",
+                        Some(&original_sha256),
+                    ) {
+                        return (StatusCode::UNAUTHORIZED, error_json(&error.to_string()));
+                    }
+                    if s.access.is_allowed(&event.pubkey, Action::Upload) {
+                        let additional_bytes = if s
+                            .database
+                            .is_upload_owner(&original_sha256, &event.pubkey)
+                            .unwrap_or(false)
+                        {
+                            0
+                        } else {
+                            data.len() as u64
+                        };
+                        if let Err(error) = s.database.check_quota(&event.pubkey, additional_bytes)
+                        {
+                            return (
+                                StatusCode::INSUFFICIENT_STORAGE,
+                                error_json(&error.to_string()),
+                            );
+                        }
+                        Some(event.pubkey)
+                    } else {
+                        // On an explicitly anonymous server, a valid signature
+                        // from a non-member does not confer ownership or quota.
+                        None
+                    }
+                }
+                Err(error) => {
+                    return (StatusCode::UNAUTHORIZED, error_json(&error.to_string()));
+                }
+            }
+        } else {
+            None
+        }
     };
+
+    // Only verified identities may receive their own bucket. Invalid or
+    // anonymous requests share the bounded anonymous bucket.
+    if let Some(ref limiter) = s.rate_limiter {
+        let key = pubkey.as_deref().unwrap_or("anonymous");
+        if !limiter.check(key) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                error_json("rate limit exceeded"),
+            );
+        }
+    }
 
     // Detect Content-Type before moving data into backend.
     let content_type = extract_content_type(&headers).unwrap_or_else(|| detect_mime(&data));
-
-    // Compute SHA-256 of original data (content identity).
-    let original_sha256 = crate::protocol::sha256_hex(&data);
-    let original_size = data.len() as u64;
+    if !mime_allowed(&s.requirements, &content_type) {
+        return (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            error_json("content type is not allowed"),
+        );
+    }
 
     // Parse LFS context from auth event tags.
     let lfs_ctx = extract_auth_event(&headers)
@@ -646,8 +880,17 @@ async fn handle_upload(
         let desc =
             crate::storage::make_descriptor_from_hash(&original_sha256, original_size, &base_url);
         if !s.backend.exists(&original_sha256) {
-            s.backend
-                .insert_with_hash(stored_data, &original_sha256, original_size, &base_url);
+            if let Err(error) = s.backend.try_insert_with_hash(
+                stored_data,
+                &original_sha256,
+                original_size,
+                &base_url,
+            ) {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error_json(&format!("storage write failed: {error}")),
+                );
+            }
         }
         desc
     };
@@ -701,7 +944,12 @@ async fn handle_upload(
         created_at: descriptor.uploaded.unwrap_or(0),
         phash: None,
     };
-    let _ = s.database.record_upload(&record);
+    if let Err(error) = s.database.record_upload(&record) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_json(&format!("metadata write failed: {error}")),
+        );
+    }
 
     // Fire webhook.
     s.notifier.notify(webhooks::make_payload(
@@ -819,13 +1067,24 @@ async fn handle_delete_blob(
     Path(sha256): Path<String>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    if !is_valid_sha256(&sha256) {
+        return (StatusCode::BAD_REQUEST, error_json("invalid SHA256 hash"));
+    }
+
     // DELETE always requires auth.
     match extract_auth_event(&headers) {
         Ok(event) => {
-            if let Err(e) = verify_auth_event(&event, Some("delete")) {
+            let mut s = state.lock().await;
+            if let Err(e) = verify_auth_event(
+                &event,
+                "delete",
+                &s.base_url,
+                &format!("/{sha256}"),
+                "DELETE",
+                Some(&sha256),
+            ) {
                 return (StatusCode::UNAUTHORIZED, error_json(&e.to_string()));
             }
-            let mut s = state.lock().await;
             let role = s.access.role(&event.pubkey);
             if role == Role::Denied {
                 return (
@@ -833,13 +1092,36 @@ async fn handle_delete_blob(
                     error_json("delete not allowed for this pubkey"),
                 );
             }
-            // Members may only delete their own blobs. Anonymous uploads
-            // (pubkey "anonymous") have no owner, so anyone may delete them.
+            // Members remove only their own ownership reference. The physical
+            // blob remains while another user still references the same hash.
             if role != Role::Admin {
-                if let Ok(record) = s.database.get_upload(&sha256) {
-                    if record.pubkey != "anonymous" && record.pubkey != event.pubkey {
-                        return (StatusCode::FORBIDDEN, error_json("not the blob owner"));
+                if !s
+                    .database
+                    .is_upload_owner(&sha256, &event.pubkey)
+                    .unwrap_or(false)
+                {
+                    return (StatusCode::FORBIDDEN, error_json("not the blob owner"));
+                }
+                let owner_count = match s.database.upload_owner_count(&sha256) {
+                    Ok(count) => count,
+                    Err(error) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            error_json(&error.to_string()),
+                        )
                     }
+                };
+                if owner_count > 1 {
+                    if let Err(error) = s.database.delete_upload_owner(&sha256, &event.pubkey) {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            error_json(&error.to_string()),
+                        );
+                    }
+                    return (
+                        StatusCode::OK,
+                        Json(serde_json::json!({"deleted": true, "blob_retained": true})),
+                    );
                 }
             }
             let base_url_clone = s.base_url.clone();
@@ -862,41 +1144,61 @@ async fn handle_delete_blob(
                     if let Some(base_decompressed) = base_decompressed_opt {
                         let compressed = compress::compress(&base_decompressed)
                             .unwrap_or_else(|_| base_decompressed.clone());
-                        s.backend.insert_with_hash(
+                        if let Err(error) = s.backend.try_insert_with_hash(
                             compressed,
                             &delta_version.sha256,
                             delta_version.original_size as u64,
                             &base_url_clone,
-                        );
+                        ) {
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                error_json(&format!("delta rebase storage failed: {error}")),
+                            );
+                        }
                         if let Some(ref mut lfs_db) = s.lfs_version_db {
-                            let _ = lfs_db.update_version(
+                            if let Err(error) = lfs_db.update_version(
                                 &delta_version.sha256,
                                 LfsStorageType::Compressed,
                                 None,
                                 base_decompressed.len() as i64,
-                            );
+                            ) {
+                                return (
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    error_json(&format!("delta metadata update failed: {error}")),
+                                );
+                            }
                         }
                     }
                 }
             }
 
-            if s.backend.delete(&sha256) {
-                let _ = s.database.delete_upload(&sha256);
+            match s.backend.try_delete(&sha256) {
+                Ok(true) => {
+                    if let Err(error) = s.database.delete_upload(&sha256) {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            error_json(&error.to_string()),
+                        );
+                    }
 
-                if let Some(ref mut lfs_db) = s.lfs_version_db {
-                    let _ = lfs_db.delete_by_sha256(&sha256);
+                    if let Some(ref mut lfs_db) = s.lfs_version_db {
+                        let _ = lfs_db.delete_by_sha256(&sha256);
+                    }
+
+                    s.notifier.notify(webhooks::make_payload(
+                        EventType::Delete,
+                        &sha256,
+                        0,
+                        &event.pubkey,
+                        None,
+                    ));
+                    (StatusCode::OK, Json(serde_json::json!({"deleted": true})))
                 }
-
-                s.notifier.notify(webhooks::make_payload(
-                    EventType::Delete,
-                    &sha256,
-                    0,
-                    &event.pubkey,
-                    None,
-                ));
-                (StatusCode::OK, Json(serde_json::json!({"deleted": true})))
-            } else {
-                (StatusCode::NOT_FOUND, error_json("not found"))
+                Ok(false) => (StatusCode::NOT_FOUND, error_json("not found")),
+                Err(error) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error_json(&format!("storage delete failed: {error}")),
+                ),
             }
         }
         Err(_) => (
@@ -953,12 +1255,28 @@ async fn handle_mirror(
     headers: HeaderMap,
     Json(req): Json<MirrorRequest>,
 ) -> impl IntoResponse {
-    tracing::Span::current().record("mirror.source_url", req.url.as_str());
+    let log_target = reqwest::Url::parse(&req.url)
+        .ok()
+        .and_then(|url| {
+            let host = url.host_str()?;
+            Some(format!("{}://{}", url.scheme(), host))
+        })
+        .unwrap_or_else(|| "invalid-url".into());
+    tracing::Span::current().record("mirror.source_url", log_target.as_str());
 
     // Mirror requires auth.
+    let base_url = state.lock().await.base_url.clone();
     let pubkey = match extract_auth_event(&headers) {
         Ok(event) => {
-            if let Err(e) = verify_auth_event(&event, Some("upload")) {
+            let source_hash = crate::protocol::sha256_hex(req.url.as_bytes());
+            if let Err(e) = verify_auth_event(
+                &event,
+                "upload",
+                &base_url,
+                "/mirror",
+                "PUT",
+                Some(&source_hash),
+            ) {
                 return (StatusCode::UNAUTHORIZED, error_json(&e.to_string()));
             }
             event.pubkey
@@ -968,36 +1286,15 @@ async fn handle_mirror(
         }
     };
 
-    // Fetch the remote blob.
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
-
-    let resp = match client.get(&req.url).send().await {
-        Ok(r) if r.status().is_success() => r,
-        Ok(r) => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                error_json(&format!("remote returned status {}", r.status())),
-            );
-        }
-        Err(e) => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                error_json(&format!("failed to fetch remote: {e}")),
-            );
-        }
-    };
-
-    let data = match resp.bytes().await {
-        Ok(b) => b.to_vec(),
-        Err(e) => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                error_json(&format!("failed to read remote body: {e}")),
-            );
-        }
+    let max_mirror_size = state
+        .lock()
+        .await
+        .requirements
+        .max_size
+        .unwrap_or(256 * 1024 * 1024);
+    let data = match fetch_mirror_blob(&req.url, max_mirror_size).await {
+        Ok(data) => data,
+        Err(error) => return (StatusCode::BAD_GATEWAY, error_json(&error)),
     };
 
     if data.is_empty() {
@@ -1008,6 +1305,13 @@ async fn handle_mirror(
     }
 
     let mut s = state.lock().await;
+    let mirror_mime = detect_mime(&data);
+    if !mime_allowed(&s.requirements, &mirror_mime) {
+        return (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            error_json("mirrored content type is not allowed"),
+        );
+    }
 
     // Check size limit.
     if let Some(max) = s.requirements.max_size {
@@ -1028,11 +1332,21 @@ async fn handle_mirror(
     }
 
     // Quota check.
+    let mirrored_sha256 = crate::protocol::sha256_hex(&data);
+    let additional_bytes = if s
+        .database
+        .is_upload_owner(&mirrored_sha256, &pubkey)
+        .unwrap_or(false)
+    {
+        0
+    } else {
+        data.len() as u64
+    };
     if let Err(DbError::QuotaExceeded {
         used,
         requested,
         limit,
-    }) = s.database.check_quota(&pubkey, data.len() as u64)
+    }) = s.database.check_quota(&pubkey, additional_bytes)
     {
         return (
             StatusCode::INSUFFICIENT_STORAGE,
@@ -1044,7 +1358,15 @@ async fn handle_mirror(
     }
 
     let base_url = s.base_url.clone();
-    let descriptor = s.backend.insert(data, &base_url);
+    let descriptor = match s.backend.try_insert(data, &base_url) {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_json(&format!("storage write failed: {error}")),
+            );
+        }
+    };
 
     // Record in database.
     let record = UploadRecord {
@@ -1058,7 +1380,12 @@ async fn handle_mirror(
         created_at: descriptor.uploaded.unwrap_or(0),
         phash: None,
     };
-    let _ = s.database.record_upload(&record);
+    if let Err(error) = s.database.record_upload(&record) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_json(&format!("metadata write failed: {error}")),
+        );
+    }
 
     // Fire webhook with source URL as metadata.
     s.notifier.notify(webhooks::make_payload(
@@ -1066,7 +1393,7 @@ async fn handle_mirror(
         &descriptor.sha256,
         descriptor.size,
         &record.pubkey,
-        Some(serde_json::json!({"source_url": req.url})),
+        Some(serde_json::json!({"source_origin": log_target})),
     ));
 
     to_json_response(&descriptor)
@@ -1088,11 +1415,12 @@ async fn handle_media_upload(
         return (StatusCode::BAD_REQUEST, error_json("empty body"));
     }
 
-    let mut s = state.lock().await;
+    let s = state.lock().await;
+    let upload_sha256 = crate::protocol::sha256_hex(&data);
 
     // Media processor required.
-    let processor = match s.media_processor {
-        Some(ref p) => p,
+    let processor = match s.media_processor.clone() {
+        Some(p) => p,
         None => {
             return (
                 StatusCode::NOT_IMPLEMENTED,
@@ -1104,7 +1432,14 @@ async fn handle_media_upload(
     // Auth required for media uploads.
     let pubkey = match extract_auth_event(&headers) {
         Ok(event) => {
-            if let Err(e) = verify_auth_event(&event, Some("upload")) {
+            if let Err(e) = verify_auth_event(
+                &event,
+                "upload",
+                &s.base_url,
+                "/media",
+                "PUT",
+                Some(&upload_sha256),
+            ) {
                 return (StatusCode::UNAUTHORIZED, error_json(&e.to_string()));
             }
             if !s.access.is_allowed(&event.pubkey, Action::Upload) {
@@ -1122,21 +1457,88 @@ async fn handle_media_upload(
 
     // Detect MIME type from content (simple heuristic).
     let mime = detect_mime(&data);
+    if !mime_allowed(&s.requirements, &mime) {
+        return (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            error_json("content type is not allowed"),
+        );
+    }
+    drop(s);
 
-    // Process the media.
-    let result = match processor.process(&data, &mime) {
-        Ok(r) => r,
-        Err(e) => {
+    // Process CPU-heavy, attacker-controlled media outside the shared state
+    // lock and within a hard execution deadline.
+    static MEDIA_PROCESS_LIMIT: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    let permit = match MEDIA_PROCESS_LIMIT
+        .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(4)))
+        .clone()
+        .try_acquire_owned()
+    {
+        Ok(permit) => permit,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                error_json("media processing capacity exhausted"),
+            )
+        }
+    };
+    let process_data = data.clone();
+    let process_mime = mime.clone();
+    let task = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        processor.process(&process_data, &process_mime)
+    });
+    let result = match tokio::time::timeout(std::time::Duration::from_secs(30), task).await {
+        Ok(Ok(Ok(result))) => result,
+        Ok(Ok(Err(error))) => {
             return (
                 StatusCode::UNPROCESSABLE_ENTITY,
-                error_json(&format!("media processing failed: {e}")),
+                error_json(&format!("media processing failed: {error}")),
+            );
+        }
+        Ok(Err(error)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_json(&format!("media worker failed: {error}")),
+            );
+        }
+        Err(_) => {
+            return (
+                StatusCode::REQUEST_TIMEOUT,
+                error_json("media processing timed out"),
             );
         }
     };
 
+    let mut s = state.lock().await;
+    let processed_sha256 = crate::protocol::sha256_hex(&result.data);
+    let additional_bytes = if s
+        .database
+        .is_upload_owner(&processed_sha256, &pubkey)
+        .unwrap_or(false)
+    {
+        0
+    } else {
+        result.data.len() as u64
+    };
+    if let Err(error) = s.database.check_quota(&pubkey, additional_bytes) {
+        return (
+            StatusCode::INSUFFICIENT_STORAGE,
+            error_json(&error.to_string()),
+        );
+    }
+
     // Store the processed data.
     let base_url = s.base_url.clone();
-    let descriptor = s.backend.insert(result.data, &base_url);
+    let descriptor = match s.backend.try_insert(result.data, &base_url) {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_json(&format!("storage write failed: {error}")),
+            );
+        }
+    };
     tracing::Span::current().record("blob.sha256", descriptor.sha256.as_str());
 
     // Record in database with phash.
@@ -1148,7 +1550,12 @@ async fn handle_media_upload(
         created_at: descriptor.uploaded.unwrap_or(0),
         phash: result.phash,
     };
-    let _ = s.database.record_upload(&record);
+    if let Err(error) = s.database.record_upload(&record) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_json(&format!("metadata write failed: {error}")),
+        );
+    }
 
     s.notifier.notify(webhooks::make_payload(
         EventType::Upload,
@@ -1319,13 +1726,34 @@ mod tests {
     }
 
     async fn spawn_server(server: BlobServer) -> String {
-        let app = server.router();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let url = format!("http://{}", addr);
+        server.state.lock().await.base_url = url.clone();
+        let app = server.router();
         tokio::spawn(async move { axum::serve(listener, app).await.ok() });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         url
+    }
+
+    fn request_auth(
+        signer: &crate::auth::Signer,
+        base_url: &str,
+        path: &str,
+        method: &str,
+        action: &str,
+        hash: Option<&str>,
+    ) -> String {
+        let event = crate::auth::build_blossom_auth_for_request(
+            signer,
+            action,
+            hash,
+            base_url,
+            &format!("{base_url}{path}"),
+            method,
+            "",
+        );
+        crate::auth::auth_header_value(&event)
     }
 
     #[tokio::test]
@@ -1595,16 +2023,23 @@ mod tests {
         let http = reqwest::Client::new();
         let signer = crate::auth::Signer::generate();
 
-        let auth_event = crate::auth::build_blossom_auth(&signer, "delete", None, None, "");
-        let auth_header = crate::auth::auth_header_value(&auth_event);
+        let hash = "0".repeat(64);
+        let auth_header = request_auth(
+            &signer,
+            &url,
+            &format!("/{hash}"),
+            "DELETE",
+            "delete",
+            Some(&hash),
+        );
 
         let resp = http
-            .delete(format!("{}/{}", url, "0".repeat(64)))
+            .delete(format!("{}/{}", url, hash))
             .header("Authorization", &auth_header)
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), 404);
+        assert_eq!(resp.status(), 403);
     }
 
     #[tokio::test]
@@ -1627,13 +2062,21 @@ mod tests {
         let http = reqwest::Client::new();
         let signer = crate::auth::Signer::generate();
 
-        let auth_event = crate::auth::build_blossom_auth(&signer, "upload", None, None, "");
-        let auth_header = crate::auth::auth_header_value(&auth_event);
+        let source_url = "http://127.0.0.1:1/nonexistent";
+        let source_hash = crate::protocol::sha256_hex(source_url.as_bytes());
+        let auth_header = request_auth(
+            &signer,
+            &url,
+            "/mirror",
+            "PUT",
+            "upload",
+            Some(&source_hash),
+        );
 
         let resp = http
             .put(format!("{}/mirror", url))
             .header("Authorization", &auth_header)
-            .json(&serde_json::json!({"url": "http://127.0.0.1:1/nonexistent"}))
+            .json(&serde_json::json!({"url": source_url}))
             .send()
             .await
             .unwrap();
@@ -1641,7 +2084,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_mirror_success() {
+    async fn test_mirror_rejects_private_source() {
         // Spin up a source server with a blob.
         let source = test_server();
         let source_url = spawn_server(source).await;
@@ -1661,29 +2104,26 @@ mod tests {
         let dest_url = spawn_server(dest).await;
         let signer = crate::auth::Signer::generate();
 
-        let auth_event = crate::auth::build_blossom_auth(&signer, "upload", None, None, "");
-        let auth_header = crate::auth::auth_header_value(&auth_event);
+        let source_blob_url = format!("{}/{}", source_url, desc.sha256);
+        let source_hash = crate::protocol::sha256_hex(source_blob_url.as_bytes());
+        let auth_header = request_auth(
+            &signer,
+            &dest_url,
+            "/mirror",
+            "PUT",
+            "upload",
+            Some(&source_hash),
+        );
 
         // Mirror from source to dest.
         let resp = http
             .put(format!("{}/mirror", dest_url))
             .header("Authorization", &auth_header)
-            .json(&serde_json::json!({"url": format!("{}/{}", source_url, desc.sha256)}))
+            .json(&serde_json::json!({"url": source_blob_url}))
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), 200);
-        let mirrored: BlobDescriptor = serde_json::from_value(resp.json().await.unwrap()).unwrap();
-        assert_eq!(mirrored.sha256, desc.sha256);
-
-        // Verify it's on dest.
-        let resp = http
-            .get(format!("{}/{}", dest_url, desc.sha256))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        assert_eq!(resp.bytes().await.unwrap().as_ref(), data);
+        assert_eq!(resp.status(), 502);
     }
 
     #[tokio::test]
@@ -1772,11 +2212,13 @@ mod tests {
 
         // Alice uploads a blob.
         let alice = crate::auth::Signer::generate();
-        let auth = crate::auth::build_blossom_auth(&alice, "upload", None, None, "");
+        let data = b"alice's data";
+        let hash = crate::protocol::sha256_hex(data);
+        let auth = request_auth(&alice, &url, "/upload", "PUT", "upload", Some(&hash));
         let resp = http
             .put(format!("{}/upload", url))
-            .header("Authorization", crate::auth::auth_header_value(&auth))
-            .body(b"alice's data".to_vec())
+            .header("Authorization", auth)
+            .body(data.to_vec())
             .send()
             .await
             .unwrap();
@@ -1786,20 +2228,34 @@ mod tests {
 
         // Bob tries to delete Alice's blob — should fail.
         let bob = crate::auth::Signer::generate();
-        let del_auth = crate::auth::build_blossom_auth(&bob, "delete", None, None, "");
+        let del_auth = request_auth(
+            &bob,
+            &url,
+            &format!("/{sha}"),
+            "DELETE",
+            "delete",
+            Some(&sha),
+        );
         let resp = http
             .delete(format!("{}/{}", url, sha))
-            .header("Authorization", crate::auth::auth_header_value(&del_auth))
+            .header("Authorization", del_auth)
             .send()
             .await
             .unwrap();
         assert_eq!(resp.status(), 403);
 
         // Alice can delete her own blob.
-        let del_auth = crate::auth::build_blossom_auth(&alice, "delete", None, None, "");
+        let del_auth = request_auth(
+            &alice,
+            &url,
+            &format!("/{sha}"),
+            "DELETE",
+            "delete",
+            Some(&sha),
+        );
         let resp = http
             .delete(format!("{}/{}", url, sha))
-            .header("Authorization", crate::auth::auth_header_value(&del_auth))
+            .header("Authorization", del_auth)
             .send()
             .await
             .unwrap();
@@ -1807,7 +2263,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_anyone_can_delete_anonymous_blob() {
+    async fn test_member_cannot_delete_anonymous_blob() {
         let server = BlobServer::new(MemoryBackend::new(), "http://localhost:3000");
         let url = spawn_server(server).await;
         let http = reqwest::Client::new();
@@ -1823,15 +2279,22 @@ mod tests {
         let desc: serde_json::Value = resp.json().await.unwrap();
         let sha = desc["sha256"].as_str().unwrap().to_string();
 
-        // Anyone with auth can delete anonymous blobs.
+        // Anonymous uploads have no member owner and require an admin delete.
         let signer = crate::auth::Signer::generate();
-        let del_auth = crate::auth::build_blossom_auth(&signer, "delete", None, None, "");
+        let del_auth = request_auth(
+            &signer,
+            &url,
+            &format!("/{sha}"),
+            "DELETE",
+            "delete",
+            Some(&sha),
+        );
         let resp = http
             .delete(format!("{}/{}", url, sha))
-            .header("Authorization", crate::auth::auth_header_value(&del_auth))
+            .header("Authorization", del_auth)
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.status(), 403);
     }
 }

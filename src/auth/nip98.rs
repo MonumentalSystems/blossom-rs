@@ -33,28 +33,33 @@ pub fn verify_nip98_auth(
         .as_secs();
 
     // NIP-98 events should be recent (within 60 seconds).
+    if event.created_at > now.saturating_add(30) {
+        return Err(AuthError::FutureDated);
+    }
     if now.saturating_sub(event.created_at) > 60 {
         return Err(AuthError::Expired);
     }
 
     // Check URL tag.
     if let Some(url) = expected_url {
-        let has_url = event
+        let tags: Vec<_> = event
             .tags
             .iter()
-            .any(|t| t.len() >= 2 && t[0] == "u" && t[1] == url);
-        if !has_url {
+            .filter(|t| t.first().is_some_and(|v| v == "u"))
+            .collect();
+        if tags.len() != 1 || tags[0].len() != 2 || tags[0][1] != url {
             return Err(AuthError::WrongAction);
         }
     }
 
     // Check method tag.
     if let Some(method) = expected_method {
-        let has_method = event
+        let tags: Vec<_> = event
             .tags
             .iter()
-            .any(|t| t.len() >= 2 && t[0] == "method" && t[1].eq_ignore_ascii_case(method));
-        if !has_method {
+            .filter(|t| t.first().is_some_and(|v| v == "method"))
+            .collect();
+        if tags.len() != 1 || tags[0].len() != 2 || !tags[0][1].eq_ignore_ascii_case(method) {
             return Err(AuthError::WrongAction);
         }
     }
@@ -91,6 +96,7 @@ pub fn build_nip98_auth(signer: &dyn super::BlossomSigner, url: &str, method: &s
     let tags = vec![
         vec!["u".to_string(), url.to_string()],
         vec!["method".to_string(), method.to_string()],
+        vec!["nonce".to_string(), uuid::Uuid::new_v4().to_string()],
     ];
 
     let id_bytes = compute_event_id(&pubkey, created_at, kind, &tags, "");

@@ -10,6 +10,8 @@ use std::time::Duration;
 
 use dashmap::DashMap;
 
+const MAX_TRACKED_KEYS: usize = 10_000;
+
 /// Configuration for the rate limiter.
 #[derive(Debug, Clone)]
 pub struct RateLimitConfig {
@@ -59,6 +61,13 @@ impl RateLimiter {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
+
+        if !self.buckets.contains_key(key) && self.buckets.len() >= MAX_TRACKED_KEYS {
+            self.cleanup(Duration::from_secs(10 * 60));
+            if self.buckets.len() >= MAX_TRACKED_KEYS {
+                return false;
+            }
+        }
 
         let entry = self
             .buckets
@@ -217,5 +226,15 @@ mod tests {
 
         let total: u64 = handles.into_iter().map(|h| h.join().unwrap()).sum();
         assert_eq!(total, 100); // Exactly max_tokens allowed.
+    }
+
+    #[test]
+    fn test_bucket_cardinality_is_bounded() {
+        let limiter = RateLimiter::default();
+        for i in 0..MAX_TRACKED_KEYS {
+            assert!(limiter.check(&format!("client-{i}")));
+        }
+        assert!(!limiter.check("one-too-many"));
+        assert_eq!(limiter.tracked_keys(), MAX_TRACKED_KEYS);
     }
 }

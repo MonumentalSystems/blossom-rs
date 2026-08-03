@@ -147,7 +147,20 @@ fn load_and_verify_release_manifest() -> Option<(ReleaseManifest, IntegrityStatu
     let manifest_path = release_manifest_path()?;
     let manifest_bytes = std::fs::read(&manifest_path).ok()?;
     let manifest = serde_json::from_slice::<ReleaseManifest>(&manifest_bytes).ok()?;
-    let status = verify_release_manifest(&manifest, &manifest_path);
+    // The trust anchor is compiled into the binary by the release build. A
+    // signer declared only by the manifest proves consistency, not publisher
+    // authenticity, and must never produce a runtime "verified" status.
+    let trusted = option_env!("BLOSSOM_TRUSTED_RELEASE_SIGNERS")
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|signer| !signer.is_empty())
+        .any(|signer| signer == manifest.signer_npub);
+    let status = if trusted {
+        verify_release_manifest(&manifest, &manifest_path)
+    } else {
+        IntegrityStatus::Mismatch
+    };
     Some((manifest, status))
 }
 

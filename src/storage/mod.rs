@@ -28,6 +28,12 @@ pub trait BlobBackend: Send + Sync {
     /// Store a blob. Returns the blob descriptor with SHA256 hash and size.
     fn insert(&mut self, data: Vec<u8>, base_url: &str) -> BlobDescriptor;
 
+    /// Fallible insert used at request boundaries. Persistent backends should
+    /// override this so storage failures are returned to the caller.
+    fn try_insert(&mut self, data: Vec<u8>, base_url: &str) -> Result<BlobDescriptor, String> {
+        Ok(self.insert(data, base_url))
+    }
+
     /// Store data under a pre-computed SHA-256 hash.
     ///
     /// Used by BUD-20 to store compressed/delta blobs under the original
@@ -43,6 +49,17 @@ pub trait BlobBackend: Send + Sync {
         self.insert(data, base_url)
     }
 
+    /// Fallible variant of [`insert_with_hash`](Self::insert_with_hash).
+    fn try_insert_with_hash(
+        &mut self,
+        data: Vec<u8>,
+        hash: &str,
+        original_size: u64,
+        base_url: &str,
+    ) -> Result<BlobDescriptor, String> {
+        Ok(self.insert_with_hash(data, hash, original_size, base_url))
+    }
+
     /// Retrieve a blob by SHA256 hash.
     fn get(&self, sha256: &str) -> Option<Vec<u8>>;
 
@@ -51,6 +68,11 @@ pub trait BlobBackend: Send + Sync {
 
     /// Delete a blob. Returns true if it existed.
     fn delete(&mut self, sha256: &str) -> bool;
+
+    /// Fallible delete used at request boundaries.
+    fn try_delete(&mut self, sha256: &str) -> Result<bool, String> {
+        Ok(self.delete(sha256))
+    }
 
     /// Number of stored blobs.
     fn len(&self) -> usize;

@@ -465,7 +465,7 @@ async fn test_iroh_upload_file() {
 
 #[tokio::test]
 #[serial]
-async fn test_iroh_force_unlock_by_non_owner() {
+async fn test_iroh_force_unlock_by_non_owner_is_rejected() {
     let (server_addr, _router) = spawn_iroh_server_with_locks().await;
     let owner = Signer::generate();
     let other = Signer::generate();
@@ -488,14 +488,19 @@ async fn test_iroh_force_unlock_by_non_owner() {
         err
     );
 
-    other_client
+    let force_err = other_client
         .delete_lock(&server_addr, "my-repo", &lock.id, true)
         .await
-        .unwrap();
+        .unwrap_err();
+    assert!(
+        force_err.contains("forbidden") || force_err.contains("owner"),
+        "non-owner force unlock should fail: got {}",
+        force_err
+    );
 
     let (locks, _) = other_client
         .list_locks(&server_addr, "my-repo", None, None)
         .await
         .unwrap();
-    assert!(locks.is_empty(), "lock should be gone after force unlock");
+    assert_eq!(locks.len(), 1, "lock should remain after rejected unlock");
 }

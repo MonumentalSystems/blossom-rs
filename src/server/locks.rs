@@ -193,7 +193,15 @@ async fn handle_create_lock(
         Ok(e) => e,
         Err(e) => return (StatusCode::UNAUTHORIZED, error_json(&e.to_string())),
     };
-    if let Err(e) = verify_auth_event(&event, Some("lock")) {
+    let base_url = state.lock().await.base_url.clone();
+    if let Err(e) = verify_auth_event(
+        &event,
+        "lock",
+        &base_url,
+        &format!("/lfs/{repo_id}/locks"),
+        "POST",
+        None,
+    ) {
         return (StatusCode::UNAUTHORIZED, error_json(&e.to_string()));
     }
     let pubkey = event.pubkey;
@@ -252,7 +260,15 @@ async fn handle_list_locks(
         Ok(e) => e,
         Err(e) => return (StatusCode::UNAUTHORIZED, error_json(&e.to_string())),
     };
-    if let Err(e) = verify_auth_event(&event, Some("lock")) {
+    let base_url = state.lock().await.base_url.clone();
+    if let Err(e) = verify_auth_event(
+        &event,
+        "lock",
+        &base_url,
+        &format!("/lfs/{repo_id}/locks"),
+        "GET",
+        None,
+    ) {
         return (StatusCode::UNAUTHORIZED, error_json(&e.to_string()));
     }
 
@@ -297,7 +313,15 @@ async fn handle_verify_locks(
         Ok(e) => e,
         Err(e) => return (StatusCode::UNAUTHORIZED, error_json(&e.to_string())),
     };
-    if let Err(e) = verify_auth_event(&event, Some("lock")) {
+    let base_url = state.lock().await.base_url.clone();
+    if let Err(e) = verify_auth_event(
+        &event,
+        "lock",
+        &base_url,
+        &format!("/lfs/{repo_id}/locks/verify"),
+        "POST",
+        None,
+    ) {
         return (StatusCode::UNAUTHORIZED, error_json(&e.to_string()));
     }
     let pubkey = event.pubkey;
@@ -357,7 +381,15 @@ async fn handle_unlock(
         Ok(e) => e,
         Err(e) => return (StatusCode::UNAUTHORIZED, error_json(&e.to_string())),
     };
-    if let Err(e) = verify_auth_event(&event, Some("lock")) {
+    let base_url = state.lock().await.base_url.clone();
+    if let Err(e) = verify_auth_event(
+        &event,
+        "lock",
+        &base_url,
+        &format!("/lfs/{repo_id}/locks/{lock_id}/unlock"),
+        "POST",
+        None,
+    ) {
         return (StatusCode::UNAUTHORIZED, error_json(&e.to_string()));
     }
     let pubkey = event.pubkey;
@@ -371,7 +403,7 @@ async fn handle_unlock(
         None => return lock_not_configured(),
     };
 
-    let force = body.force || is_admin;
+    let force = body.force && is_admin;
 
     match lock_db.delete_lock(&repo_id, &lock_id, force, &pubkey) {
         Ok(record) => {

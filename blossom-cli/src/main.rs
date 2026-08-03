@@ -7,12 +7,16 @@ use std::path::PathBuf;
 
 use std::sync::Arc;
 
-use blossom_rs::auth::{auth_header_value, build_blossom_auth};
+use blossom_rs::auth::{auth_header_value, build_blossom_auth_for_request, build_nip98_auth};
 use blossom_rs::client::multi::MultiTransportClient;
 use blossom_rs::traits::BlobClient;
 use blossom_rs::transport::IrohBlossomClient;
 use blossom_rs::{BlossomClient, BlossomSigner, Signer};
 use clap::{Parser, Subcommand};
+
+fn nip98_header(signer: &dyn BlossomSigner, url: &str, method: &str) -> String {
+    auth_header_value(&build_nip98_auth(signer, url, method))
+}
 
 #[derive(Parser)]
 #[command(
@@ -33,6 +37,10 @@ struct Args {
     /// Force all operations through iroh (no HTTP fallback).
     #[arg(long, global = true)]
     iroh_only: bool,
+
+    /// Permit sending signed authorization events to a non-loopback HTTP server.
+    #[arg(long, global = true)]
+    allow_insecure_http: bool,
 
     /// Secret key (hex or nsec1 bech32).
     #[arg(short, long, env = "BLOSSOM_SECRET_KEY", global = true)]
@@ -318,6 +326,34 @@ async fn build_client(args: &Args, signer: Signer) -> Result<MultiTransportClien
 }
 
 async fn run(args: Args) -> Result<(), String> {
+    let signs_http_requests = matches!(
+        &args.command,
+        Command::Upload { .. }
+            | Command::Media { .. }
+            | Command::Delete { .. }
+            | Command::List { .. }
+            | Command::Mirror { .. }
+            | Command::Admin(_)
+            | Command::BatchUpload { .. }
+            | Command::Relay(_)
+    ) && !args.iroh_only;
+    if signs_http_requests && !args.allow_insecure_http && !is_iroh_server(&args.server) {
+        let url = reqwest::Url::parse(&args.server)
+            .map_err(|error| format!("invalid server URL: {error}"))?;
+        let loopback = url.host_str().is_some_and(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|address| address.is_loopback())
+        });
+        if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
+            return Err(
+                "refusing to send signed authorization over plaintext HTTP; use HTTPS or --allow-insecure-http"
+                    .into(),
+            );
+        }
+    }
+
     match args.command {
         Command::Keygen => {
             let signer = Signer::generate();
@@ -449,10 +485,17 @@ async fn run(args: Args) -> Result<(), String> {
             let signer = get_signer(&args.key)?;
             let http = reqwest::Client::new();
 
-            let auth_event = build_blossom_auth(&signer, "upload", None, None, "");
-            let auth_header = auth_header_value(&auth_event);
-
             let url = format!("{}/mirror", args.server.trim_end_matches('/'));
+            let source_hash = blossom_rs::protocol::sha256_hex(source_url.as_bytes());
+            let auth_header = auth_header_value(&build_blossom_auth_for_request(
+                &signer,
+                "upload",
+                Some(&source_hash),
+                args.server.trim_end_matches('/'),
+                &url,
+                "PUT",
+                "",
+            ));
             let resp = http
                 .put(&url)
                 .header("Authorization", &auth_header)
@@ -498,10 +541,17 @@ async fn run(args: Args) -> Result<(), String> {
             let mime = mime_from_path(&file);
 
             let http = reqwest::Client::new();
-            let auth = build_blossom_auth(&signer, "upload", None, None, "");
-            let auth_header = auth_header_value(&auth);
-
             let url = format!("{}/media", args.server.trim_end_matches('/'));
+            let hash = blossom_rs::protocol::sha256_hex(&data);
+            let auth_header = auth_header_value(&build_blossom_auth_for_request(
+                &signer,
+                "upload",
+                Some(&hash),
+                args.server.trim_end_matches('/'),
+                &url,
+                "PUT",
+                "",
+            ));
             let resp = http
                 .put(&url)
                 .header("Authorization", &auth_header)
@@ -525,15 +575,14 @@ async fn run(args: Args) -> Result<(), String> {
         Command::Admin(admin_cmd) => {
             let signer = get_signer(&args.key)?;
             let http = reqwest::Client::new();
-            let auth = build_blossom_auth(&signer, "admin", None, None, "");
-            let auth_header = auth_header_value(&auth);
             let base = args.server.trim_end_matches('/');
 
             match admin_cmd {
                 AdminCommand::Stats => {
+                    let url = format!("{}/admin/stats", base);
                     let resp = http
-                        .get(format!("{}/admin/stats", base))
-                        .header("Authorization", &auth_header)
+                        .get(&url)
+                        .header("Authorization", nip98_header(&signer, &url, "GET"))
                         .send()
                         .await
                         .map_err(|e| format!("request: {e}"))?;
@@ -547,9 +596,10 @@ async fn run(args: Args) -> Result<(), String> {
                     }
                 }
                 AdminCommand::GetUser { pubkey } => {
+                    let url = format!("{}/admin/users/{}", base, pubkey);
                     let resp = http
-                        .get(format!("{}/admin/users/{}", base, pubkey))
-                        .header("Authorization", &auth_header)
+                        .get(&url)
+                        .header("Authorization", nip98_header(&signer, &url, "GET"))
                         .send()
                         .await
                         .map_err(|e| format!("request: {e}"))?;
@@ -566,9 +616,10 @@ async fn run(args: Args) -> Result<(), String> {
                     pubkey,
                     quota_bytes,
                 } => {
+                    let url = format!("{}/admin/users/{}/quota", base, pubkey);
                     let resp = http
-                        .put(format!("{}/admin/users/{}/quota", base, pubkey))
-                        .header("Authorization", &auth_header)
+                        .put(&url)
+                        .header("Authorization", nip98_header(&signer, &url, "PUT"))
                         .json(&serde_json::json!({"quota_bytes": quota_bytes}))
                         .send()
                         .await
@@ -583,9 +634,10 @@ async fn run(args: Args) -> Result<(), String> {
                     }
                 }
                 AdminCommand::LfsStats => {
+                    let url = format!("{}/admin/lfs-stats", base);
                     let resp = http
-                        .get(format!("{}/admin/lfs-stats", base))
-                        .header("Authorization", &auth_header)
+                        .get(&url)
+                        .header("Authorization", nip98_header(&signer, &url, "GET"))
                         .send()
                         .await
                         .map_err(|e| format!("request: {e}"))?;
@@ -599,9 +651,10 @@ async fn run(args: Args) -> Result<(), String> {
                     }
                 }
                 AdminCommand::ListBlobs => {
+                    let url = format!("{}/admin/blobs", base);
                     let resp = http
-                        .get(format!("{}/admin/blobs", base))
-                        .header("Authorization", &auth_header)
+                        .get(&url)
+                        .header("Authorization", nip98_header(&signer, &url, "GET"))
                         .send()
                         .await
                         .map_err(|e| format!("request: {e}"))?;
@@ -615,9 +668,10 @@ async fn run(args: Args) -> Result<(), String> {
                     }
                 }
                 AdminCommand::DeleteBlob { sha256 } => {
+                    let url = format!("{}/admin/blobs/{}", base, sha256);
                     let resp = http
-                        .delete(format!("{}/admin/blobs/{}", base, sha256))
-                        .header("Authorization", &auth_header)
+                        .delete(&url)
+                        .header("Authorization", nip98_header(&signer, &url, "DELETE"))
                         .send()
                         .await
                         .map_err(|e| format!("request: {e}"))?;
@@ -629,9 +683,10 @@ async fn run(args: Args) -> Result<(), String> {
                     }
                 }
                 AdminCommand::WhitelistList => {
+                    let url = format!("{}/admin/whitelist", base);
                     let resp = http
-                        .get(format!("{}/admin/whitelist", base))
-                        .header("Authorization", &auth_header)
+                        .get(&url)
+                        .header("Authorization", nip98_header(&signer, &url, "GET"))
                         .send()
                         .await
                         .map_err(|e| format!("request: {e}"))?;
@@ -645,9 +700,10 @@ async fn run(args: Args) -> Result<(), String> {
                     }
                 }
                 AdminCommand::WhitelistAdd { pubkey } => {
+                    let url = format!("{}/admin/whitelist/{}", base, pubkey);
                     let resp = http
-                        .put(format!("{}/admin/whitelist/{}", base, pubkey))
-                        .header("Authorization", &auth_header)
+                        .put(&url)
+                        .header("Authorization", nip98_header(&signer, &url, "PUT"))
                         .send()
                         .await
                         .map_err(|e| format!("request: {e}"))?;
@@ -659,9 +715,10 @@ async fn run(args: Args) -> Result<(), String> {
                     }
                 }
                 AdminCommand::WhitelistRemove { pubkey } => {
+                    let url = format!("{}/admin/whitelist/{}", base, pubkey);
                     let resp = http
-                        .delete(format!("{}/admin/whitelist/{}", base, pubkey))
-                        .header("Authorization", &auth_header)
+                        .delete(&url)
+                        .header("Authorization", nip98_header(&signer, &url, "DELETE"))
                         .send()
                         .await
                         .map_err(|e| format!("request: {e}"))?;
@@ -730,15 +787,15 @@ async fn run(args: Args) -> Result<(), String> {
         Command::Relay(relay_cmd) => {
             let signer = get_signer(&args.key)?;
             let http = reqwest::Client::new();
-            let auth = build_blossom_auth(&signer, "admin", None, None, "");
-            let auth_header = auth_header_value(&auth);
             let base = args.server.trim_end_matches('/');
+            let relay_header =
+                |path: &str, method: &str| nip98_header(&signer, &format!("{base}{path}"), method);
 
             match relay_cmd {
                 RelayCommand::Policy => {
                     let resp = http
                         .get(format!("{}/relay/admin/policy", base))
-                        .header("Authorization", &auth_header)
+                        .header("Authorization", relay_header("/relay/admin/policy", "GET"))
                         .send()
                         .await
                         .map_err(|e| format!("request: {e}"))?;
@@ -754,7 +811,10 @@ async fn run(args: Args) -> Result<(), String> {
                 RelayCommand::WhitelistList => {
                     let resp = http
                         .get(format!("{}/relay/admin/whitelist", base))
-                        .header("Authorization", &auth_header)
+                        .header(
+                            "Authorization",
+                            relay_header("/relay/admin/whitelist", "GET"),
+                        )
                         .send()
                         .await
                         .map_err(|e| format!("request: {e}"))?;
@@ -770,7 +830,10 @@ async fn run(args: Args) -> Result<(), String> {
                 RelayCommand::WhitelistAdd { pubkey } => {
                     let resp = http
                         .put(format!("{}/relay/admin/whitelist", base))
-                        .header("Authorization", &auth_header)
+                        .header(
+                            "Authorization",
+                            relay_header("/relay/admin/whitelist", "PUT"),
+                        )
                         .json(&serde_json::json!({"pubkey": pubkey}))
                         .send()
                         .await
@@ -787,7 +850,10 @@ async fn run(args: Args) -> Result<(), String> {
                 RelayCommand::WhitelistRemove { pubkey } => {
                     let resp = http
                         .delete(format!("{}/relay/admin/whitelist", base))
-                        .header("Authorization", &auth_header)
+                        .header(
+                            "Authorization",
+                            relay_header("/relay/admin/whitelist", "DELETE"),
+                        )
                         .json(&serde_json::json!({"pubkey": pubkey}))
                         .send()
                         .await
@@ -804,7 +870,10 @@ async fn run(args: Args) -> Result<(), String> {
                 RelayCommand::BlacklistList => {
                     let resp = http
                         .get(format!("{}/relay/admin/blacklist", base))
-                        .header("Authorization", &auth_header)
+                        .header(
+                            "Authorization",
+                            relay_header("/relay/admin/blacklist", "GET"),
+                        )
                         .send()
                         .await
                         .map_err(|e| format!("request: {e}"))?;
@@ -820,7 +889,10 @@ async fn run(args: Args) -> Result<(), String> {
                 RelayCommand::BlacklistAdd { pubkey } => {
                     let resp = http
                         .put(format!("{}/relay/admin/blacklist", base))
-                        .header("Authorization", &auth_header)
+                        .header(
+                            "Authorization",
+                            relay_header("/relay/admin/blacklist", "PUT"),
+                        )
                         .json(&serde_json::json!({"pubkey": pubkey}))
                         .send()
                         .await
@@ -837,7 +909,10 @@ async fn run(args: Args) -> Result<(), String> {
                 RelayCommand::BlacklistRemove { pubkey } => {
                     let resp = http
                         .delete(format!("{}/relay/admin/blacklist", base))
-                        .header("Authorization", &auth_header)
+                        .header(
+                            "Authorization",
+                            relay_header("/relay/admin/blacklist", "DELETE"),
+                        )
                         .json(&serde_json::json!({"pubkey": pubkey}))
                         .send()
                         .await
@@ -854,7 +929,7 @@ async fn run(args: Args) -> Result<(), String> {
                 RelayCommand::AdminList => {
                     let resp = http
                         .get(format!("{}/relay/admin/admins", base))
-                        .header("Authorization", &auth_header)
+                        .header("Authorization", relay_header("/relay/admin/admins", "GET"))
                         .send()
                         .await
                         .map_err(|e| format!("request: {e}"))?;
@@ -870,7 +945,7 @@ async fn run(args: Args) -> Result<(), String> {
                 RelayCommand::AdminAdd { pubkey } => {
                     let resp = http
                         .put(format!("{}/relay/admin/admins", base))
-                        .header("Authorization", &auth_header)
+                        .header("Authorization", relay_header("/relay/admin/admins", "PUT"))
                         .json(&serde_json::json!({"pubkey": pubkey}))
                         .send()
                         .await

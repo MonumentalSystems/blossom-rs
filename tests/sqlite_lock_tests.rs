@@ -3,14 +3,22 @@
 //! Tests the full HTTP lock API using SqliteLockDatabase for persistence,
 //! including restart survival.
 
-use blossom_rs::auth::{auth_header_value, build_blossom_auth, Signer};
+use blossom_rs::auth::{auth_header_value, build_blossom_auth_for_request, Signer};
 use blossom_rs::locks::SqliteLockDatabase;
 use blossom_rs::server::BlobServer;
 use blossom_rs::storage::MemoryBackend;
 use blossom_rs::BlossomSigner;
 
-fn lock_auth(signer: &Signer) -> String {
-    let event = build_blossom_auth(signer, "lock", None, None, "");
+fn lock_auth(signer: &Signer, server_url: &str, path: &str, method: &str) -> String {
+    let event = build_blossom_auth_for_request(
+        signer,
+        "lock",
+        None,
+        server_url,
+        &format!("{server_url}{path}"),
+        method,
+        "",
+    );
     auth_header_value(&event)
 }
 
@@ -23,10 +31,11 @@ async fn sqlite_lock_server(db_path: &str) -> BlobServer {
 }
 
 async fn spawn_server(server: BlobServer) -> String {
-    let app = server.router();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let url = format!("http://{}", addr);
+    server.shared_state().lock().await.set_base_url(url.clone());
+    let app = server.router();
     tokio::spawn(async move { axum::serve(listener, app).await.ok() });
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     url
@@ -39,7 +48,7 @@ async fn test_sqlite_create_lock() {
     let server = sqlite_lock_server(db_path).await;
     let url = spawn_server(server).await;
     let signer = Signer::generate();
-    let auth = lock_auth(&signer);
+    let auth = lock_auth(&signer, &url, "/lfs/myrepo/locks", "POST");
 
     let resp = reqwest::Client::new()
         .post(format!("{}/lfs/myrepo/locks", url))
@@ -64,12 +73,14 @@ async fn test_sqlite_lock_conflict() {
     let server = sqlite_lock_server(db_path).await;
     let url = spawn_server(server).await;
     let signer = Signer::generate();
-    let auth = lock_auth(&signer);
     let client = reqwest::Client::new();
 
     let resp1 = client
         .post(format!("{}/lfs/myrepo/locks", url))
-        .header("Authorization", &auth)
+        .header(
+            "Authorization",
+            lock_auth(&signer, &url, "/lfs/myrepo/locks", "POST"),
+        )
         .json(&serde_json::json!({"path": "file.txt"}))
         .send()
         .await
@@ -78,7 +89,10 @@ async fn test_sqlite_lock_conflict() {
 
     let resp2 = client
         .post(format!("{}/lfs/myrepo/locks", url))
-        .header("Authorization", &auth)
+        .header(
+            "Authorization",
+            lock_auth(&signer, &url, "/lfs/myrepo/locks", "POST"),
+        )
         .json(&serde_json::json!({"path": "file.txt"}))
         .send()
         .await
@@ -93,12 +107,14 @@ async fn test_sqlite_unlock_by_owner() {
     let server = sqlite_lock_server(db_path).await;
     let url = spawn_server(server).await;
     let signer = Signer::generate();
-    let auth = lock_auth(&signer);
     let client = reqwest::Client::new();
 
     let create_resp: serde_json::Value = client
         .post(format!("{}/lfs/myrepo/locks", url))
-        .header("Authorization", &auth)
+        .header(
+            "Authorization",
+            lock_auth(&signer, &url, "/lfs/myrepo/locks", "POST"),
+        )
         .json(&serde_json::json!({"path": "file.txt"}))
         .send()
         .await
@@ -111,7 +127,15 @@ async fn test_sqlite_unlock_by_owner() {
 
     let unlock_resp = client
         .post(format!("{}/lfs/myrepo/locks/{}/unlock", url, lock_id))
-        .header("Authorization", &auth)
+        .header(
+            "Authorization",
+            lock_auth(
+                &signer,
+                &url,
+                &format!("/lfs/myrepo/locks/{lock_id}/unlock"),
+                "POST",
+            ),
+        )
         .json(&serde_json::json!({"force": false}))
         .send()
         .await
@@ -132,7 +156,10 @@ async fn test_sqlite_unlock_non_owner_forbidden() {
 
     let create_resp: serde_json::Value = client
         .post(format!("{}/lfs/myrepo/locks", url))
-        .header("Authorization", lock_auth(&owner))
+        .header(
+            "Authorization",
+            lock_auth(&owner, &url, "/lfs/myrepo/locks", "POST"),
+        )
         .json(&serde_json::json!({"path": "file.txt"}))
         .send()
         .await
@@ -145,7 +172,15 @@ async fn test_sqlite_unlock_non_owner_forbidden() {
 
     let unlock_resp = client
         .post(format!("{}/lfs/myrepo/locks/{}/unlock", url, lock_id))
-        .header("Authorization", lock_auth(&other))
+        .header(
+            "Authorization",
+            lock_auth(
+                &other,
+                &url,
+                &format!("/lfs/myrepo/locks/{lock_id}/unlock"),
+                "POST",
+            ),
+        )
         .json(&serde_json::json!({"force": false}))
         .send()
         .await
@@ -161,12 +196,14 @@ async fn test_sqlite_list_locks() {
     let server = sqlite_lock_server(db_path).await;
     let url = spawn_server(server).await;
     let signer = Signer::generate();
-    let auth = lock_auth(&signer);
     let client = reqwest::Client::new();
 
     client
         .post(format!("{}/lfs/myrepo/locks", url))
-        .header("Authorization", &auth)
+        .header(
+            "Authorization",
+            lock_auth(&signer, &url, "/lfs/myrepo/locks", "POST"),
+        )
         .json(&serde_json::json!({"path": "a.txt"}))
         .send()
         .await
@@ -174,7 +211,10 @@ async fn test_sqlite_list_locks() {
 
     client
         .post(format!("{}/lfs/myrepo/locks", url))
-        .header("Authorization", &auth)
+        .header(
+            "Authorization",
+            lock_auth(&signer, &url, "/lfs/myrepo/locks", "POST"),
+        )
         .json(&serde_json::json!({"path": "b.txt"}))
         .send()
         .await
@@ -182,7 +222,10 @@ async fn test_sqlite_list_locks() {
 
     let resp = client
         .get(format!("{}/lfs/myrepo/locks", url))
-        .header("Authorization", &auth)
+        .header(
+            "Authorization",
+            lock_auth(&signer, &url, "/lfs/myrepo/locks", "GET"),
+        )
         .send()
         .await
         .unwrap();
@@ -200,12 +243,14 @@ async fn test_sqlite_list_locks_with_path_filter() {
     let server = sqlite_lock_server(db_path).await;
     let url = spawn_server(server).await;
     let signer = Signer::generate();
-    let auth = lock_auth(&signer);
     let client = reqwest::Client::new();
 
     client
         .post(format!("{}/lfs/myrepo/locks", url))
-        .header("Authorization", &auth)
+        .header(
+            "Authorization",
+            lock_auth(&signer, &url, "/lfs/myrepo/locks", "POST"),
+        )
         .json(&serde_json::json!({"path": "a.txt"}))
         .send()
         .await
@@ -213,7 +258,10 @@ async fn test_sqlite_list_locks_with_path_filter() {
 
     client
         .post(format!("{}/lfs/myrepo/locks", url))
-        .header("Authorization", &auth)
+        .header(
+            "Authorization",
+            lock_auth(&signer, &url, "/lfs/myrepo/locks", "POST"),
+        )
         .json(&serde_json::json!({"path": "b.txt"}))
         .send()
         .await
@@ -221,7 +269,10 @@ async fn test_sqlite_list_locks_with_path_filter() {
 
     let resp = client
         .get(format!("{}/lfs/myrepo/locks?path=a.txt", url))
-        .header("Authorization", &auth)
+        .header(
+            "Authorization",
+            lock_auth(&signer, &url, "/lfs/myrepo/locks", "GET"),
+        )
         .send()
         .await
         .unwrap();
@@ -245,7 +296,10 @@ async fn test_sqlite_verify_locks_ours_theirs() {
 
     client
         .post(format!("{}/lfs/myrepo/locks", url))
-        .header("Authorization", lock_auth(&owner))
+        .header(
+            "Authorization",
+            lock_auth(&owner, &url, "/lfs/myrepo/locks", "POST"),
+        )
         .json(&serde_json::json!({"path": "owner-file.txt"}))
         .send()
         .await
@@ -253,7 +307,10 @@ async fn test_sqlite_verify_locks_ours_theirs() {
 
     client
         .post(format!("{}/lfs/myrepo/locks", url))
-        .header("Authorization", lock_auth(&other))
+        .header(
+            "Authorization",
+            lock_auth(&other, &url, "/lfs/myrepo/locks", "POST"),
+        )
         .json(&serde_json::json!({"path": "other-file.txt"}))
         .send()
         .await
@@ -261,7 +318,10 @@ async fn test_sqlite_verify_locks_ours_theirs() {
 
     let resp = client
         .post(format!("{}/lfs/myrepo/locks/verify", url))
-        .header("Authorization", lock_auth(&owner))
+        .header(
+            "Authorization",
+            lock_auth(&owner, &url, "/lfs/myrepo/locks/verify", "POST"),
+        )
         .json(&serde_json::json!({}))
         .send()
         .await
@@ -284,12 +344,14 @@ async fn test_sqlite_cross_repo_isolation() {
     let server = sqlite_lock_server(db_path).await;
     let url = spawn_server(server).await;
     let signer = Signer::generate();
-    let auth = lock_auth(&signer);
     let client = reqwest::Client::new();
 
     let resp1 = client
         .post(format!("{}/lfs/repo1/locks", url))
-        .header("Authorization", &auth)
+        .header(
+            "Authorization",
+            lock_auth(&signer, &url, "/lfs/repo1/locks", "POST"),
+        )
         .json(&serde_json::json!({"path": "file.txt"}))
         .send()
         .await
@@ -299,7 +361,10 @@ async fn test_sqlite_cross_repo_isolation() {
     // Same path, different repo — should succeed (no conflict).
     let resp2 = client
         .post(format!("{}/lfs/repo2/locks", url))
-        .header("Authorization", &auth)
+        .header(
+            "Authorization",
+            lock_auth(&signer, &url, "/lfs/repo2/locks", "POST"),
+        )
         .json(&serde_json::json!({"path": "file.txt"}))
         .send()
         .await
@@ -309,7 +374,10 @@ async fn test_sqlite_cross_repo_isolation() {
     // Listing repo1 should only show 1 lock.
     let list = client
         .get(format!("{}/lfs/repo1/locks", url))
-        .header("Authorization", &auth)
+        .header(
+            "Authorization",
+            lock_auth(&signer, &url, "/lfs/repo1/locks", "GET"),
+        )
         .send()
         .await
         .unwrap();
@@ -324,13 +392,15 @@ async fn test_sqlite_full_lifecycle() {
     let server = sqlite_lock_server(db_path).await;
     let url = spawn_server(server).await;
     let signer = Signer::generate();
-    let auth = lock_auth(&signer);
     let client = reqwest::Client::new();
 
     // Create
     let create_resp = client
         .post(format!("{}/lfs/myrepo/locks", url))
-        .header("Authorization", &auth)
+        .header(
+            "Authorization",
+            lock_auth(&signer, &url, "/lfs/myrepo/locks", "POST"),
+        )
         .json(&serde_json::json!({"path": "big-file.bin"}))
         .send()
         .await
@@ -342,7 +412,10 @@ async fn test_sqlite_full_lifecycle() {
     // List — should have 1 lock
     let list_resp = client
         .get(format!("{}/lfs/myrepo/locks", url))
-        .header("Authorization", &auth)
+        .header(
+            "Authorization",
+            lock_auth(&signer, &url, "/lfs/myrepo/locks", "GET"),
+        )
         .send()
         .await
         .unwrap();
@@ -353,7 +426,10 @@ async fn test_sqlite_full_lifecycle() {
     // Verify — should be in "ours"
     let verify_resp = client
         .post(format!("{}/lfs/myrepo/locks/verify", url))
-        .header("Authorization", &auth)
+        .header(
+            "Authorization",
+            lock_auth(&signer, &url, "/lfs/myrepo/locks/verify", "POST"),
+        )
         .json(&serde_json::json!({}))
         .send()
         .await
@@ -366,7 +442,15 @@ async fn test_sqlite_full_lifecycle() {
     // Unlock
     let unlock_resp = client
         .post(format!("{}/lfs/myrepo/locks/{}/unlock", url, lock_id))
-        .header("Authorization", &auth)
+        .header(
+            "Authorization",
+            lock_auth(
+                &signer,
+                &url,
+                &format!("/lfs/myrepo/locks/{lock_id}/unlock"),
+                "POST",
+            ),
+        )
         .json(&serde_json::json!({"force": false}))
         .send()
         .await
@@ -376,7 +460,10 @@ async fn test_sqlite_full_lifecycle() {
     // List — should be empty
     let list_after = client
         .get(format!("{}/lfs/myrepo/locks", url))
-        .header("Authorization", &auth)
+        .header(
+            "Authorization",
+            lock_auth(&signer, &url, "/lfs/myrepo/locks", "GET"),
+        )
         .send()
         .await
         .unwrap();
@@ -390,7 +477,6 @@ async fn test_sqlite_locks_persist_across_restart() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let db_path = tmp.path().to_str().unwrap().to_string();
     let signer = Signer::generate();
-    let auth = lock_auth(&signer);
     let client = reqwest::Client::new();
 
     // Server instance 1: create a lock
@@ -399,7 +485,10 @@ async fn test_sqlite_locks_persist_across_restart() {
 
     let create_resp = client
         .post(format!("{}/lfs/myrepo/locks", url1))
-        .header("Authorization", &auth)
+        .header(
+            "Authorization",
+            lock_auth(&signer, &url1, "/lfs/myrepo/locks", "POST"),
+        )
         .json(&serde_json::json!({"path": "persistent-file.bin"}))
         .send()
         .await
@@ -414,7 +503,10 @@ async fn test_sqlite_locks_persist_across_restart() {
 
     let list_resp = client
         .get(format!("{}/lfs/myrepo/locks", url2))
-        .header("Authorization", &auth)
+        .header(
+            "Authorization",
+            lock_auth(&signer, &url2, "/lfs/myrepo/locks", "GET"),
+        )
         .send()
         .await
         .unwrap();
@@ -428,7 +520,15 @@ async fn test_sqlite_locks_persist_across_restart() {
     // Unlock on the new server instance
     let unlock_resp = client
         .post(format!("{}/lfs/myrepo/locks/{}/unlock", url2, lock_id))
-        .header("Authorization", &auth)
+        .header(
+            "Authorization",
+            lock_auth(
+                &signer,
+                &url2,
+                &format!("/lfs/myrepo/locks/{lock_id}/unlock"),
+                "POST",
+            ),
+        )
         .json(&serde_json::json!({"force": false}))
         .send()
         .await
@@ -438,7 +538,10 @@ async fn test_sqlite_locks_persist_across_restart() {
     // Verify it's gone
     let list_after = client
         .get(format!("{}/lfs/myrepo/locks", url2))
-        .header("Authorization", &auth)
+        .header(
+            "Authorization",
+            lock_auth(&signer, &url2, "/lfs/myrepo/locks", "GET"),
+        )
         .send()
         .await
         .unwrap();

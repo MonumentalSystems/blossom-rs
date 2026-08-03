@@ -115,6 +115,13 @@ impl S3Backend {
         format!("{}.blob", sha256)
     }
 
+    fn valid_hash(sha256: &str) -> bool {
+        sha256.len() == 64
+            && sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+
     /// Build the public URL for a blob.
     fn blob_url(&self, sha256: &str, base_url: &str) -> String {
         if let Some(ref cdn) = self.config.public_url {
@@ -132,6 +139,17 @@ impl S3Backend {
 
 impl BlobBackend for S3Backend {
     fn insert(&mut self, data: Vec<u8>, base_url: &str) -> BlobDescriptor {
+        let fallback = super::make_descriptor(&data, base_url);
+        match self.try_insert(data, base_url) {
+            Ok(descriptor) => descriptor,
+            Err(error) => {
+                tracing::warn!(error.message = %error, "failed to upload blob to S3");
+                fallback
+            }
+        }
+    }
+
+    fn try_insert(&mut self, data: Vec<u8>, base_url: &str) -> Result<BlobDescriptor, String> {
         let hash = sha256_hex(&data);
         let size = data.len() as u64;
         let key = Self::object_key(&hash);
@@ -147,14 +165,7 @@ impl BlobBackend for S3Backend {
                 .await
         });
 
-        if let Err(e) = result {
-            tracing::warn!(
-                storage.backend = "s3",
-                blob.sha256 = %hash,
-                error.message = %e,
-                "failed to upload blob to S3"
-            );
-        }
+        result.map_err(|e| format!("s3 upload: {e}"))?;
 
         self.index.insert(hash.clone(), size);
 
@@ -164,16 +175,19 @@ impl BlobBackend for S3Backend {
             .unwrap_or_default()
             .as_secs();
 
-        BlobDescriptor {
+        Ok(BlobDescriptor {
             sha256: hash,
             size,
             content_type: Some("application/octet-stream".into()),
             url: Some(url),
             uploaded: Some(ts),
-        }
+        })
     }
 
     fn get(&self, sha256: &str) -> Option<Vec<u8>> {
+        if !Self::valid_hash(sha256) {
+            return None;
+        }
         let key = Self::object_key(sha256);
 
         let result = Self::block_on(async {
@@ -206,6 +220,9 @@ impl BlobBackend for S3Backend {
     }
 
     fn exists(&self, sha256: &str) -> bool {
+        if !Self::valid_hash(sha256) {
+            return false;
+        }
         if self.index.contains_key(sha256) {
             return true;
         }
@@ -222,17 +239,26 @@ impl BlobBackend for S3Backend {
     }
 
     fn delete(&mut self, sha256: &str) -> bool {
-        let existed = self.index.remove(sha256).is_some();
+        self.try_delete(sha256).unwrap_or(false)
+    }
+
+    fn try_delete(&mut self, sha256: &str) -> Result<bool, String> {
+        if !Self::valid_hash(sha256) {
+            return Err("invalid SHA256 storage key".into());
+        }
+        let existed = self.exists(sha256);
         let key = Self::object_key(sha256);
-        let _ = Self::block_on(async {
+        Self::block_on(async {
             self.client
                 .delete_object()
                 .bucket(&self.config.bucket)
                 .key(&key)
                 .send()
                 .await
-        });
-        existed
+        })
+        .map_err(|e| format!("s3 delete: {e}"))?;
+        self.index.remove(sha256);
+        Ok(existed)
     }
 
     fn len(&self) -> usize {

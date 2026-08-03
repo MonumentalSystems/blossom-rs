@@ -5,6 +5,9 @@
 
 use super::{MediaError, MediaProcessor, MediaResult};
 
+const MAX_IMAGE_DIMENSION: u32 = 16_384;
+const MAX_IMAGE_ALLOCATION: u64 = 256 * 1024 * 1024;
+
 /// Image processor using the `image`, `blurhash`, and `kamadak-exif` crates.
 pub struct ImageProcessor {
     /// Maximum thumbnail dimension (width or height).
@@ -34,6 +37,44 @@ impl ImageProcessor {
             reject_gps_exif,
         }
     }
+
+    fn decode_limited(data: &[u8]) -> Result<image::DynamicImage, MediaError> {
+        let mut reader = image::ImageReader::new(std::io::Cursor::new(data))
+            .with_guessed_format()
+            .map_err(|e| MediaError::ProcessingFailed(format!("detect format: {e}")))?;
+        let mut limits = image::Limits::default();
+        limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
+        limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
+        limits.max_alloc = Some(MAX_IMAGE_ALLOCATION);
+        reader.limits(limits);
+        reader
+            .decode()
+            .map_err(|e| MediaError::ProcessingFailed(format!("decode: {e}")))
+    }
+
+    fn perceptual_hash_image(img: &image::DynamicImage) -> u64 {
+        let small = img.resize_exact(8, 8, image::imageops::FilterType::Lanczos3);
+        let gray = small.to_luma8();
+        let pixels: Vec<u8> = gray.pixels().map(|p| p.0[0]).collect();
+        let mean = pixels.iter().map(|&p| p as f64).sum::<f64>() / pixels.len() as f64;
+        pixels
+            .iter()
+            .enumerate()
+            .fold(0u64, |mut hash, (i, pixel)| {
+                if *pixel as f64 > mean {
+                    hash |= 1 << (63 - i);
+                }
+                hash
+            })
+    }
+
+    fn blurhash_image(img: &image::DynamicImage) -> Result<String, MediaError> {
+        let small = img.resize(32, 32, image::imageops::FilterType::Lanczos3);
+        let rgba = small.to_rgba8();
+        let (w, h) = rgba.dimensions();
+        blurhash::encode(4, 3, w, h, &rgba.into_raw())
+            .map_err(|e| MediaError::ProcessingFailed(format!("blurhash: {e}")))
+    }
 }
 
 impl MediaProcessor for ImageProcessor {
@@ -47,8 +88,7 @@ impl MediaProcessor for ImageProcessor {
         }
 
         // Decode image.
-        let img = image::load_from_memory(data)
-            .map_err(|e| MediaError::ProcessingFailed(format!("decode: {e}")))?;
+        let img = Self::decode_limited(data)?;
 
         let width = img.width();
         let height = img.height();
@@ -64,10 +104,10 @@ impl MediaProcessor for ImageProcessor {
             .map_err(|e| MediaError::ProcessingFailed(format!("thumbnail: {e}")))?;
 
         // Compute blurhash.
-        let blurhash = self.blurhash(data).ok();
+        let blurhash = Self::blurhash_image(&img).ok();
 
         // Compute perceptual hash.
-        let phash = self.perceptual_hash(data).ok();
+        let phash = Some(Self::perceptual_hash_image(&img));
 
         Ok(MediaResult {
             data: data.to_vec(),
@@ -99,41 +139,13 @@ impl MediaProcessor for ImageProcessor {
     }
 
     fn perceptual_hash(&self, data: &[u8]) -> Result<u64, MediaError> {
-        let img = image::load_from_memory(data)
-            .map_err(|e| MediaError::ProcessingFailed(format!("decode: {e}")))?;
-
-        // Resize to 8x8 grayscale.
-        let small = img.resize_exact(8, 8, image::imageops::FilterType::Lanczos3);
-        let gray = small.to_luma8();
-
-        // Compute mean.
-        let pixels: Vec<u8> = gray.pixels().map(|p| p.0[0]).collect();
-        let mean: f64 = pixels.iter().map(|&p| p as f64).sum::<f64>() / pixels.len() as f64;
-
-        // Build hash: bit is 1 if pixel > mean.
-        let mut hash: u64 = 0;
-        for (i, &pixel) in pixels.iter().enumerate() {
-            if pixel as f64 > mean {
-                hash |= 1 << (63 - i);
-            }
-        }
-
-        Ok(hash)
+        let img = Self::decode_limited(data)?;
+        Ok(Self::perceptual_hash_image(&img))
     }
 
     fn blurhash(&self, data: &[u8]) -> Result<String, MediaError> {
-        let img = image::load_from_memory(data)
-            .map_err(|e| MediaError::ProcessingFailed(format!("decode: {e}")))?;
-
-        let small = img.resize(32, 32, image::imageops::FilterType::Lanczos3);
-        let rgba = small.to_rgba8();
-        let w = rgba.width();
-        let h = rgba.height();
-        let pixels: Vec<u8> = rgba.into_raw();
-
-        let hash = blurhash::encode(4, 3, w, h, &pixels)
-            .map_err(|e| MediaError::ProcessingFailed(format!("blurhash: {e}")))?;
-        Ok(hash)
+        let img = Self::decode_limited(data)?;
+        Self::blurhash_image(&img)
     }
 
     fn thumbnail(
@@ -142,8 +154,7 @@ impl MediaProcessor for ImageProcessor {
         max_width: u32,
         max_height: u32,
     ) -> Result<Vec<u8>, MediaError> {
-        let img = image::load_from_memory(data)
-            .map_err(|e| MediaError::ProcessingFailed(format!("decode: {e}")))?;
+        let img = Self::decode_limited(data)?;
 
         let thumb = img.thumbnail(max_width, max_height);
         let mut bytes = Vec::new();
