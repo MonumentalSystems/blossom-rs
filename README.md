@@ -19,7 +19,7 @@ Content-addressed blob storage over HTTP with BIP-340 Schnorr authorization via 
 
 ## Features
 
-- **Decentralized git hosting** — NIP-34 Nostr relay + GRASP git HTTP server (enabled by default)
+- **Decentralized git hosting** — NIP-34 Nostr relay + GRASP git HTTP server (server opt-in with `--enable-relay`)
 - **Blob storage** — content-addressed BUD-01 with SHA256 integrity
 - **BUD-19 file locking** — Git LFS lock/unlock/verify with ownership enforcement
 - **BUD-20 compression** — zstd + xdelta3 delta encoding for LFS blobs
@@ -52,7 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "http://localhost:3000",
     );
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
     axum::serve(listener, server.router()).await?;
     Ok(())
 }

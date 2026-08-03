@@ -173,29 +173,24 @@ impl LockDatabase for SqliteLockDatabase {
                 .and_then(|c| c.parse::<i64>().ok())
                 .unwrap_or(0);
 
-            // Build query dynamically based on filters.
-            let mut sql = String::from(
-                "SELECT id, repo_id, path, pubkey, locked_at FROM lfs_locks WHERE repo_id = ?",
+            let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                "SELECT id, repo_id, path, pubkey, locked_at FROM lfs_locks WHERE repo_id = ",
             );
-            if filters.path.is_some() {
-                sql.push_str(" AND path = ?");
-            }
-            if filters.id.is_some() {
-                sql.push_str(" AND id = ?");
-            }
-            sql.push_str(" ORDER BY locked_at ASC LIMIT ? OFFSET ?");
-
-            let mut query =
-                sqlx::query_as::<_, (String, String, String, String, i64)>(&sql).bind(repo);
+            query.push_bind(repo);
             if let Some(ref p) = filters.path {
-                query = query.bind(p);
+                query.push(" AND path = ").push_bind(p);
             }
             if let Some(ref id) = filters.id {
-                query = query.bind(id);
+                query.push(" AND id = ").push_bind(id);
             }
-            query = query.bind(limit + 1).bind(offset);
+            query
+                .push(" ORDER BY locked_at ASC LIMIT ")
+                .push_bind(limit + 1)
+                .push(" OFFSET ")
+                .push_bind(offset);
 
             let rows: Vec<(String, String, String, String, i64)> = query
+                .build_query_as()
                 .fetch_all(&self.pool)
                 .await
                 .map_err(|e| LockError::Internal(format!("list locks: {e}")))?;

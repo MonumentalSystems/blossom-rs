@@ -43,11 +43,15 @@ pub fn admin_router(state: SharedState) -> Router {
 fn extract_admin_pubkey(
     headers: &HeaderMap,
     access: &dyn crate::access::AccessControl,
+    base_url: &str,
+    path: &str,
+    method: &str,
+    expected_hash: Option<&str>,
 ) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
     let event = extract_auth_event(headers)
         .map_err(|e| (StatusCode::UNAUTHORIZED, error_json(&e.to_string())))?;
 
-    verify_auth_event(&event, None)
+    verify_auth_event(&event, "admin", base_url, path, method, expected_hash)
         .map_err(|e| (StatusCode::UNAUTHORIZED, error_json(&e.to_string())))?;
 
     if !access.is_allowed(&event.pubkey, Action::Admin) {
@@ -67,7 +71,14 @@ async fn handle_admin_stats(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let s = state.lock().await;
-    if let Err(e) = extract_admin_pubkey(&headers, &*s.access) {
+    if let Err(e) = extract_admin_pubkey(
+        &headers,
+        &*s.access,
+        &s.base_url,
+        "/admin/stats",
+        "GET",
+        None,
+    ) {
         return e;
     }
 
@@ -93,7 +104,14 @@ async fn handle_lfs_stats(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let s = state.lock().await;
-    if let Err(e) = extract_admin_pubkey(&headers, &*s.access) {
+    if let Err(e) = extract_admin_pubkey(
+        &headers,
+        &*s.access,
+        &s.base_url,
+        "/admin/lfs-stats",
+        "GET",
+        None,
+    ) {
         return e;
     }
 
@@ -139,7 +157,14 @@ async fn handle_list_users(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let s = state.lock().await;
-    if let Err(e) = extract_admin_pubkey(&headers, &*s.access) {
+    if let Err(e) = extract_admin_pubkey(
+        &headers,
+        &*s.access,
+        &s.base_url,
+        "/admin/users",
+        "GET",
+        None,
+    ) {
         return e;
     }
 
@@ -159,7 +184,14 @@ async fn handle_get_user(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let mut s = state.lock().await;
-    if let Err(e) = extract_admin_pubkey(&headers, &*s.access) {
+    if let Err(e) = extract_admin_pubkey(
+        &headers,
+        &*s.access,
+        &s.base_url,
+        &format!("/admin/users/{pubkey}"),
+        "GET",
+        None,
+    ) {
         return e;
     }
 
@@ -193,7 +225,14 @@ async fn handle_set_quota(
     Json(req): Json<SetQuotaRequest>,
 ) -> impl IntoResponse {
     let mut s = state.lock().await;
-    if let Err(e) = extract_admin_pubkey(&headers, &*s.access) {
+    if let Err(e) = extract_admin_pubkey(
+        &headers,
+        &*s.access,
+        &s.base_url,
+        &format!("/admin/users/{pubkey}/quota"),
+        "PUT",
+        None,
+    ) {
         return e;
     }
 
@@ -229,7 +268,14 @@ async fn handle_list_all_blobs(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let s = state.lock().await;
-    if let Err(e) = extract_admin_pubkey(&headers, &*s.access) {
+    if let Err(e) = extract_admin_pubkey(
+        &headers,
+        &*s.access,
+        &s.base_url,
+        "/admin/blobs",
+        "GET",
+        None,
+    ) {
         return e;
     }
 
@@ -249,16 +295,36 @@ async fn handle_admin_delete_blob(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let mut s = state.lock().await;
-    if let Err(e) = extract_admin_pubkey(&headers, &*s.access) {
+    if !super::is_valid_sha256(&sha256) {
+        return (StatusCode::BAD_REQUEST, error_json("invalid SHA256 hash"));
+    }
+    if let Err(e) = extract_admin_pubkey(
+        &headers,
+        &*s.access,
+        &s.base_url,
+        &format!("/admin/blobs/{sha256}"),
+        "DELETE",
+        Some(&sha256),
+    ) {
         return e;
     }
 
-    if s.backend.delete(&sha256) {
-        let _ = s.database.delete_upload(&sha256);
-        tracing::info!(blob.sha256 = %sha256, "admin deleted blob");
-        (StatusCode::OK, Json(serde_json::json!({"deleted": true})))
-    } else {
-        (StatusCode::NOT_FOUND, error_json("blob not found"))
+    match s.backend.try_delete(&sha256) {
+        Ok(true) => {
+            if let Err(error) = s.database.delete_upload(&sha256) {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error_json(&error.to_string()),
+                );
+            }
+            tracing::info!(blob.sha256 = %sha256, "admin deleted blob");
+            (StatusCode::OK, Json(serde_json::json!({"deleted": true})))
+        }
+        Ok(false) => (StatusCode::NOT_FOUND, error_json("blob not found")),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_json(&format!("storage delete failed: {error}")),
+        ),
     }
 }
 
@@ -283,7 +349,14 @@ async fn handle_set_role(
     Json(body): Json<SetRoleRequest>,
 ) -> impl IntoResponse {
     let mut s = state.lock().await;
-    if let Err(e) = extract_admin_pubkey(&headers, &*s.access) {
+    if let Err(e) = extract_admin_pubkey(
+        &headers,
+        &*s.access,
+        &s.base_url,
+        &format!("/admin/users/{pubkey}/role"),
+        "PUT",
+        None,
+    ) {
         return e;
     }
 
@@ -296,7 +369,13 @@ async fn handle_set_role(
         );
     }
 
-    if let Err(e) = s.database.set_role(&normalized, &role) {
+    let live_roles = s.role_based_access.clone();
+    let update = if let Some(rba) = live_roles {
+        rba.set_role(&normalized, &role, &mut *s.database).await
+    } else {
+        s.database.set_role(&normalized, &role)
+    };
+    if let Err(e) = update {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             error_json(&format!("set role: {e}")),
@@ -319,7 +398,14 @@ async fn handle_list_roles(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let s = state.lock().await;
-    if let Err(e) = extract_admin_pubkey(&headers, &*s.access) {
+    if let Err(e) = extract_admin_pubkey(
+        &headers,
+        &*s.access,
+        &s.base_url,
+        "/admin/roles",
+        "GET",
+        None,
+    ) {
         return e;
     }
 
@@ -365,7 +451,14 @@ async fn handle_whitelist_list(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let s = state.lock().await;
-    if let Err(e) = extract_admin_pubkey(&headers, &*s.access) {
+    if let Err(e) = extract_admin_pubkey(
+        &headers,
+        &*s.access,
+        &s.base_url,
+        "/admin/whitelist",
+        "GET",
+        None,
+    ) {
         return e;
     }
 
@@ -391,7 +484,14 @@ async fn handle_whitelist_add(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let s = state.lock().await;
-    if let Err(e) = extract_admin_pubkey(&headers, &*s.access) {
+    if let Err(e) = extract_admin_pubkey(
+        &headers,
+        &*s.access,
+        &s.base_url,
+        &format!("/admin/whitelist/{pubkey}"),
+        "PUT",
+        None,
+    ) {
         return e;
     }
 
@@ -412,7 +512,14 @@ async fn handle_whitelist_remove(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let s = state.lock().await;
-    if let Err(e) = extract_admin_pubkey(&headers, &*s.access) {
+    if let Err(e) = extract_admin_pubkey(
+        &headers,
+        &*s.access,
+        &s.base_url,
+        &format!("/admin/whitelist/{pubkey}"),
+        "DELETE",
+        None,
+    ) {
         return e;
     }
 
@@ -430,7 +537,9 @@ async fn handle_whitelist_remove(
 mod tests {
     use super::*;
     use crate::access::Whitelist;
-    use crate::auth::{auth_header_value, build_blossom_auth, Signer};
+    use crate::auth::{
+        auth_header_value, build_blossom_auth_for_request, build_nip98_auth, Signer,
+    };
     use crate::db::MemoryDatabase;
     use crate::server::nip96::nip96_router;
     use crate::storage::MemoryBackend;
@@ -446,7 +555,10 @@ mod tests {
         keys.insert(admin_pubkey);
         let whitelist = Whitelist::new(keys);
 
-        let server = BlobServer::builder(MemoryBackend::new(), "http://localhost:3000")
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{}", addr);
+        let server = BlobServer::builder(MemoryBackend::new(), &url)
             .database(MemoryDatabase::new())
             .access_control(whitelist)
             .require_auth()
@@ -457,18 +569,14 @@ mod tests {
             .merge(nip96_router(state.clone()))
             .merge(admin_router(state));
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let url = format!("http://{}", addr);
         tokio::spawn(async move { axum::serve(listener, app).await.ok() });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         (url, admin_signer)
     }
 
-    fn admin_auth(signer: &Signer) -> String {
-        let event = build_blossom_auth(signer, "admin", None, None, "");
-        auth_header_value(&event)
+    fn admin_auth(signer: &Signer, url: &str, method: &str) -> String {
+        auth_header_value(&build_nip98_auth(signer, url, method))
     }
 
     #[tokio::test]
@@ -476,9 +584,10 @@ mod tests {
         let (url, signer) = spawn_admin_server().await;
         let http = reqwest::Client::new();
 
+        let target = format!("{}/admin/stats", url);
         let resp = http
-            .get(format!("{}/admin/stats", url))
-            .header("Authorization", admin_auth(&signer))
+            .get(&target)
+            .header("Authorization", admin_auth(&signer, &target, "GET"))
             .send()
             .await
             .unwrap();
@@ -507,9 +616,10 @@ mod tests {
 
         // Use a different signer not in the whitelist.
         let other = Signer::generate();
+        let target = format!("{}/admin/stats", url);
         let resp = http
-            .get(format!("{}/admin/stats", url))
-            .header("Authorization", admin_auth(&other))
+            .get(&target)
+            .header("Authorization", admin_auth(&other, &target, "GET"))
             .send()
             .await
             .unwrap();
@@ -523,9 +633,10 @@ mod tests {
         let target_pubkey = "a".repeat(64);
 
         // Set quota.
+        let quota_url = format!("{}/admin/users/{}/quota", url, target_pubkey);
         let resp = http
-            .put(format!("{}/admin/users/{}/quota", url, target_pubkey))
-            .header("Authorization", admin_auth(&signer))
+            .put(&quota_url)
+            .header("Authorization", admin_auth(&signer, &quota_url, "PUT"))
             .json(&serde_json::json!({"quota_bytes": 1048576}))
             .send()
             .await
@@ -535,9 +646,10 @@ mod tests {
         assert_eq!(body["quota_bytes"], 1048576);
 
         // Get user.
+        let user_url = format!("{}/admin/users/{}", url, target_pubkey);
         let resp = http
-            .get(format!("{}/admin/users/{}", url, target_pubkey))
-            .header("Authorization", admin_auth(&signer))
+            .get(&user_url)
+            .header("Authorization", admin_auth(&signer, &user_url, "GET"))
             .send()
             .await
             .unwrap();
@@ -554,10 +666,20 @@ mod tests {
 
         // Upload a blob (with auth since require_auth is on).
         let data = b"admin delete test";
-        let upload_event = build_blossom_auth(&signer, "upload", None, None, "");
+        let upload_url = format!("{}/upload", url);
+        let hash = crate::protocol::sha256_hex(data);
+        let upload_event = build_blossom_auth_for_request(
+            &signer,
+            "upload",
+            Some(&hash),
+            &url,
+            &upload_url,
+            "PUT",
+            "",
+        );
         let auth = auth_header_value(&upload_event);
         let resp = http
-            .put(format!("{}/upload", url))
+            .put(&upload_url)
             .header("Authorization", &auth)
             .body(data.to_vec())
             .send()
@@ -568,9 +690,10 @@ mod tests {
         let sha = desc["sha256"].as_str().unwrap();
 
         // Admin delete.
+        let delete_url = format!("{}/admin/blobs/{}", url, sha);
         let resp = http
-            .delete(format!("{}/admin/blobs/{}", url, sha))
-            .header("Authorization", admin_auth(&signer))
+            .delete(&delete_url)
+            .header("Authorization", admin_auth(&signer, &delete_url, "DELETE"))
             .send()
             .await
             .unwrap();

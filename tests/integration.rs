@@ -3,17 +3,18 @@
 //! These tests exercise end-to-end workflows: client → server → storage → database.
 
 use blossom_rs::{
-    auth::{auth_header_value, build_blossom_auth},
+    auth::{auth_header_value, build_blossom_auth_for_request},
     protocol::sha256_hex,
     server::BlobServer,
     BlobDatabase, BlossomClient, MemoryBackend, MemoryDatabase, Signer,
 };
 
 async fn spawn_server(server: BlobServer) -> String {
-    let app = server.router();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let url = format!("http://{}", addr);
+    server.shared_state().lock().await.set_base_url(url.clone());
+    let app = server.router();
     tokio::spawn(async move { axum::serve(listener, app).await.ok() });
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     url
@@ -106,11 +107,20 @@ async fn test_auth_required_upload_succeeds_with_auth() {
     let signer = Signer::generate();
 
     let data = b"authorized upload";
-    let auth_event = build_blossom_auth(&signer, "upload", Some(&sha256_hex(data)), None, "");
+    let upload_url = format!("{}/upload", url);
+    let auth_event = build_blossom_auth_for_request(
+        &signer,
+        "upload",
+        Some(&sha256_hex(data)),
+        &url,
+        &upload_url,
+        "PUT",
+        "",
+    );
     let auth_header = auth_header_value(&auth_event);
 
     let resp = http
-        .put(format!("{}/upload", url))
+        .put(&upload_url)
         .header("Authorization", &auth_header)
         .body(data.to_vec())
         .send()
@@ -127,8 +137,20 @@ async fn test_delete_requires_auth() {
 
     // Upload first.
     let data = b"to be deleted";
+    let signer = Signer::generate();
+    let upload_url = format!("{}/upload", url);
+    let upload_auth = build_blossom_auth_for_request(
+        &signer,
+        "upload",
+        Some(&sha256_hex(data)),
+        &url,
+        &upload_url,
+        "PUT",
+        "",
+    );
     let resp = http
-        .put(format!("{}/upload", url))
+        .put(&upload_url)
+        .header("Authorization", auth_header_value(&upload_auth))
         .body(data.to_vec())
         .send()
         .await
@@ -144,12 +166,20 @@ async fn test_delete_requires_auth() {
     assert_eq!(resp.status(), 401);
 
     // Delete with auth should succeed.
-    let signer = Signer::generate();
-    let auth_event = build_blossom_auth(&signer, "delete", None, None, "");
+    let delete_url = format!("{}/{}", url, desc.sha256);
+    let auth_event = build_blossom_auth_for_request(
+        &signer,
+        "delete",
+        Some(&desc.sha256),
+        &url,
+        &delete_url,
+        "DELETE",
+        "",
+    );
     let auth_header = auth_header_value(&auth_event);
 
     let resp = http
-        .delete(format!("{}/{}", url, desc.sha256))
+        .delete(&delete_url)
         .header("Authorization", &auth_header)
         .send()
         .await

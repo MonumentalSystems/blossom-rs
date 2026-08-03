@@ -13,22 +13,19 @@ use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use nostr::nips::nip19::FromBech32;
+use sha2::{Digest, Sha256};
 
 use crate::Nip34State;
 
-/// Ensure a bare repo exists on disk. If it doesn't exist but the npub has
-/// a repo path, create it (lazy repo creation for GRASP).
+/// Resolve an existing bare repository without creating state for an
+/// unauthenticated discovery request.
 async fn ensure_repo(
     state: &Nip34State,
     npub: &str,
     repo_name: &str,
 ) -> Option<std::path::PathBuf> {
     let path = state.repo_path(npub, repo_name)?;
-    if path.join("HEAD").exists() {
-        return Some(path);
-    }
-    // Auto-create bare repo
-    state.create_bare_repo(npub, repo_name, "").await.ok()
+    path.join("HEAD").exists().then_some(path)
 }
 
 /// Build the git HTTP router.
@@ -55,7 +52,15 @@ pub fn git_router() -> axum::Router<Arc<Nip34State>> {
 
 /// Verify that the Authorization header contains a valid Nostr event
 /// signed by the expected npub. Returns the pubkey hex on success.
-fn verify_push_auth(headers: &HeaderMap, expected_npub: &str) -> Result<String, &'static str> {
+fn verify_push_auth(
+    headers: &HeaderMap,
+    expected_npub: &str,
+    repo_name: &str,
+    domain: &str,
+    method: &str,
+    path: &str,
+    body_hash: Option<&str>,
+) -> Result<String, &'static str> {
     let auth_value = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -66,7 +71,10 @@ fn verify_push_auth(headers: &HeaderMap, expected_npub: &str) -> Result<String, 
         .strip_prefix("Nostr ")
         .ok_or("authorization must use 'Nostr <base64>' format")?;
 
-    let json_bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
+    use base64::Engine;
+    let json_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(b64)
+        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(b64))
         .map_err(|_| "invalid base64 in authorization")?;
 
     let event: nostr::Event =
@@ -88,13 +96,93 @@ fn verify_push_auth(headers: &HeaderMap, expected_npub: &str) -> Result<String, 
         return Err("authorization pubkey does not match repository owner");
     }
 
+    let value = serde_json::to_value(&event).map_err(|_| "invalid authorization event")?;
+    let created_at = value
+        .get("created_at")
+        .and_then(|v| v.as_u64())
+        .ok_or("missing created_at")?;
+    let kind = value.get("kind").and_then(|v| v.as_u64()).unwrap_or(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if kind != 24242 || created_at > now.saturating_add(30) || now.saturating_sub(created_at) > 60 {
+        return Err("push authorization is stale, future-dated, or wrong kind");
+    }
+    let tags = value
+        .get("tags")
+        .and_then(|v| v.as_array())
+        .ok_or("missing authorization tags")?;
+    let unique = |name: &str| -> Option<String> {
+        let matching: Vec<_> = tags
+            .iter()
+            .filter_map(|tag| tag.as_array())
+            .filter(|tag| tag.first().and_then(|v| v.as_str()) == Some(name))
+            .collect();
+        if matching.len() != 1 || matching[0].len() != 2 {
+            return None;
+        }
+        matching[0]
+            .get(1)
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+    };
+    if unique("t").as_deref() != Some("git-push")
+        || unique("repo").as_deref() != Some(repo_name)
+        || !unique("method").is_some_and(|v| v.eq_ignore_ascii_case(method))
+    {
+        return Err("push authorization is not bound to this operation");
+    }
+    let url = unique("u").ok_or("push authorization missing URL")?;
+    let parsed = url::Url::parse(&url).map_err(|_| "push authorization URL is invalid")?;
+    if parsed.path() != path || parsed.host_str() != Some(domain) {
+        return Err("push authorization is for a different repository or server");
+    }
+    let expiration = unique("expiration")
+        .and_then(|v| v.parse::<u64>().ok())
+        .ok_or("push authorization missing expiration")?;
+    if expiration < now || expiration > created_at.saturating_add(120) {
+        return Err("push authorization expired");
+    }
+    if let Some(hash) = body_hash {
+        if unique("x").as_deref() != Some(hash) {
+            return Err("push authorization is for a different request body");
+        }
+    }
+    let nonce_present = match unique("nonce") {
+        Some(nonce) => !nonce.is_empty(),
+        None => false,
+    };
+    if !nonce_present {
+        return Err("push authorization is missing a nonce");
+    }
+    if !mark_auth_event_once(&event.id.to_hex(), now) {
+        return Err("push authorization has already been used");
+    }
+
     Ok(event.pubkey.to_hex())
+}
+
+fn mark_auth_event_once(event_id: &str, now: u64) -> bool {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u64>>> =
+        std::sync::OnceLock::new();
+    let mut seen = SEEN
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    seen.retain(|_, expires_at| *expires_at > now);
+    if seen.contains_key(event_id) || seen.len() >= 10_000 {
+        return false;
+    }
+    seen.insert(event_id.to_string(), now.saturating_add(120));
+    true
 }
 
 /// GET /{npub}/{repo}/info/refs?service=git-upload-pack
 async fn info_refs(
     State(state): State<Arc<Nip34State>>,
     Path((npub, repo)): Path<(String, String)>,
+    headers: HeaderMap,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
     let repo_name = repo.trim_end_matches(".git");
@@ -107,6 +195,27 @@ async fn info_refs(
         .get("service")
         .map(String::as_str)
         .unwrap_or("git-upload-pack");
+    if !matches!(service, "git-upload-pack" | "git-receive-pack") {
+        return (StatusCode::BAD_REQUEST, "unsupported git service").into_response();
+    }
+    if service == "git-receive-pack"
+        && verify_push_auth(
+            &headers,
+            &npub,
+            repo_name,
+            &state.config.domain,
+            "GET",
+            &format!("/{npub}/{repo}/info/refs"),
+            None,
+        )
+        .is_err()
+    {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "valid push authorization required",
+        )
+            .into_response();
+    }
 
     let git_cmd = command::GitCommand::new(&state.config.git_path, &repo_path);
     let is_v2 = false; // TODO: detect git protocol version from headers
@@ -174,9 +283,27 @@ async fn receive_pack(
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
     let repo_name = repo.trim_end_matches(".git");
-    let repo_path = match ensure_repo(&state, &npub, repo_name).await {
-        Some(p) => p,
-        None => return (StatusCode::NOT_FOUND, "repository not found").into_response(),
+    let body_hash = hex::encode(Sha256::digest(&body));
+    if let Err(error) = verify_push_auth(
+        &headers,
+        &npub,
+        repo_name,
+        &state.config.domain,
+        "POST",
+        &format!("/{npub}/{repo}/git-receive-pack"),
+        Some(&body_hash),
+    ) {
+        return (StatusCode::UNAUTHORIZED, error).into_response();
+    }
+    let repo_path = match state.repo_path(&npub, repo_name) {
+        Some(path) if path.join("HEAD").exists() => path,
+        Some(_) => match state.create_bare_repo(&npub, repo_name, "").await {
+            Ok(path) => path,
+            Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+        },
+        None => {
+            return (StatusCode::BAD_REQUEST, "invalid repository owner or name").into_response()
+        }
     };
 
     // Parse ref updates from the pkt-line body
@@ -196,17 +323,14 @@ async fn receive_pack(
     };
 
     // GRASP validation: check against relay state
-    // Optional: if Nostr auth header present, verify it as additional auth
-    let has_nostr_auth = verify_push_auth(&headers, &npub).is_ok();
-
-    // Check if repo is empty (first push) — allow without validation
+    // Check if repo is empty. Authentication is still mandatory for the first
+    // push; relay-state validation begins once refs exist.
     let is_empty_repo = !repo_path.join("refs/heads").exists()
         || std::fs::read_dir(repo_path.join("refs/heads"))
             .map(|mut d| d.next().is_none())
             .unwrap_or(true);
 
-    if !has_nostr_auth && !is_empty_repo {
-        // Fall back to GRASP relay-based validation (skip for first push to empty repo)
+    if !is_empty_repo {
         match validation::validate_push(&ref_updates, &state.database, &author_hex, repo_name).await
         {
             Ok(errors) if errors.is_empty() => {
@@ -250,18 +374,36 @@ mod tests {
     #[test]
     fn test_verify_push_auth_missing_header() {
         let headers = HeaderMap::new();
-        assert!(verify_push_auth(&headers, "npub1test").is_err());
+        assert!(verify_push_auth(
+            &headers,
+            "npub1test",
+            "repo",
+            "localhost",
+            "POST",
+            "/repo",
+            None
+        )
+        .is_err());
     }
 
     #[test]
     fn test_verify_push_auth_wrong_format() {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", "Bearer token".parse().unwrap());
-        assert!(verify_push_auth(&headers, "npub1test").is_err());
+        assert!(verify_push_auth(
+            &headers,
+            "npub1test",
+            "repo",
+            "localhost",
+            "POST",
+            "/repo",
+            None
+        )
+        .is_err());
     }
 
     #[test]
-    fn test_verify_push_auth_valid() {
+    fn test_verify_push_auth_rejects_unbound_public_event() {
         use nostr::prelude::*;
 
         let keys = Keys::generate();
@@ -275,13 +417,31 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", format!("Nostr {}", b64).parse().unwrap());
 
-        // Should succeed when npub matches the signer
+        // A valid public event from the owner is not push authorization.
         let npub = keys.public_key().to_bech32().unwrap();
-        assert!(verify_push_auth(&headers, &npub).is_ok());
+        assert!(verify_push_auth(
+            &headers,
+            &npub,
+            "repo",
+            "localhost",
+            "POST",
+            &format!("/{npub}/repo/git-receive-pack"),
+            None,
+        )
+        .is_err());
 
         // Should fail when npub doesn't match
         let other_keys = Keys::generate();
         let other_npub = other_keys.public_key().to_bech32().unwrap();
-        assert!(verify_push_auth(&headers, &other_npub).is_err());
+        assert!(verify_push_auth(
+            &headers,
+            &other_npub,
+            "repo",
+            "localhost",
+            "POST",
+            "/repo",
+            None,
+        )
+        .is_err());
     }
 }

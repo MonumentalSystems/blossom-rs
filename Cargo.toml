@@ -77,11 +77,11 @@ tower-http = { version = "0.6", features = ["cors", "limit", "trace"], optional 
 reqwest = { version = "0.12", default-features = false, features = ["json", "http2", "rustls-tls", "stream"], optional = true }
 
 # S3 (optional)
-aws-sdk-s3 = { version = "1", optional = true }
-aws-config = { version = "1", optional = true }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"], optional = true }
+aws-config = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "credentials-process"], optional = true }
 
 # Database (optional)
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "postgres"], optional = true }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite", "postgres"], optional = true }
 
 # Media processing (optional)
 image = { version = "0.25", optional = true }
@@ -102,7 +102,7 @@ opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"], optional = true
 opentelemetry-otlp = { version = "0.27", optional = true }
 
 # P2P transport (optional)
-iroh = { version = "0.97", optional = true }
+iroh = { version = "1.0.3", optional = true }
 anyhow = { version = "1", optional = true }
 
 # PKARR discovery (optional)

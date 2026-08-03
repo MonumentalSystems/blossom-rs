@@ -9,29 +9,58 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
 jobs:
   # Trusted CI — runs on self-hosted runner for pushes to master.
   ci-trusted:
     if: github.event_name == 'push'
     runs-on: self-hosted
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: rustfmt, clippy
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - name: Install Gitleaks 8.28.0
+        run: |
+          curl --proto '=https' --tlsv1.2 -fsSLo /tmp/gitleaks.tar.gz \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.28.0/gitleaks_8.28.0_linux_x64.tar.gz
+          echo 'a65b5253807a68ac0cafa4414031fd740aeb55f54fb7e55f386acb52e6a840eb  /tmp/gitleaks.tar.gz' | sha256sum --check
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+      - name: Scan pushed commits for secrets
+        run: /tmp/gitleaks git . --redact --verbose --log-opts='${{ github.event.before }}..${{ github.sha }}'
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   # PR CI — runs on GitHub-hosted runner for pull requests.
   ci-pr:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: rustfmt, clippy
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - name: Install Gitleaks 8.28.0
+        run: |
+          curl --proto '=https' --tlsv1.2 -fsSLo /tmp/gitleaks.tar.gz \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.28.0/gitleaks_8.28.0_linux_x64.tar.gz
+          echo 'a65b5253807a68ac0cafa4414031fd740aeb55f54fb7e55f386acb52e6a840eb  /tmp/gitleaks.tar.gz' | sha256sum --check
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+      - name: Scan pull request commits for secrets
+        run: /tmp/gitleaks git . --redact --verbose --log-opts='${{ github.event.pull_request.base.sha }}..${{ github.sha }}'
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

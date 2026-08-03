@@ -10,7 +10,7 @@ categories = ["web-programming", "development-tools"]
 
 [dependencies]
 # Nostr relay infrastructure (MIT)
-nostr = { version = "0.44", default-features = false, features = ["std"] }
+nostr = { version = "0.44.7", default-features = false, features = ["std"] }
 nostr-database = "0.44"
 nostr-lmdb = "0.44"
 nostr-relay-builder = "0.44"
@@ -34,10 +34,12 @@ serde_json = "1"
 tracing = "0.1"
 
 # Database (policy persistence)
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "postgres"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite", "postgres"] }
 
 # Utilities
 hex = "0.4"
+url = "2"
+sha2 = "0.10"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

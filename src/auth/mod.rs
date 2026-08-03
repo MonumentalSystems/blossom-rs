@@ -27,6 +27,55 @@ pub fn build_blossom_auth(
     build_blossom_auth_with_extra_tags(signer, action, blob_sha256, server_url, content, &[])
 }
 
+/// Build a Blossom authorization event bound to one HTTP request.
+pub fn build_blossom_auth_for_request(
+    signer: &dyn BlossomSigner,
+    action: &str,
+    blob_sha256: Option<&str>,
+    server_url: &str,
+    request_url: &str,
+    method: &str,
+    content: &str,
+) -> NostrEvent {
+    build_blossom_auth_for_request_with_extra_tags(
+        signer,
+        action,
+        blob_sha256,
+        server_url,
+        request_url,
+        method,
+        content,
+        &[],
+    )
+}
+
+/// Build a request-bound Blossom event with protocol-specific extra tags.
+#[allow(clippy::too_many_arguments)]
+pub fn build_blossom_auth_for_request_with_extra_tags(
+    signer: &dyn BlossomSigner,
+    action: &str,
+    blob_sha256: Option<&str>,
+    server_url: &str,
+    request_url: &str,
+    method: &str,
+    content: &str,
+    extra_tags: &[Vec<String>],
+) -> NostrEvent {
+    let mut extra = vec![
+        vec!["u".to_string(), request_url.to_string()],
+        vec!["method".to_string(), method.to_ascii_uppercase()],
+    ];
+    extra.extend_from_slice(extra_tags);
+    build_blossom_auth_with_extra_tags(
+        signer,
+        action,
+        blob_sha256,
+        Some(server_url.trim_end_matches('/')),
+        content,
+        &extra,
+    )
+}
+
 /// Build and sign a kind:24242 Blossom auth event with additional tags.
 ///
 /// Additional tags are appended before the expiration tag.
@@ -58,6 +107,7 @@ pub fn build_blossom_auth_with_extra_tags(
     for extra in extra_tags {
         tags.push(extra.clone());
     }
+    tags.push(vec!["nonce".to_string(), uuid::Uuid::new_v4().to_string()]);
     let expiration = created_at + 60;
     tags.push(vec!["expiration".to_string(), expiration.to_string()]);
 
@@ -99,32 +149,64 @@ pub fn verify_blossom_auth(
         return Err(AuthError::WrongKind(event.kind));
     }
 
-    // Check expiration.
+    // Blossom authorization events are bearer credentials. Require a tight,
+    // unambiguous validity window instead of treating expiration as optional.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
 
-    if let Some(exp_tag) = event
+    if event.created_at > now.saturating_add(30) {
+        return Err(AuthError::FutureDated);
+    }
+    if now.saturating_sub(event.created_at) > 60 {
+        return Err(AuthError::Expired);
+    }
+
+    let expiration_tags: Vec<_> = event
         .tags
         .iter()
-        .find(|t| t.len() >= 2 && t[0] == "expiration")
-    {
-        if let Ok(exp) = exp_tag[1].parse::<u64>() {
-            if now > exp {
-                return Err(AuthError::Expired);
-            }
-        }
+        .filter(|t| t.first().is_some_and(|v| v == "expiration"))
+        .collect();
+    if expiration_tags.len() != 1 {
+        return Err(if expiration_tags.is_empty() {
+            AuthError::MissingTag("expiration")
+        } else {
+            AuthError::DuplicateTag("expiration")
+        });
+    }
+    let exp_tag = expiration_tags[0];
+    if exp_tag.len() != 2 {
+        return Err(AuthError::MalformedTag("expiration"));
+    }
+    let exp = exp_tag[1]
+        .parse::<u64>()
+        .map_err(|_| AuthError::MalformedTag("expiration"))?;
+    if now > exp || exp > event.created_at.saturating_add(120) {
+        return Err(AuthError::Expired);
     }
 
     // Check action tag.
     if let Some(expected) = expected_action {
-        let has_action = event
+        let matching_actions = event
             .tags
             .iter()
-            .any(|t| t.len() >= 2 && t[0] == "t" && t[1] == expected);
-        if !has_action {
-            return Err(AuthError::WrongAction);
+            .filter(|t| t.len() == 2 && t[0] == "t" && t[1] == expected)
+            .count();
+        if matching_actions != 1 {
+            return Err(if matching_actions == 0 {
+                if event
+                    .tags
+                    .iter()
+                    .any(|t| t.first().is_some_and(|v| v == "t"))
+                {
+                    AuthError::WrongAction
+                } else {
+                    AuthError::MissingTag("t")
+                }
+            } else {
+                AuthError::DuplicateTag("t")
+            });
         }
     }
 
@@ -148,6 +230,56 @@ pub fn verify_blossom_auth(
     Ok(())
 }
 
+/// Verify a Blossom event and bind it to the expected server and resource.
+pub fn verify_blossom_auth_bound(
+    event: &NostrEvent,
+    expected_action: &str,
+    expected_server: &str,
+    expected_url: &str,
+    expected_method: &str,
+    expected_hash: Option<&str>,
+) -> Result<(), AuthError> {
+    verify_blossom_auth(event, Some(expected_action))?;
+    verify_unique_tag(event, "server", expected_server, AuthError::WrongServer)?;
+    verify_unique_tag(event, "u", expected_url, AuthError::WrongResource)?;
+    verify_unique_tag(
+        event,
+        "method",
+        &expected_method.to_ascii_uppercase(),
+        AuthError::WrongAction,
+    )?;
+    if let Some(hash) = expected_hash {
+        verify_unique_tag(event, "x", hash, AuthError::WrongResource)?;
+    }
+    Ok(())
+}
+
+fn verify_unique_tag(
+    event: &NostrEvent,
+    name: &'static str,
+    expected: &str,
+    mismatch: AuthError,
+) -> Result<(), AuthError> {
+    let tags: Vec<_> = event
+        .tags
+        .iter()
+        .filter(|t| t.first().is_some_and(|v| v == name))
+        .collect();
+    if tags.is_empty() {
+        return Err(AuthError::MissingTag(name));
+    }
+    if tags.len() != 1 {
+        return Err(AuthError::DuplicateTag(name));
+    }
+    if tags[0].len() != 2 {
+        return Err(AuthError::MalformedTag(name));
+    }
+    if tags[0][1] != expected {
+        return Err(mismatch);
+    }
+    Ok(())
+}
+
 /// Errors from Blossom auth verification.
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
@@ -155,12 +287,26 @@ pub enum AuthError {
     WrongKind(u32),
     #[error("auth event has expired")]
     Expired,
+    #[error("auth event is dated too far in the future")]
+    FutureDated,
+    #[error("missing required auth tag: {0}")]
+    MissingTag(&'static str),
+    #[error("duplicate auth tag: {0}")]
+    DuplicateTag(&'static str),
+    #[error("malformed auth tag: {0}")]
+    MalformedTag(&'static str),
     #[error("action tag does not match expected action")]
     WrongAction,
+    #[error("auth event is for a different server")]
+    WrongServer,
+    #[error("auth event is for a different resource")]
+    WrongResource,
     #[error("event ID does not match computed hash")]
     InvalidEventId,
     #[error("BIP-340 signature verification failed")]
     InvalidSignature,
+    #[error("authorization event has already been used")]
+    Replay,
 }
 
 #[cfg(test)]

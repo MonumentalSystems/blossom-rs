@@ -14,6 +14,10 @@ async fn test_state(tmp: &std::path::Path) -> Arc<Nip34State> {
     Arc::new(Nip34State::new(config).await.unwrap())
 }
 
+fn test_owner() -> String {
+    "a".repeat(64)
+}
+
 // ---------------------------------------------------------------------------
 // Config defaults
 // ---------------------------------------------------------------------------
@@ -52,10 +56,11 @@ async fn test_repo_path_valid() {
     let tmp = tempfile::tempdir().unwrap();
     let state = test_state(tmp.path()).await;
 
-    let path = state.repo_path("npub1test", "my-repo");
+    let owner = test_owner();
+    let path = state.repo_path(&owner, "my-repo");
     assert!(path.is_some());
     let path = path.unwrap();
-    assert!(path.ends_with("npub1test/my-repo.git"));
+    assert!(path.ends_with(format!("{owner}/my-repo.git")));
 }
 
 #[tokio::test]
@@ -63,12 +68,13 @@ async fn test_repo_path_invalid_name() {
     let tmp = tempfile::tempdir().unwrap();
     let state = test_state(tmp.path()).await;
 
-    assert!(state.repo_path("npub1test", "").is_none());
-    assert!(state.repo_path("npub1test", "has spaces").is_none());
+    let owner = test_owner();
+    assert!(state.repo_path(&owner, "").is_none());
+    assert!(state.repo_path(&owner, "has spaces").is_none());
     assert!(state
-        .repo_path("npub1test", "way-too-long-name-that-exceeds-limit")
+        .repo_path(&owner, "way-too-long-name-that-exceeds-limit")
         .is_none());
-    assert!(state.repo_path("npub1test", "has/slash").is_none());
+    assert!(state.repo_path(&owner, "has/slash").is_none());
 }
 
 #[tokio::test]
@@ -76,10 +82,11 @@ async fn test_repo_path_valid_names() {
     let tmp = tempfile::tempdir().unwrap();
     let state = test_state(tmp.path()).await;
 
-    assert!(state.repo_path("npub1test", "my-repo").is_some());
-    assert!(state.repo_path("npub1test", "my_repo").is_some());
-    assert!(state.repo_path("npub1test", "MyRepo123").is_some());
-    assert!(state.repo_path("npub1test", "a").is_some());
+    let owner = test_owner();
+    assert!(state.repo_path(&owner, "my-repo").is_some());
+    assert!(state.repo_path(&owner, "my_repo").is_some());
+    assert!(state.repo_path(&owner, "MyRepo123").is_some());
+    assert!(state.repo_path(&owner, "a").is_some());
 }
 
 // ---------------------------------------------------------------------------
@@ -92,7 +99,7 @@ async fn test_create_bare_repo() {
     let state = test_state(tmp.path()).await;
 
     let path = state
-        .create_bare_repo("npub1abc", "test-repo", "A test repository")
+        .create_bare_repo(&test_owner(), "test-repo", "A test repository")
         .await
         .unwrap();
 
@@ -109,11 +116,11 @@ async fn test_create_bare_repo_idempotent() {
     let state = test_state(tmp.path()).await;
 
     let path1 = state
-        .create_bare_repo("npub1abc", "test-repo", "First")
+        .create_bare_repo(&test_owner(), "test-repo", "First")
         .await
         .unwrap();
     let path2 = state
-        .create_bare_repo("npub1abc", "test-repo", "Second")
+        .create_bare_repo(&test_owner(), "test-repo", "Second")
         .await
         .unwrap();
 
@@ -128,7 +135,7 @@ async fn test_create_bare_repo_invalid_name() {
     let state = test_state(tmp.path()).await;
 
     let result = state
-        .create_bare_repo("npub1abc", "invalid name!", "desc")
+        .create_bare_repo(&test_owner(), "invalid name!", "desc")
         .await;
     assert!(result.is_err());
 }
@@ -138,15 +145,16 @@ async fn test_repo_exists() {
     let tmp = tempfile::tempdir().unwrap();
     let state = test_state(tmp.path()).await;
 
-    assert!(!state.repo_exists("npub1abc", "test-repo"));
+    let owner = test_owner();
+    assert!(!state.repo_exists(&owner, "test-repo"));
 
     state
-        .create_bare_repo("npub1abc", "test-repo", "desc")
+        .create_bare_repo(&owner, "test-repo", "desc")
         .await
         .unwrap();
 
-    assert!(state.repo_exists("npub1abc", "test-repo"));
-    assert!(!state.repo_exists("npub1abc", "other-repo"));
+    assert!(state.repo_exists(&owner, "test-repo"));
+    assert!(!state.repo_exists(&owner, "other-repo"));
 }
 
 // ---------------------------------------------------------------------------
@@ -159,7 +167,7 @@ async fn test_git_refs_on_empty_repo() {
     let state = test_state(tmp.path()).await;
 
     let path = state
-        .create_bare_repo("npub1abc", "test-repo", "desc")
+        .create_bare_repo(&test_owner(), "test-repo", "desc")
         .await
         .unwrap();
 
@@ -188,7 +196,14 @@ async fn test_nip11_response() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let url = format!("http://{}", addr);
-    tokio::spawn(async move { axum::serve(listener, router).await.ok() });
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .ok()
+    });
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let client = reqwest::Client::new();
@@ -233,7 +248,7 @@ async fn test_git_info_refs_endpoint() {
 
     // Create a bare repo
     state
-        .create_bare_repo("npub1test", "hello", "test repo")
+        .create_bare_repo(&test_owner(), "hello", "test repo")
         .await
         .unwrap();
 
@@ -241,7 +256,14 @@ async fn test_git_info_refs_endpoint() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let url = format!("http://{}", addr);
-    tokio::spawn(async move { axum::serve(listener, router).await.ok() });
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .ok()
+    });
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let client = reqwest::Client::new();
@@ -249,8 +271,9 @@ async fn test_git_info_refs_endpoint() {
     // info/refs
     let resp = client
         .get(format!(
-            "{}/npub1test/hello/info/refs?service=git-upload-pack",
-            url
+            "{}/{}/hello/info/refs?service=git-upload-pack",
+            url,
+            test_owner()
         ))
         .send()
         .await
@@ -279,13 +302,21 @@ async fn test_git_info_refs_invalid_repo_name() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let url = format!("http://{}", addr);
-    tokio::spawn(async move { axum::serve(listener, router).await.ok() });
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .ok()
+    });
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let resp = reqwest::Client::new()
         .get(format!(
-            "{}/npub1test/invalid repo name!/info/refs?service=git-upload-pack",
-            url
+            "{}/{}/invalid repo name!/info/refs?service=git-upload-pack",
+            url,
+            test_owner()
         ))
         .send()
         .await

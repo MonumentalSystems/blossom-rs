@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use nostr::nips::nip19::FromBech32;
 use nostr_database::NostrDatabase;
 use nostr_relay_builder::LocalRelay;
 
@@ -36,6 +37,7 @@ impl Nip34State {
         let policy = Arc::new(RelayPolicy::with_config(
             config.admin_pubkeys.clone(),
             config.max_event_size,
+            config.rate_limit_events_per_min,
         ));
         for pk in &config.whitelist_pubkeys {
             policy.add_whitelist(pk);
@@ -89,10 +91,22 @@ impl Nip34State {
             return None;
         }
 
+        let owner = if npub.starts_with("npub1") {
+            nostr::PublicKey::from_bech32(npub).ok()?.to_hex()
+        } else if npub.len() == 64
+            && npub
+                .bytes()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+        {
+            npub.to_string()
+        } else {
+            return None;
+        };
+
         Some(
             self.config
                 .repos_path
-                .join(npub)
+                .join(owner)
                 .join(format!("{}.git", repo_name)),
         )
     }

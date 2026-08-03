@@ -4,20 +4,22 @@
 //! exercising each command pathway. Tests key format conversion,
 //! output formatting, iroh URL detection, and error handling.
 
-use blossom_rs::auth::{auth_header_value, build_blossom_auth, Signer};
+use blossom_rs::auth::{
+    auth_header_value, build_blossom_auth_for_request, build_nip98_auth, Signer,
+};
 use blossom_rs::db::MemoryDatabase;
 use blossom_rs::protocol::{sha256_hex, BlobDescriptor};
 use blossom_rs::server::nip96::nip96_router;
 use blossom_rs::{BlobServer, BlossomSigner, MemoryBackend};
 
 async fn spawn_server() -> (String, Signer) {
-    let server = BlobServer::new(MemoryBackend::new(), "http://localhost:3000");
-    let state = server.shared_state();
-    let app = server.router().merge(nip96_router(state));
-
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let url = format!("http://{}", addr);
+    let server = BlobServer::new(MemoryBackend::new(), &url);
+    let state = server.shared_state();
+    let app = server.router().merge(nip96_router(state));
+
     tokio::spawn(async move { axum::serve(listener, app).await.ok() });
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -71,12 +73,21 @@ async fn test_upload_and_download() {
     let http = reqwest::Client::new();
 
     let data = b"cli upload test";
-    let auth = build_blossom_auth(&signer, "upload", Some(&sha256_hex(data)), None, "");
+    let upload_url = format!("{}/upload", url);
+    let auth = build_blossom_auth_for_request(
+        &signer,
+        "upload",
+        Some(&sha256_hex(data)),
+        &url,
+        &upload_url,
+        "PUT",
+        "",
+    );
     let auth_header = auth_header_value(&auth);
 
     // Upload.
     let resp = http
-        .put(format!("{}/upload", url))
+        .put(&upload_url)
         .header("Authorization", &auth_header)
         .body(data.to_vec())
         .send()
@@ -87,10 +98,8 @@ async fn test_upload_and_download() {
     assert_eq!(desc.sha256, sha256_hex(data));
 
     // Download.
-    let auth2 = build_blossom_auth(&signer, "get", None, None, "");
     let resp = http
         .get(format!("{}/{}", url, desc.sha256))
-        .header("Authorization", auth_header_value(&auth2))
         .send()
         .await
         .unwrap();
@@ -104,8 +113,19 @@ async fn test_exists_and_delete() {
     let http = reqwest::Client::new();
 
     let data = b"exists delete test";
+    let upload_url = format!("{}/upload", url);
+    let upload_auth = build_blossom_auth_for_request(
+        &signer,
+        "upload",
+        Some(&sha256_hex(data)),
+        &url,
+        &upload_url,
+        "PUT",
+        "",
+    );
     let resp = http
-        .put(format!("{}/upload", url))
+        .put(&upload_url)
+        .header("Authorization", auth_header_value(&upload_auth))
         .body(data.to_vec())
         .send()
         .await
@@ -121,9 +141,18 @@ async fn test_exists_and_delete() {
     assert_eq!(resp.status(), 200);
 
     // DELETE with auth.
-    let auth = build_blossom_auth(&signer, "delete", None, None, "");
+    let delete_url = format!("{}/{}", url, desc.sha256);
+    let auth = build_blossom_auth_for_request(
+        &signer,
+        "delete",
+        Some(&desc.sha256),
+        &url,
+        &delete_url,
+        "DELETE",
+        "",
+    );
     let resp = http
-        .delete(format!("{}/{}", url, desc.sha256))
+        .delete(&delete_url)
         .header("Authorization", auth_header_value(&auth))
         .send()
         .await
@@ -178,7 +207,7 @@ async fn test_status() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_mirror() {
+async fn test_mirror_rejects_loopback_source() {
     let (source_url, _) = spawn_server().await;
     let (dest_url, signer) = spawn_server().await;
     let http = reqwest::Client::new();
@@ -194,23 +223,26 @@ async fn test_mirror() {
     let desc: BlobDescriptor = resp.json().await.unwrap();
 
     // Mirror to dest.
-    let auth = build_blossom_auth(&signer, "upload", None, None, "");
+    let source_blob_url = format!("{}/{}", source_url, desc.sha256);
+    let mirror_url = format!("{}/mirror", dest_url);
+    let source_hash = sha256_hex(source_blob_url.as_bytes());
+    let auth = build_blossom_auth_for_request(
+        &signer,
+        "upload",
+        Some(&source_hash),
+        &dest_url,
+        &mirror_url,
+        "PUT",
+        "",
+    );
     let resp = http
-        .put(format!("{}/mirror", dest_url))
+        .put(&mirror_url)
         .header("Authorization", auth_header_value(&auth))
-        .json(&serde_json::json!({"url": format!("{}/{}", source_url, desc.sha256)}))
+        .json(&serde_json::json!({"url": source_blob_url}))
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200);
-
-    // Verify on dest.
-    let resp = http
-        .head(format!("{}/{}", dest_url, desc.sha256))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.status(), 502);
 }
 
 // ---------------------------------------------------------------------------
@@ -219,15 +251,15 @@ async fn test_mirror() {
 
 #[tokio::test]
 async fn test_allowed_types_enforcement() {
-    let server = BlobServer::builder(MemoryBackend::new(), "http://localhost:3000")
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let url = format!("http://{}", addr);
+    let server = BlobServer::builder(MemoryBackend::new(), &url)
         .allowed_types(vec!["image/png".into()])
         .build();
     let state = server.shared_state();
     let app = server.router().merge(nip96_router(state));
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let url = format!("http://{}", addr);
     tokio::spawn(async move { axum::serve(listener, app).await.ok() });
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -301,7 +333,10 @@ async fn test_admin_endpoints() {
     let mut keys = HashSet::new();
     keys.insert(admin_pubkey);
 
-    let server = BlobServer::builder(MemoryBackend::new(), "http://localhost:3000")
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let url = format!("http://{}", addr);
+    let server = BlobServer::builder(MemoryBackend::new(), &url)
         .database(MemoryDatabase::new())
         .access_control(blossom_rs::access::Whitelist::new(keys))
         .require_auth()
@@ -312,20 +347,18 @@ async fn test_admin_endpoints() {
         .merge(nip96_router(state.clone()))
         .merge(blossom_rs::server::admin::admin_router(state));
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let url = format!("http://{}", addr);
     tokio::spawn(async move { axum::serve(listener, app).await.ok() });
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let http = reqwest::Client::new();
-    let auth = build_blossom_auth(&signer, "admin", None, None, "");
-    let auth_header = auth_header_value(&auth);
-
     // Stats.
+    let stats_url = format!("{}/admin/stats", url);
     let resp = http
-        .get(format!("{}/admin/stats", url))
-        .header("Authorization", &auth_header)
+        .get(&stats_url)
+        .header(
+            "Authorization",
+            auth_header_value(&build_nip98_auth(&signer, &stats_url, "GET")),
+        )
         .send()
         .await
         .unwrap();
@@ -333,9 +366,13 @@ async fn test_admin_endpoints() {
 
     // Set quota.
     let target = "a".repeat(64);
+    let quota_url = format!("{}/admin/users/{}/quota", url, target);
     let resp = http
-        .put(format!("{}/admin/users/{}/quota", url, target))
-        .header("Authorization", &auth_header)
+        .put(&quota_url)
+        .header(
+            "Authorization",
+            auth_header_value(&build_nip98_auth(&signer, &quota_url, "PUT")),
+        )
         .json(&serde_json::json!({"quota_bytes": 1048576}))
         .send()
         .await
@@ -343,10 +380,13 @@ async fn test_admin_endpoints() {
     assert_eq!(resp.status(), 200);
 
     // Get user.
-    let auth2 = build_blossom_auth(&signer, "admin", None, None, "");
+    let user_url = format!("{}/admin/users/{}", url, target);
     let resp = http
-        .get(format!("{}/admin/users/{}", url, target))
-        .header("Authorization", auth_header_value(&auth2))
+        .get(&user_url)
+        .header(
+            "Authorization",
+            auth_header_value(&build_nip98_auth(&signer, &user_url, "GET")),
+        )
         .send()
         .await
         .unwrap();

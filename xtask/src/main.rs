@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use blossom_rs::auth::{BlossomSigner, Signer};
 use blossom_rs::integrity::{
     generate_release_manifest, generate_release_manifest_for_entries,
     generate_source_build_manifest, verify_merkle_proof, workspace_root_from_manifest_dir,
@@ -17,12 +18,25 @@ fn main() {
 fn run() -> Result<(), String> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     match args.first().map(String::as_str) {
+        Some("release-signer-pubkey") => release_signer_pubkey(),
         Some("sign-release-manifest") => sign_release_manifest(&args[1..]),
         Some("source-build-manifest") => source_build_manifest(&args[1..]),
         Some("source-merkle-tree") => source_merkle_tree(&args[1..]),
         Some("verify-source-file") => verify_source_file(&args[1..]),
         _ => Err(usage()),
     }
+}
+
+fn release_signer_pubkey() -> Result<(), String> {
+    let nsec = std::env::var("BLOSSOM_RELEASE_NSEC")
+        .map_err(|_| "missing BLOSSOM_RELEASE_NSEC environment variable".to_string())?;
+    if nsec.trim().is_empty() {
+        return Err("missing BLOSSOM_RELEASE_NSEC environment variable".into());
+    }
+
+    let signer = Signer::from_secret_hex(nsec.trim())?;
+    println!("{}", signer.public_key_hex());
+    Ok(())
 }
 
 fn sign_release_manifest(args: &[String]) -> Result<(), String> {
@@ -226,6 +240,7 @@ fn take_flag_value(args: &[String], flag: &str) -> Option<String> {
 fn usage() -> String {
     [
         "usage:",
+        "  cargo xtask release-signer-pubkey",
         "  cargo xtask sign-release-manifest [--bin <path> | --package-root <dir>] [--output <path>] [--target <triple>]",
         "  cargo xtask source-build-manifest [--output <path>] [--target <triple>]",
         "  cargo xtask source-merkle-tree [--output <path>]",

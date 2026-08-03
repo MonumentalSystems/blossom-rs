@@ -47,23 +47,23 @@ Global Options:
 The `--key` option accepts both formats:
 
 ```bash
-# Hex (64 characters)
--k 7c3fb2c976bce406b095a13dae24990661b32a6d1d38c9509041ed3c34959791
+# Hex (64 characters; placeholder only)
+-k <64-character-secret-hex>
 
-# nsec1 bech32
--k nsec10slm9jtkhnjqdvy45y76ufyeqesmx2ndr5uvj5ysg8kncdy4j7gs66zq5r
+# nsec1 bech32 (placeholder only)
+-k <your-nsec>
 
 # Or via environment variable
-export BLOSSOM_SECRET_KEY=nsec10slm9jtkhnjqdvy45y76ufyeqesmx2ndr5uvj5ysg8kncdy4j7gs66zq5r
+export BLOSSOM_SECRET_KEY=<your-nsec>
 cargo run -p blossom-cli -- upload photo.jpg
 ```
 
 The `keygen` command outputs both formats:
 
 ```
-Secret key (hex):  7c3fb2c976bce406b095a13dae24990661b32a6d1d38c9509041ed3c34959791
-Secret key (nsec): nsec10slm9jtkhnjqdvy45y76ufyeqesmx2ndr5uvj5ysg8kncdy4j7gs66zq5r
-Public key (hex):  bea809c847e78732159417625dfe17c16dd36493919467c9b69c5e9eb3227450
+Secret key (hex):  <redacted>
+Secret key (nsec): <redacted>
+Public key (hex):  <generated-public-key>
 ```
 
 ## Examples

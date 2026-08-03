@@ -4,9 +4,9 @@
 //! for pubkey whitelists/blacklists, event size limits, kind filtering,
 //! and admin bypass.
 
-use std::collections::HashSet;
-use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
+use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex, RwLock};
 
 use nostr::{Event, Kind};
 use nostr_relay_builder::prelude::*;
@@ -33,6 +33,9 @@ pub struct RelayPolicy {
     pub allowed_kinds: RwLock<HashSet<Kind>>,
     /// Disallowed event kinds — always rejected.
     pub disallowed_kinds: RwLock<HashSet<Kind>>,
+    /// Per-connection event rate limit (zero disables the limit).
+    pub event_rate_per_min: u32,
+    event_rates: Mutex<HashMap<IpAddr, (u64, u32)>>,
 }
 
 impl RelayPolicy {
@@ -45,14 +48,21 @@ impl RelayPolicy {
             max_event_size: 0,
             allowed_kinds: RwLock::new(HashSet::new()),
             disallowed_kinds: RwLock::new(HashSet::new()),
+            event_rate_per_min: 120,
+            event_rates: Mutex::new(HashMap::new()),
         }
     }
 
     /// Create a policy with admin pubkeys and event size limit.
-    pub fn with_config(admins: Vec<String>, max_event_size: usize) -> Self {
+    pub fn with_config(
+        admins: Vec<String>,
+        max_event_size: usize,
+        event_rate_per_min: u32,
+    ) -> Self {
         Self {
             admins: RwLock::new(admins.into_iter().collect()),
             max_event_size,
+            event_rate_per_min,
             ..Self::new()
         }
     }
@@ -97,7 +107,30 @@ impl RelayPolicy {
         self.disallowed_kinds.write().unwrap().insert(kind);
     }
 
-    fn check_event(&self, event: &Event) -> PolicyResult {
+    fn check_event(&self, event: &Event, addr: &SocketAddr) -> PolicyResult {
+        if self.event_rate_per_min > 0 {
+            let minute = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                / 60;
+            let mut rates = self
+                .event_rates
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if rates.len() >= 10_000 {
+                rates.retain(|_, (window, _)| *window == minute);
+            }
+            let entry = rates.entry(addr.ip()).or_insert((minute, 0));
+            if entry.0 != minute {
+                *entry = (minute, 0);
+            }
+            if entry.1 >= self.event_rate_per_min {
+                return PolicyResult::Reject("event rate limit exceeded".into());
+            }
+            entry.1 += 1;
+        }
+
         let pubkey_hex = event.pubkey.to_hex();
 
         // 1. Admins bypass all restrictions
@@ -157,9 +190,9 @@ impl WritePolicy for RelayPolicy {
     fn admit_event<'a>(
         &'a self,
         event: &'a Event,
-        _addr: &'a SocketAddr,
+        addr: &'a SocketAddr,
     ) -> BoxedFuture<'a, PolicyResult> {
-        Box::pin(async move { self.check_event(event) })
+        Box::pin(async move { self.check_event(event, addr) })
     }
 }
 
@@ -171,9 +204,9 @@ impl WritePolicy for SharedRelayPolicy {
     fn admit_event<'a>(
         &'a self,
         event: &'a Event,
-        _addr: &'a SocketAddr,
+        addr: &'a SocketAddr,
     ) -> BoxedFuture<'a, PolicyResult> {
-        Box::pin(async move { self.0.check_event(event) })
+        Box::pin(async move { self.0.check_event(event, addr) })
     }
 }
 
@@ -209,12 +242,16 @@ mod tests {
             .unwrap()
     }
 
+    fn check(policy: &RelayPolicy, event: &Event) -> PolicyResult {
+        policy.check_event(event, &SocketAddr::from(([127, 0, 0, 1], 12345)))
+    }
+
     #[test]
     fn test_no_restrictions() {
         let policy = RelayPolicy::new();
         let keys = Keys::generate();
         let event = make_event(&keys, Kind::TextNote);
-        assert!(matches!(policy.check_event(&event), PolicyResult::Accept));
+        assert!(matches!(check(&policy, &event), PolicyResult::Accept));
     }
 
     #[test]
@@ -224,10 +261,7 @@ mod tests {
         policy.add_blacklist(&keys.public_key().to_hex());
 
         let event = make_event(&keys, Kind::TextNote);
-        assert!(matches!(
-            policy.check_event(&event),
-            PolicyResult::Reject(_)
-        ));
+        assert!(matches!(check(&policy, &event), PolicyResult::Reject(_)));
     }
 
     #[test]
@@ -240,12 +274,9 @@ mod tests {
         let ok_event = make_event(&allowed, Kind::TextNote);
         let bad_event = make_event(&denied, Kind::TextNote);
 
+        assert!(matches!(check(&policy, &ok_event), PolicyResult::Accept));
         assert!(matches!(
-            policy.check_event(&ok_event),
-            PolicyResult::Accept
-        ));
-        assert!(matches!(
-            policy.check_event(&bad_event),
+            check(&policy, &bad_event),
             PolicyResult::Reject(_)
         ));
     }
@@ -259,19 +290,16 @@ mod tests {
         policy.add_admin(&hex);
 
         let event = make_event(&keys, Kind::TextNote);
-        assert!(matches!(policy.check_event(&event), PolicyResult::Accept));
+        assert!(matches!(check(&policy, &event), PolicyResult::Accept));
     }
 
     #[test]
     fn test_event_size_limit() {
-        let policy = RelayPolicy::with_config(vec![], 100);
+        let policy = RelayPolicy::with_config(vec![], 100, 120);
         let keys = Keys::generate();
         // A normal event is > 100 bytes when serialized
         let event = make_event(&keys, Kind::TextNote);
-        assert!(matches!(
-            policy.check_event(&event),
-            PolicyResult::Reject(_)
-        ));
+        assert!(matches!(check(&policy, &event), PolicyResult::Reject(_)));
     }
 
     #[test]
@@ -283,8 +311,8 @@ mod tests {
         let bad = make_event(&keys, Kind::TextNote);
         let ok = make_event(&keys, Kind::Custom(30617));
 
-        assert!(matches!(policy.check_event(&bad), PolicyResult::Reject(_)));
-        assert!(matches!(policy.check_event(&ok), PolicyResult::Accept));
+        assert!(matches!(check(&policy, &bad), PolicyResult::Reject(_)));
+        assert!(matches!(check(&policy, &ok), PolicyResult::Accept));
     }
 
     #[test]
@@ -296,8 +324,8 @@ mod tests {
         let ok = make_event(&keys, Kind::Custom(30617));
         let bad = make_event(&keys, Kind::TextNote);
 
-        assert!(matches!(policy.check_event(&ok), PolicyResult::Accept));
-        assert!(matches!(policy.check_event(&bad), PolicyResult::Reject(_)));
+        assert!(matches!(check(&policy, &ok), PolicyResult::Accept));
+        assert!(matches!(check(&policy, &bad), PolicyResult::Reject(_)));
     }
 
     #[test]
@@ -312,6 +340,6 @@ mod tests {
 
         // Admin can send any kind even though not whitelisted for that kind
         let event = make_event(&admin_keys, Kind::TextNote);
-        assert!(matches!(policy.check_event(&event), PolicyResult::Accept));
+        assert!(matches!(check(&policy, &event), PolicyResult::Accept));
     }
 }

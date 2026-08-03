@@ -95,7 +95,7 @@ impl IrohBlossomClient {
         // Send request.
         let req = Request {
             op: Op::Upload,
-            sha256: String::new(),
+            sha256: our_sha256.clone(),
             pubkey: String::new(),
             auth: auth_header,
             content_type: content_type.to_string(),
@@ -181,6 +181,7 @@ impl IrohBlossomClient {
 
         let req = Request {
             op: Op::Upload,
+            sha256: our_sha256.clone(),
             auth: auth_header,
             content_type: content_type.to_string(),
             body_len: data.len() as u64,
@@ -311,7 +312,7 @@ impl IrohBlossomClient {
     /// Delete a blob on a remote peer (requires auth).
     #[instrument(name = "blossom.iroh.client.delete", skip_all, fields(blob.sha256 = %sha256))]
     pub async fn delete(&self, addr: EndpointAddr, sha256: &str) -> Result<bool, String> {
-        let auth_event = build_blossom_auth(self.signer.as_ref(), "delete", None, None, "");
+        let auth_event = build_blossom_auth(self.signer.as_ref(), "delete", Some(sha256), None, "");
         let auth_header = auth_header_value(&auth_event);
 
         let conn = self.connect(addr).await?;
@@ -432,7 +433,7 @@ impl IrohBlossomClient {
         // Send request header.
         let req = Request {
             op: Op::Upload,
-            sha256: String::new(),
+            sha256: our_sha256.clone(),
             pubkey: String::new(),
             auth: auth_header,
             content_type: content_type.to_string(),
@@ -530,19 +531,25 @@ impl IrohBlossomClient {
         repo_id: &str,
         path: &str,
     ) -> Result<LockRecord, String> {
-        let auth_event = build_blossom_auth(self.signer.as_ref(), "lock", None, None, "");
-        let auth_header = auth_header_value(&auth_event);
-
-        let conn = self.connect(addr.clone()).await?;
-        let (mut send, mut recv) = conn.open_bi().await.map_err(|e| format!("open_bi: {e}"))?;
-
-        let req = Request {
+        let mut req = Request {
             op: Op::LockCreate,
-            auth: auth_header,
             repo_id: repo_id.to_string(),
             lock_path: path.to_string(),
             ..Default::default()
         };
+        let binding = super::iroh_transport::request_auth_binding(&req)
+            .ok_or_else(|| "missing lock request binding".to_string())?;
+        req.auth = auth_header_value(&build_blossom_auth(
+            self.signer.as_ref(),
+            "lock",
+            Some(&binding),
+            None,
+            "",
+        ));
+
+        let conn = self.connect(addr.clone()).await?;
+        let (mut send, mut recv) = conn.open_bi().await.map_err(|e| format!("open_bi: {e}"))?;
+
         send.write_all(&wire::encode_request(&req))
             .await
             .map_err(|e| format!("send: {e}"))?;
@@ -571,20 +578,26 @@ impl IrohBlossomClient {
         lock_id: &str,
         force: bool,
     ) -> Result<LockRecord, String> {
-        let auth_event = build_blossom_auth(self.signer.as_ref(), "lock", None, None, "");
-        let auth_header = auth_header_value(&auth_event);
-
-        let conn = self.connect(addr.clone()).await?;
-        let (mut send, mut recv) = conn.open_bi().await.map_err(|e| format!("open_bi: {e}"))?;
-
-        let req = Request {
+        let mut req = Request {
             op: Op::LockDelete,
-            auth: auth_header,
             repo_id: repo_id.to_string(),
             lock_id: lock_id.to_string(),
             force,
             ..Default::default()
         };
+        let binding = super::iroh_transport::request_auth_binding(&req)
+            .ok_or_else(|| "missing unlock request binding".to_string())?;
+        req.auth = auth_header_value(&build_blossom_auth(
+            self.signer.as_ref(),
+            "lock",
+            Some(&binding),
+            None,
+            "",
+        ));
+
+        let conn = self.connect(addr.clone()).await?;
+        let (mut send, mut recv) = conn.open_bi().await.map_err(|e| format!("open_bi: {e}"))?;
+
         send.write_all(&wire::encode_request(&req))
             .await
             .map_err(|e| format!("send: {e}"))?;
@@ -660,20 +673,26 @@ impl IrohBlossomClient {
         cursor: Option<&str>,
         limit: Option<u32>,
     ) -> Result<(Vec<LockRecord>, Vec<LockRecord>, Option<String>), String> {
-        let auth_event = build_blossom_auth(self.signer.as_ref(), "lock", None, None, "");
-        let auth_header = auth_header_value(&auth_event);
-
-        let conn = self.connect(addr.clone()).await?;
-        let (mut send, mut recv) = conn.open_bi().await.map_err(|e| format!("open_bi: {e}"))?;
-
-        let req = Request {
+        let mut req = Request {
             op: Op::LockVerify,
-            auth: auth_header,
             repo_id: repo_id.to_string(),
             cursor: cursor.unwrap_or("").to_string(),
             limit: limit.unwrap_or(0),
             ..Default::default()
         };
+        let binding = super::iroh_transport::request_auth_binding(&req)
+            .ok_or_else(|| "missing lock verification binding".to_string())?;
+        req.auth = auth_header_value(&build_blossom_auth(
+            self.signer.as_ref(),
+            "lock",
+            Some(&binding),
+            None,
+            "",
+        ));
+
+        let conn = self.connect(addr.clone()).await?;
+        let (mut send, mut recv) = conn.open_bi().await.map_err(|e| format!("open_bi: {e}"))?;
+
         send.write_all(&wire::encode_request(&req))
             .await
             .map_err(|e| format!("send: {e}"))?;

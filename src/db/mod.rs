@@ -103,6 +103,15 @@ pub trait BlobDatabase: Send + Sync {
     /// Delete an upload record. Returns true if it existed.
     fn delete_upload(&mut self, sha256: &str) -> Result<bool, DbError>;
 
+    /// Return whether a pubkey owns a reference to this blob.
+    fn is_upload_owner(&self, sha256: &str, pubkey: &str) -> Result<bool, DbError>;
+
+    /// Return the number of owners currently referencing this blob.
+    fn upload_owner_count(&self, sha256: &str) -> Result<usize, DbError>;
+
+    /// Remove one owner's reference and debit their quota. Returns true if it existed.
+    fn delete_upload_owner(&mut self, sha256: &str, pubkey: &str) -> Result<bool, DbError>;
+
     // --- User / quota ---
 
     /// Get or create a user record.

@@ -10,6 +10,7 @@ use super::{BlobDatabase, DbError, FileStats, UploadRecord, UserRecord};
 /// and lightweight embedded scenarios.
 pub struct MemoryDatabase {
     uploads: HashMap<String, UploadRecord>,
+    owners: HashMap<(String, String), UploadRecord>,
     users: HashMap<String, UserRecord>,
     stats: HashMap<String, FileStats>,
 }
@@ -18,6 +19,7 @@ impl MemoryDatabase {
     pub fn new() -> Self {
         Self {
             uploads: HashMap::new(),
+            owners: HashMap::new(),
             users: HashMap::new(),
             stats: HashMap::new(),
         }
@@ -32,13 +34,30 @@ impl Default for MemoryDatabase {
 
 impl BlobDatabase for MemoryDatabase {
     fn record_upload(&mut self, record: &UploadRecord) -> Result<(), DbError> {
+        let owner_key = (record.sha256.clone(), record.pubkey.clone());
+        if self.owners.contains_key(&owner_key) {
+            return Ok(());
+        }
+
+        let user = self.get_or_create_user(&record.pubkey)?;
+        let new_used = user
+            .used_bytes
+            .checked_add(record.size)
+            .ok_or_else(|| DbError::Internal("used byte count overflow".into()))?;
+        if let Some(limit) = user.quota_bytes {
+            if new_used > limit {
+                return Err(DbError::QuotaExceeded {
+                    used: user.used_bytes,
+                    requested: record.size,
+                    limit,
+                });
+            }
+        }
+
         self.uploads
             .entry(record.sha256.clone())
             .or_insert_with(|| record.clone());
-
-        // Update user's used_bytes.
-        let user = self.get_or_create_user(&record.pubkey)?;
-        let new_used = user.used_bytes + record.size;
+        self.owners.insert(owner_key, record.clone());
         self.update_used_bytes(&record.pubkey, new_used)?;
 
         Ok(())
@@ -50,7 +69,7 @@ impl BlobDatabase for MemoryDatabase {
 
     fn list_uploads_by_pubkey(&self, pubkey: &str) -> Result<Vec<UploadRecord>, DbError> {
         let mut records: Vec<_> = self
-            .uploads
+            .owners
             .values()
             .filter(|r| r.pubkey == pubkey)
             .cloned()
@@ -60,16 +79,50 @@ impl BlobDatabase for MemoryDatabase {
     }
 
     fn delete_upload(&mut self, sha256: &str) -> Result<bool, DbError> {
-        if let Some(record) = self.uploads.remove(sha256) {
-            // Recalculate user's used_bytes.
-            if let Some(user) = self.users.get_mut(&record.pubkey) {
-                user.used_bytes = user.used_bytes.saturating_sub(record.size);
+        if self.uploads.remove(sha256).is_some() {
+            let owners: Vec<_> = self
+                .owners
+                .keys()
+                .filter(|(hash, _)| hash == sha256)
+                .cloned()
+                .collect();
+            for key in owners {
+                if let Some(owner) = self.owners.remove(&key) {
+                    if let Some(user) = self.users.get_mut(&owner.pubkey) {
+                        user.used_bytes = user.used_bytes.saturating_sub(owner.size);
+                    }
+                }
             }
             self.stats.remove(sha256);
             Ok(true)
         } else {
             Ok(false)
         }
+    }
+
+    fn is_upload_owner(&self, sha256: &str, pubkey: &str) -> Result<bool, DbError> {
+        Ok(self
+            .owners
+            .contains_key(&(sha256.to_string(), pubkey.to_string())))
+    }
+
+    fn upload_owner_count(&self, sha256: &str) -> Result<usize, DbError> {
+        Ok(self
+            .owners
+            .keys()
+            .filter(|(hash, _)| hash == sha256)
+            .count())
+    }
+
+    fn delete_upload_owner(&mut self, sha256: &str, pubkey: &str) -> Result<bool, DbError> {
+        let key = (sha256.to_string(), pubkey.to_string());
+        let Some(record) = self.owners.remove(&key) else {
+            return Ok(false);
+        };
+        if let Some(user) = self.users.get_mut(pubkey) {
+            user.used_bytes = user.used_bytes.saturating_sub(record.size);
+        }
+        Ok(true)
     }
 
     fn get_or_create_user(&mut self, pubkey: &str) -> Result<UserRecord, DbError> {
@@ -102,7 +155,11 @@ impl BlobDatabase for MemoryDatabase {
     fn check_quota(&self, pubkey: &str, additional_bytes: u64) -> Result<(), DbError> {
         if let Some(user) = self.users.get(pubkey) {
             if let Some(limit) = user.quota_bytes {
-                if user.used_bytes + additional_bytes > limit {
+                let exceeds_limit = match user.used_bytes.checked_add(additional_bytes) {
+                    Some(total) => total > limit,
+                    None => true,
+                };
+                if exceeds_limit {
                     return Err(DbError::QuotaExceeded {
                         used: user.used_bytes,
                         requested: additional_bytes,
@@ -329,12 +386,26 @@ mod tests {
         assert_eq!(db.upload_count(), 1);
         // used_bytes should only count once since it's the same sha256.
         let user = db.get_or_create_user("alice").unwrap();
-        // First insert adds 1024, second is a no-op for the record
-        // but still adds to used_bytes — let's check actual behavior.
-        // The entry().or_insert means record_upload is no-op for duplicate sha256,
-        // but used_bytes gets incremented. This is a known behavior —
-        // in practice the server checks existence before recording.
-        // For this test, just verify upload count is deduplicated.
-        assert!(user.used_bytes >= 1024);
+        assert_eq!(user.used_bytes, 1024);
+    }
+
+    #[test]
+    fn test_shared_blob_has_independent_owners() {
+        let mut db = MemoryDatabase::new();
+        let alice = sample_upload("alice");
+        let mut bob = alice.clone();
+        bob.pubkey = "bob".into();
+
+        db.record_upload(&alice).unwrap();
+        db.record_upload(&bob).unwrap();
+        assert!(db.is_upload_owner(&alice.sha256, "alice").unwrap());
+        assert!(db.is_upload_owner(&alice.sha256, "bob").unwrap());
+        assert_eq!(db.upload_owner_count(&alice.sha256).unwrap(), 2);
+
+        db.delete_upload_owner(&alice.sha256, "alice").unwrap();
+        assert!(!db.is_upload_owner(&alice.sha256, "alice").unwrap());
+        assert!(db.is_upload_owner(&alice.sha256, "bob").unwrap());
+        assert_eq!(db.get_or_create_user("alice").unwrap().used_bytes, 0);
+        assert_eq!(db.get_or_create_user("bob").unwrap().used_bytes, 1024);
     }
 }
