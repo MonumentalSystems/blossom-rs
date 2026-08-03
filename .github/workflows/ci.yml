@@ -28,13 +28,9 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - name: Install Gitleaks 8.28.0
-        run: |
-          curl --proto '=https' --tlsv1.2 -fsSLo /tmp/gitleaks.tar.gz \
-            https://github.com/gitleaks/gitleaks/releases/download/v8.28.0/gitleaks_8.28.0_linux_x64.tar.gz
-          echo 'a65b5253807a68ac0cafa4414031fd740aeb55f54fb7e55f386acb52e6a840eb  /tmp/gitleaks.tar.gz' | sha256sum --check
-          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+        run: bash .github/scripts/install-gitleaks.sh
       - name: Scan pushed commits for secrets
-        run: /tmp/gitleaks git . --redact --verbose --log-opts='${{ github.event.before }}..${{ github.sha }}'
+        run: gitleaks git . --redact --verbose --log-opts='${{ github.event.before }}..${{ github.sha }}'
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -54,13 +50,9 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - name: Install Gitleaks 8.28.0
-        run: |
-          curl --proto '=https' --tlsv1.2 -fsSLo /tmp/gitleaks.tar.gz \
-            https://github.com/gitleaks/gitleaks/releases/download/v8.28.0/gitleaks_8.28.0_linux_x64.tar.gz
-          echo 'a65b5253807a68ac0cafa4414031fd740aeb55f54fb7e55f386acb52e6a840eb  /tmp/gitleaks.tar.gz' | sha256sum --check
-          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+        run: bash .github/scripts/install-gitleaks.sh
       - name: Scan pull request commits for secrets
-        run: /tmp/gitleaks git . --redact --verbose --log-opts='${{ github.event.pull_request.base.sha }}..${{ github.sha }}'
+        run: gitleaks git . --redact --verbose --log-opts='${{ github.event.pull_request.base.sha }}..${{ github.sha }}'
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
