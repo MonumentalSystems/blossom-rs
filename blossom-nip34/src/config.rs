@@ -9,6 +9,9 @@ use nostr::Kind;
 pub struct Nip34Config {
     /// Relay domain (e.g., "relay.example.com"). Used in NIP-11 and GRASP validation.
     pub domain: String,
+    /// Canonical externally visible HTTP origin, including scheme and port.
+    /// Request authorization URLs are matched exactly against this value.
+    pub server_url: String,
     /// LMDB database directory for Nostr event storage.
     pub lmdb_path: PathBuf,
     /// Directory for bare git repositories (`{npub}/{repo}.git`).
@@ -48,6 +51,7 @@ impl Default for Nip34Config {
     fn default() -> Self {
         Self {
             domain: "localhost".into(),
+            server_url: "http://localhost".into(),
             lmdb_path: PathBuf::from("./relay_db"),
             repos_path: PathBuf::from("./repos"),
             git_path: "git".into(),

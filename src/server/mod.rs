@@ -19,7 +19,7 @@ pub mod nip96;
 use std::sync::Arc;
 
 use crate::access::{AccessControl, Action, OpenAccess, Role};
-use crate::auth::{verify_blossom_auth_bound, verify_nip98_auth, AuthError};
+use crate::auth::{verify_blossom_auth_bound, verify_nip98_auth_with_payload, AuthError};
 use crate::db::{BlobDatabase, DbError, MemoryDatabase, UploadRecord};
 use crate::lfs::{
     compress, reconstruct_blob, LfsContext, LfsFileVersion, LfsStorageType, LfsVersionDatabase,
@@ -391,7 +391,7 @@ impl BlobServer {
         let router = iroh::protocol::Router::builder(endpoint)
             .accept(
                 BLOSSOM_ALPN,
-                Arc::new(BlossomProtocol::new(self.state.clone())),
+                Arc::new(BlossomProtocol::new(self.state.clone(), addr.id)),
             )
             .spawn();
 
@@ -446,7 +446,14 @@ pub(crate) fn verify_auth_event(
             method,
             expected_hash,
         ),
-        27235 => verify_nip98_auth(event, Some(&request_url), Some(method)),
+        27235 => verify_nip98_auth_with_payload(
+            event,
+            Some(&request_url),
+            Some(method),
+            matches!(method, "POST" | "PUT" | "PATCH")
+                .then_some(expected_hash)
+                .flatten(),
+        ),
         other => Err(AuthError::WrongKind(other)),
     }?;
 

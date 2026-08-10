@@ -34,14 +34,16 @@ const MAX_CONCURRENT_STREAMS: usize = 64;
 #[derive(Debug, Clone)]
 pub struct BlossomProtocol {
     state: SharedState,
+    receiver: String,
     streams: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 impl BlossomProtocol {
     /// Create a new protocol handler sharing the given `SharedState`.
-    pub fn new(state: SharedState) -> Self {
+    pub fn new(state: SharedState, receiver_id: iroh::EndpointId) -> Self {
         Self {
             state,
+            receiver: iroh_server_identity(&receiver_id),
             streams: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_STREAMS)),
         }
     }
@@ -53,6 +55,7 @@ impl ProtocolHandler for BlossomProtocol {
         conn: Connection,
     ) -> impl std::future::Future<Output = Result<(), AcceptError>> + Send {
         let state = self.state.clone();
+        let receiver = self.receiver.clone();
         let streams = self.streams.clone();
         async move {
             let remote = conn.remote_id();
@@ -64,6 +67,7 @@ impl ProtocolHandler for BlossomProtocol {
                     Err(_) => break,
                 };
                 let state = state.clone();
+                let receiver = receiver.clone();
                 let permit = match streams.clone().try_acquire_owned() {
                     Ok(permit) => permit,
                     Err(_) => {
@@ -73,8 +77,11 @@ impl ProtocolHandler for BlossomProtocol {
                 };
                 tokio::spawn(async move {
                     let _permit = permit;
-                    let _ = tokio::time::timeout(STREAM_TIMEOUT, handle_stream(send, recv, state))
-                        .await;
+                    let _ = tokio::time::timeout(
+                        STREAM_TIMEOUT,
+                        handle_stream(send, recv, state, &receiver),
+                    )
+                    .await;
                 });
             }
 
@@ -89,6 +96,7 @@ async fn handle_stream(
     mut send: iroh::endpoint::SendStream,
     mut recv: iroh::endpoint::RecvStream,
     state: SharedState,
+    receiver: &str,
 ) {
     // Read the request JSON line.
     let mut buf = Vec::with_capacity(4096);
@@ -174,7 +182,7 @@ async fn handle_stream(
 
     // Verify auth if provided.
     let auth_pubkey = if !req.auth.is_empty() {
-        match verify_auth(&req.auth, &req) {
+        match verify_auth(&req.auth, &req, receiver) {
             Ok(pk) => Some(pk),
             Err(e) => {
                 let resp = Response {
@@ -252,7 +260,7 @@ fn parse_lfs_from_request(req: &Request) -> LfsContext {
 
 /// Verify transport-specific Blossom auth. NIP-98 is HTTP-only and is not
 /// accepted on the iroh protocol.
-fn verify_auth(auth_header: &str, req: &Request) -> Result<String, String> {
+fn verify_auth(auth_header: &str, req: &Request, receiver: &str) -> Result<String, String> {
     let b64 = auth_header.strip_prefix("Nostr ").unwrap_or(auth_header);
 
     let json_bytes = base64url_decode(b64).map_err(|e| format!("invalid auth encoding: {e}"))?;
@@ -272,6 +280,16 @@ fn verify_auth(auth_header: &str, req: &Request) -> Result<String, String> {
         return Err("iroh requires a Blossom kind:24242 authorization event".into());
     }
     verify_blossom_auth(&event, Some(action)).map_err(|e| e.to_string())?;
+    if request_auth_binding(req).is_some() {
+        let servers: Vec<_> = event
+            .tags
+            .iter()
+            .filter(|tag| tag.first().is_some_and(|value| value == "server"))
+            .collect();
+        if servers.len() != 1 || servers[0].len() != 2 || servers[0][1] != receiver {
+            return Err("authorization is for a different iroh server".into());
+        }
+    }
     if let Some(expected_binding) = request_auth_binding(req) {
         let hashes: Vec<_> = event
             .tags
@@ -294,6 +312,10 @@ fn verify_auth(auth_header: &str, req: &Request) -> Result<String, String> {
     }
 
     Ok(event.pubkey)
+}
+
+pub(super) fn iroh_server_identity(id: &iroh::EndpointId) -> String {
+    format!("iroh://{id}")
 }
 
 pub(super) fn request_auth_binding(req: &Request) -> Option<String> {
@@ -1262,6 +1284,66 @@ async fn handle_lock_verify(
                 descriptor: None,
             };
             let _ = send.write_all(&wire::encode_response(&resp)).await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+    use crate::auth::{auth_header_value, build_blossom_auth, BlossomSigner, Signer};
+
+    #[test]
+    fn mutation_auth_is_bound_to_receiving_iroh_server() {
+        let signer = Signer::generate();
+        let hash = crate::protocol::sha256_hex(b"receiver-bound upload");
+        let receiver_a = "iroh://server-a";
+        let requests = [
+            Request {
+                op: Op::Upload,
+                sha256: hash.clone(),
+                ..Default::default()
+            },
+            Request {
+                op: Op::Delete,
+                sha256: hash,
+                ..Default::default()
+            },
+            Request {
+                op: Op::LockCreate,
+                repo_id: "repo".into(),
+                lock_path: "assets/model.bin".into(),
+                ..Default::default()
+            },
+            Request {
+                op: Op::LockDelete,
+                repo_id: "repo".into(),
+                lock_id: "lock-1".into(),
+                ..Default::default()
+            },
+            Request {
+                op: Op::LockVerify,
+                repo_id: "repo".into(),
+                limit: 100,
+                ..Default::default()
+            },
+        ];
+
+        for mut request in requests {
+            let action = match &request.op {
+                Op::Upload => "upload",
+                Op::Delete => "delete",
+                _ => "lock",
+            };
+            let binding = request_auth_binding(&request).unwrap();
+            let event = build_blossom_auth(&signer, action, Some(&binding), Some(receiver_a), "");
+            request.auth = auth_header_value(&event);
+
+            assert!(verify_auth(&request.auth, &request, "iroh://server-b").is_err());
+            assert_eq!(
+                verify_auth(&request.auth, &request, receiver_a).unwrap(),
+                signer.public_key_hex()
+            );
         }
     }
 }

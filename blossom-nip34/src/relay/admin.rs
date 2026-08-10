@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use axum::body::{to_bytes, Body};
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
 use axum::middleware::Next;
@@ -12,6 +13,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64::Engine;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use crate::Nip34State;
 
@@ -46,8 +48,24 @@ async fn require_relay_admin(
     request: Request,
     next: Next,
 ) -> Response {
-    let authorized = request
-        .headers()
+    let (parts, body) = request.into_parts();
+    let body = match to_bytes(body, 64 * 1024).await {
+        Ok(body) => body,
+        Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+    };
+    let mutation = matches!(parts.method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE");
+    let payload_hash = mutation.then(|| hex::encode(Sha256::digest(&body)));
+    let path_and_query = parts
+        .uri
+        .path_and_query()
+        .map_or(parts.uri.path(), |value| value.as_str());
+    let expected_url = format!(
+        "{}{}",
+        state.config.server_url.trim_end_matches('/'),
+        path_and_query
+    );
+    let authorized = parts
+        .headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Nostr "))
@@ -56,8 +74,9 @@ async fn require_relay_admin(
             verify_admin_event(
                 &event,
                 &state,
-                request.uri().path(),
-                request.method().as_str(),
+                &expected_url,
+                parts.method.as_str(),
+                payload_hash.as_deref(),
             )
         });
 
@@ -68,7 +87,7 @@ async fn require_relay_admin(
         )
             .into_response();
     }
-    next.run(request).await
+    next.run(Request::from_parts(parts, Body::from(body))).await
 }
 
 fn decode_auth_event(encoded: &str) -> Option<nostr::Event> {
@@ -79,7 +98,13 @@ fn decode_auth_event(encoded: &str) -> Option<nostr::Event> {
     serde_json::from_slice(&bytes).ok()
 }
 
-fn verify_admin_event(event: &nostr::Event, state: &Nip34State, path: &str, method: &str) -> bool {
+fn verify_admin_event(
+    event: &nostr::Event,
+    state: &Nip34State,
+    expected_url: &str,
+    method: &str,
+    payload_hash: Option<&str>,
+) -> bool {
     if event.verify().is_err()
         || !state
             .policy
@@ -129,15 +154,14 @@ fn verify_admin_event(event: &nostr::Event, state: &Nip34State, path: &str, meth
     let Some(tag_method) = unique("method") else {
         return false;
     };
-    let parsed = match url::Url::parse(&url) {
-        Ok(parsed) => parsed,
-        Err(_) => return false,
-    };
-    let host_matches = parsed
-        .host_str()
-        .is_some_and(|host| host == state.config.domain)
-        || state.config.domain == "localhost" && parsed.host_str() == Some("127.0.0.1");
-    if !host_matches || parsed.path() != path || !tag_method.eq_ignore_ascii_case(method) {
+    if url::Url::parse(&url).is_err()
+        || url != expected_url
+        || !tag_method.eq_ignore_ascii_case(method)
+    {
+        return false;
+    }
+    if kind == 27235 && payload_hash.is_some_and(|hash| unique("payload").as_deref() != Some(hash))
+    {
         return false;
     }
     let valid = (kind == 27235
@@ -311,4 +335,72 @@ async fn add_admin(
         StatusCode::OK,
         Json(serde_json::json!({ "added": req.pubkey })),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nostr::prelude::*;
+
+    fn admin_event(keys: &Keys, url: &str, method: &str, payload: &str) -> Event {
+        EventBuilder::new(Kind::Custom(27235), "")
+            .tags([
+                Tag::custom(TagKind::custom("u"), [url]),
+                Tag::custom(TagKind::custom("method"), [method]),
+                Tag::custom(TagKind::custom("payload"), [payload]),
+                Tag::custom(TagKind::custom("nonce"), [uuid::Uuid::new_v4().to_string()]),
+            ])
+            .sign_with_keys(keys)
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn relay_admin_auth_binds_exact_url_and_json_body() {
+        let keys = Keys::generate();
+        let temp = tempfile::tempdir().unwrap();
+        let config = crate::Nip34Config {
+            server_url: "https://relay.example:8443".into(),
+            lmdb_path: temp.path().join("lmdb"),
+            repos_path: temp.path().join("repos"),
+            admin_pubkeys: vec![keys.public_key().to_hex()],
+            ..Default::default()
+        };
+        let state = Nip34State::new(config).await.unwrap();
+        let expected = "https://relay.example:8443/relay/admin/whitelist?tenant=a";
+        let body_a = hex::encode(Sha256::digest(br#"{"pubkey":"a"}"#));
+        let body_b = hex::encode(Sha256::digest(br#"{"pubkey":"b"}"#));
+
+        let valid = admin_event(&keys, expected, "PUT", &body_a);
+        assert!(verify_admin_event(
+            &valid,
+            &state,
+            expected,
+            "PUT",
+            Some(&body_a)
+        ));
+
+        for changed in [
+            expected.replacen("https://", "http://", 1),
+            expected.replace(":8443", ":9443"),
+            expected.replace("tenant=a", "tenant=b"),
+        ] {
+            let event = admin_event(&keys, &changed, "PUT", &body_a);
+            assert!(!verify_admin_event(
+                &event,
+                &state,
+                expected,
+                "PUT",
+                Some(&body_a)
+            ));
+        }
+
+        let swapped = admin_event(&keys, expected, "PUT", &body_a);
+        assert!(!verify_admin_event(
+            &swapped,
+            &state,
+            expected,
+            "PUT",
+            Some(&body_b)
+        ));
+    }
 }

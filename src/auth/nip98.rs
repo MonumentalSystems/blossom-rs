@@ -22,6 +22,17 @@ pub fn verify_nip98_auth(
     expected_url: Option<&str>,
     expected_method: Option<&str>,
 ) -> Result<(), AuthError> {
+    verify_nip98_auth_with_payload(event, expected_url, expected_method, None)
+}
+
+/// Verify a NIP-98 event, including the `payload` SHA-256 tag when a request
+/// body affects the authorized operation.
+pub fn verify_nip98_auth_with_payload(
+    event: &NostrEvent,
+    expected_url: Option<&str>,
+    expected_method: Option<&str>,
+    expected_payload: Option<&str>,
+) -> Result<(), AuthError> {
     if event.kind != 27235 {
         return Err(AuthError::WrongKind(event.kind));
     }
@@ -64,6 +75,17 @@ pub fn verify_nip98_auth(
         }
     }
 
+    if let Some(payload) = expected_payload {
+        let tags: Vec<_> = event
+            .tags
+            .iter()
+            .filter(|t| t.first().is_some_and(|v| v == "payload"))
+            .collect();
+        if tags.len() != 1 || tags[0].len() != 2 || tags[0][1] != payload {
+            return Err(AuthError::WrongAction);
+        }
+    }
+
     // Verify event ID.
     let computed_id = compute_event_id(
         &event.pubkey,
@@ -86,6 +108,16 @@ pub fn verify_nip98_auth(
 
 /// Build a NIP-98 auth event for an HTTP request.
 pub fn build_nip98_auth(signer: &dyn super::BlossomSigner, url: &str, method: &str) -> NostrEvent {
+    build_nip98_auth_with_payload(signer, url, method, None)
+}
+
+/// Build a NIP-98 event with an optional SHA-256 hash of the exact HTTP body.
+pub fn build_nip98_auth_with_payload(
+    signer: &dyn super::BlossomSigner,
+    url: &str,
+    method: &str,
+    payload_hash: Option<&str>,
+) -> NostrEvent {
     let pubkey = signer.public_key_hex();
     let created_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -93,11 +125,14 @@ pub fn build_nip98_auth(signer: &dyn super::BlossomSigner, url: &str, method: &s
         .as_secs();
     let kind = 27235;
 
-    let tags = vec![
+    let mut tags = vec![
         vec!["u".to_string(), url.to_string()],
         vec!["method".to_string(), method.to_string()],
         vec!["nonce".to_string(), uuid::Uuid::new_v4().to_string()],
     ];
+    if let Some(hash) = payload_hash {
+        tags.push(vec!["payload".to_string(), hash.to_string()]);
+    }
 
     let id_bytes = compute_event_id(&pubkey, created_at, kind, &tags, "");
     let id = hex::encode(id_bytes);
@@ -151,5 +186,35 @@ mod tests {
         let event = crate::auth::build_blossom_auth(&signer, "upload", None, None, "");
         let result = verify_nip98_auth(&event, None, None);
         assert!(matches!(result, Err(AuthError::WrongKind(24242))));
+    }
+
+    #[test]
+    fn payload_hash_prevents_body_swap() {
+        let signer = Signer::generate();
+        let first = crate::protocol::sha256_hex(br#"{"role":"admin"}"#);
+        let swapped = crate::protocol::sha256_hex(br#"{"role":"user"}"#);
+        let event = build_nip98_auth_with_payload(
+            &signer,
+            "https://example.com:8443/admin?tenant=a",
+            "PUT",
+            Some(&first),
+        );
+
+        verify_nip98_auth_with_payload(
+            &event,
+            Some("https://example.com:8443/admin?tenant=a"),
+            Some("PUT"),
+            Some(&first),
+        )
+        .unwrap();
+        assert!(matches!(
+            verify_nip98_auth_with_payload(
+                &event,
+                Some("https://example.com:8443/admin?tenant=a"),
+                Some("PUT"),
+                Some(&swapped),
+            ),
+            Err(AuthError::WrongAction)
+        ));
     }
 }

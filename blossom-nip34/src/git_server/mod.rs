@@ -9,7 +9,7 @@ pub mod validation;
 
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{OriginalUri, Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use nostr::nips::nip19::FromBech32;
@@ -56,9 +56,8 @@ fn verify_push_auth(
     headers: &HeaderMap,
     expected_npub: &str,
     repo_name: &str,
-    domain: &str,
+    expected_url: &str,
     method: &str,
-    path: &str,
     body_hash: Option<&str>,
 ) -> Result<String, &'static str> {
     let auth_value = headers
@@ -134,8 +133,8 @@ fn verify_push_auth(
         return Err("push authorization is not bound to this operation");
     }
     let url = unique("u").ok_or("push authorization missing URL")?;
-    let parsed = url::Url::parse(&url).map_err(|_| "push authorization URL is invalid")?;
-    if parsed.path() != path || parsed.host_str() != Some(domain) {
+    url::Url::parse(&url).map_err(|_| "push authorization URL is invalid")?;
+    if url != expected_url {
         return Err("push authorization is for a different repository or server");
     }
     let expiration = unique("expiration")
@@ -182,6 +181,7 @@ fn mark_auth_event_once(event_id: &str, now: u64) -> bool {
 async fn info_refs(
     State(state): State<Arc<Nip34State>>,
     Path((npub, repo)): Path<(String, String)>,
+    OriginalUri(original_uri): OriginalUri,
     headers: HeaderMap,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
@@ -203,9 +203,12 @@ async fn info_refs(
             &headers,
             &npub,
             repo_name,
-            &state.config.domain,
+            &format!(
+                "{}{}",
+                state.config.server_url.trim_end_matches('/'),
+                original_uri
+            ),
             "GET",
-            &format!("/{npub}/{repo}/info/refs"),
             None,
         )
         .is_err()
@@ -279,6 +282,7 @@ async fn upload_pack(
 async fn receive_pack(
     State(state): State<Arc<Nip34State>>,
     Path((npub, repo)): Path<(String, String)>,
+    OriginalUri(original_uri): OriginalUri,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
@@ -288,9 +292,12 @@ async fn receive_pack(
         &headers,
         &npub,
         repo_name,
-        &state.config.domain,
+        &format!(
+            "{}{}",
+            state.config.server_url.trim_end_matches('/'),
+            original_uri
+        ),
         "POST",
-        &format!("/{npub}/{repo}/git-receive-pack"),
         Some(&body_hash),
     ) {
         return (StatusCode::UNAUTHORIZED, error).into_response();
@@ -371,6 +378,32 @@ async fn receive_pack(
 mod tests {
     use super::*;
 
+    fn push_headers(keys: &nostr::Keys, url: &str, repo: &str, body_hash: &str) -> HeaderMap {
+        use nostr::prelude::*;
+        let expiration = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 60;
+        let event = EventBuilder::new(Kind::Custom(24242), "")
+            .tags([
+                Tag::custom(TagKind::custom("t"), ["git-push"]),
+                Tag::custom(TagKind::custom("repo"), [repo]),
+                Tag::custom(TagKind::custom("method"), ["POST"]),
+                Tag::custom(TagKind::custom("u"), [url]),
+                Tag::custom(TagKind::custom("x"), [body_hash]),
+                Tag::custom(TagKind::custom("nonce"), [uuid::Uuid::new_v4().to_string()]),
+                Tag::custom(TagKind::custom("expiration"), [expiration.to_string()]),
+            ])
+            .sign_with_keys(keys)
+            .unwrap();
+        let json = serde_json::to_vec(&event).unwrap();
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &json);
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", format!("Nostr {b64}").parse().unwrap());
+        headers
+    }
+
     #[test]
     fn test_verify_push_auth_missing_header() {
         let headers = HeaderMap::new();
@@ -378,9 +411,8 @@ mod tests {
             &headers,
             "npub1test",
             "repo",
-            "localhost",
+            "http://localhost/repo",
             "POST",
-            "/repo",
             None
         )
         .is_err());
@@ -394,9 +426,8 @@ mod tests {
             &headers,
             "npub1test",
             "repo",
-            "localhost",
+            "http://localhost/repo",
             "POST",
-            "/repo",
             None
         )
         .is_err());
@@ -423,9 +454,8 @@ mod tests {
             &headers,
             &npub,
             "repo",
-            "localhost",
+            &format!("http://localhost/{npub}/repo/git-receive-pack"),
             "POST",
-            &format!("/{npub}/repo/git-receive-pack"),
             None,
         )
         .is_err());
@@ -437,10 +467,47 @@ mod tests {
             &headers,
             &other_npub,
             "repo",
-            "localhost",
+            "http://localhost/repo",
             "POST",
-            "/repo",
             None,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn push_auth_requires_exact_canonical_url_and_body() {
+        use nostr::prelude::*;
+        let keys = Keys::generate();
+        let npub = keys.public_key().to_bech32().unwrap();
+        let expected = format!("https://git.example:8443/{npub}/repo/git-receive-pack?tenant=a");
+        let body_hash = hex::encode(Sha256::digest(b"pack-a"));
+
+        let headers = push_headers(&keys, &expected, "repo", &body_hash);
+        assert!(
+            verify_push_auth(&headers, &npub, "repo", &expected, "POST", Some(&body_hash),).is_ok()
+        );
+
+        for changed in [
+            expected.replacen("https://", "http://", 1),
+            expected.replace(":8443", ":9443"),
+            expected.replace("tenant=a", "tenant=b"),
+        ] {
+            let headers = push_headers(&keys, &changed, "repo", &body_hash);
+            assert!(
+                verify_push_auth(&headers, &npub, "repo", &expected, "POST", Some(&body_hash),)
+                    .is_err()
+            );
+        }
+
+        let headers = push_headers(&keys, &expected, "repo", &body_hash);
+        let swapped_hash = hex::encode(Sha256::digest(b"pack-b"));
+        assert!(verify_push_auth(
+            &headers,
+            &npub,
+            "repo",
+            &expected,
+            "POST",
+            Some(&swapped_hash),
         )
         .is_err());
     }
