@@ -84,10 +84,7 @@ impl Signer {
             Ok(bytes) => bytes,
             Err(_) => return false,
         };
-        let sig = match secp256k1::schnorr::Signature::from_byte_array(sig_bytes) {
-            Ok(s) => s,
-            Err(_) => return false,
-        };
+        let sig = secp256k1::schnorr::Signature::from_byte_array(sig_bytes);
 
         secp.verify_schnorr(&sig, message, &xonly).is_ok()
     }
