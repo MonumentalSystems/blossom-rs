@@ -11,6 +11,12 @@ the hardening work that was merged after the 0.5.8 repository tag.
   windows, unique request-binding tags, nonces, and replay protection.
 - HTTP authorization is bound to the server, URL, method, action, and blob hash
   where applicable.
+- NIP-98 JSON mutations bind the exact request bytes, Iroh mutations bind the
+  receiving node identity, and replay caches cannot be globally exhausted by
+  one signer.
+- Request bodies are authenticated and authorized before buffering, with hard
+  aggregate memory and processor concurrency budgets across HTTP, Git, media,
+  mirror, and Iroh upload paths.
 - Upload, deletion, ownership, multi-owner quota accounting, and database
   mutations were hardened to avoid unauthorized access and inconsistent state.
 - Mirror requests validate resolved addresses and redirects, reject credentials
@@ -18,6 +24,8 @@ the hardening work that was merged after the 0.5.8 repository tag.
 - Git repository creation and pushes now require owner authorization, and Git
   subprocesses have bounded execution, environment, and output.
 - Filesystem storage validates content-addressed paths and uses atomic writes.
+- S3 preserves caller-supplied content hashes for compressed and delta LFS
+  objects, and verifies remote deletion before removing its local index.
 - Server and CLI defaults now favor loopback listeners, authenticated uploads,
   and encrypted transport for signed credentials.
 
@@ -39,8 +47,10 @@ the hardening work that was merged after the 0.5.8 repository tag.
 ### Dependencies
 
 - Updated the direct Reqwest, SHA-2, secp256k1, Rand, Tower HTTP, Bech32,
-  Base64, EXIF, PKARR, OpenTelemetry, and bindgen requirements to their current
-  stable release lines.
+  Base64, EXIF, PKARR, and OpenTelemetry requirements to their current stable
+  release lines.
+- Removed consumer-time bindgen and libclang requirements by replacing the
+  generated xdelta3 surface with audited declarations for the two used C APIs.
 - Removed unused `axum-extra`, Candle, and direct NIP-34 Tower dependencies,
   reducing duplicate compatibility lines and optional supply-chain surface.
 - Replaced the PKARR release candidate dependency with the stable 8.x line.
