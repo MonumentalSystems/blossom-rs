@@ -33,7 +33,7 @@ use crate::stats::StatsAccumulator;
 use crate::storage::BlobBackend;
 use crate::webhooks::{self, EventType, NoopNotifier, WebhookNotifier};
 use axum::{
-    body::{to_bytes, Body, Bytes},
+    body::{to_bytes, Body, HttpBody},
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
@@ -629,6 +629,7 @@ impl BufferedBody {
 async fn read_body_limited(
     body: Body,
     limit: usize,
+    declared_len: Option<usize>,
 ) -> Result<BufferedBody, (StatusCode, Json<serde_json::Value>)> {
     if limit > MAX_BUFFERED_BODY_BYTES {
         return Err((
@@ -636,7 +637,21 @@ async fn read_body_limited(
             error_json("configured request body limit exceeds the safe buffered ceiling"),
         ));
     }
-    let permits = limit
+    if declared_len.is_some_and(|length| length > limit) {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            error_json("request body exceeds configured limit"),
+        ));
+    }
+    // Hyper enforces Content-Length framing. Reserve the declared size when
+    // present, or an exact in-memory body size when the transport exposes one;
+    // chunked/unknown-length requests conservatively reserve the full limit.
+    let hinted_len = body
+        .size_hint()
+        .exact()
+        .and_then(|length| usize::try_from(length).ok());
+    let reservation = declared_len.or(hinted_len).unwrap_or(limit);
+    let permits = reservation
         .max(1)
         .div_ceil(BODY_BUFFER_UNIT_BYTES)
         .try_into()
@@ -662,6 +677,13 @@ async fn read_body_limited(
         data: bytes.to_vec(),
         permit,
     })
+}
+
+pub(crate) fn declared_body_len(headers: &HeaderMap) -> Option<usize> {
+    headers
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
 }
 
 fn error_json(msg: &str) -> Json<serde_json::Value> {
@@ -899,7 +921,7 @@ async fn handle_upload(
         (pubkey, s.body_limit)
     };
 
-    let body = match read_body_limited(body, body_limit).await {
+    let body = match read_body_limited(body, body_limit, declared_body_len(&headers)).await {
         Ok(body) => body,
         Err(response) => return response,
     };
@@ -1449,7 +1471,7 @@ async fn handle_mirror(
         }
         s.body_limit.min(64 * 1024)
     };
-    let body = match read_body_limited(body, body_limit).await {
+    let body = match read_body_limited(body, body_limit, declared_body_len(&headers)).await {
         Ok(body) => body,
         Err(response) => return response,
     };
@@ -1730,7 +1752,7 @@ async fn handle_media_upload(
             );
         }
     };
-    let body = match read_body_limited(body, body_limit).await {
+    let body = match read_body_limited(body, body_limit, declared_body_len(&headers)).await {
         Ok(body) => body,
         Err(response) => return response,
     };
@@ -1947,7 +1969,7 @@ pub fn build_s3_compat_router(state: SharedState) -> Router {
 async fn s3_put(
     State(state): State<SharedState>,
     Path((_bucket, key)): Path<(String, String)>,
-    body: Bytes,
+    body: axum::body::Bytes,
 ) -> StatusCode {
     let data = body.to_vec();
     let hash_key = key.trim_end_matches(".blob").to_string();
@@ -2014,6 +2036,7 @@ mod tests {
     use super::*;
     use crate::protocol::BlobDescriptor;
     use crate::storage::MemoryBackend;
+    use axum::body::Bytes;
     use std::convert::Infallible;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -2208,7 +2231,7 @@ mod tests {
     #[tokio::test]
     async fn body_limits_above_buffer_budget_are_rejected_without_polling() {
         let (body, polled) = pending_body();
-        let response = match read_body_limited(body, MAX_BUFFERED_BODY_BYTES + 1).await {
+        let response = match read_body_limited(body, MAX_BUFFERED_BODY_BYTES + 1, None).await {
             Ok(_) => panic!("oversized buffer limit unexpectedly accepted"),
             Err(response) => response,
         };

@@ -140,7 +140,9 @@ async fn handle_nip96_upload(
         }
         s.body_limit
     };
-    let body = match super::read_body_limited(body, body_limit).await {
+    let body = match super::read_body_limited(body, body_limit, super::declared_body_len(&headers))
+        .await
+    {
         Ok(body) => body,
         Err(response) => return response,
     };
@@ -639,8 +641,7 @@ mod tests {
         let http = reqwest::Client::new();
         let signer = crate::auth::Signer::generate();
 
-        let auth_event = crate::auth::build_blossom_auth(&signer, "upload", None, None, "");
-        let auth_header = crate::auth::auth_header_value(&auth_event);
+        let auth_header = request_auth(&signer, &url, "/n96", "POST", "upload", None);
 
         let resp = http
             .post(format!("{}/n96", url))
