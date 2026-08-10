@@ -6,6 +6,7 @@
 
 use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler};
+use std::collections::{HashMap, VecDeque};
 use tracing::{info, instrument, warn};
 
 use super::wire::{self, Op, Request, Response, Status};
@@ -23,6 +24,9 @@ const MAX_WIRE_HEADER: usize = 16 * 1024;
 const DEFAULT_MAX_IROH_BODY: u64 = 256 * 1024 * 1024;
 const STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const MAX_CONCURRENT_STREAMS: usize = 64;
+const MAX_IN_FLIGHT_IROH_BODY_BYTES: u32 = 256 * 1024 * 1024;
+const MAX_REPLAY_ENTRIES: usize = 10_000;
+const MAX_REPLAY_ENTRIES_PER_PRINCIPAL: usize = 256;
 
 /// Blossom protocol handler for iroh connections.
 ///
@@ -36,6 +40,7 @@ pub struct BlossomProtocol {
     state: SharedState,
     receiver: String,
     streams: std::sync::Arc<tokio::sync::Semaphore>,
+    body_budget: InFlightBodyBudget,
 }
 
 impl BlossomProtocol {
@@ -45,6 +50,7 @@ impl BlossomProtocol {
             state,
             receiver: iroh_server_identity(&receiver_id),
             streams: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_STREAMS)),
+            body_budget: InFlightBodyBudget::new(MAX_IN_FLIGHT_IROH_BODY_BYTES),
         }
     }
 }
@@ -57,6 +63,7 @@ impl ProtocolHandler for BlossomProtocol {
         let state = self.state.clone();
         let receiver = self.receiver.clone();
         let streams = self.streams.clone();
+        let body_budget = self.body_budget.clone();
         async move {
             let remote = conn.remote_id();
             info!(peer.id = %remote, "iroh connection accepted");
@@ -68,6 +75,7 @@ impl ProtocolHandler for BlossomProtocol {
                 };
                 let state = state.clone();
                 let receiver = receiver.clone();
+                let body_budget = body_budget.clone();
                 let permit = match streams.clone().try_acquire_owned() {
                     Ok(permit) => permit,
                     Err(_) => {
@@ -79,7 +87,7 @@ impl ProtocolHandler for BlossomProtocol {
                     let _permit = permit;
                     let _ = tokio::time::timeout(
                         STREAM_TIMEOUT,
-                        handle_stream(send, recv, state, &receiver),
+                        handle_stream(send, recv, state, &receiver, body_budget),
                     )
                     .await;
                 });
@@ -90,6 +98,32 @@ impl ProtocolHandler for BlossomProtocol {
     }
 }
 
+#[derive(Debug, Clone)]
+struct InFlightBodyBudget {
+    permits: std::sync::Arc<tokio::sync::Semaphore>,
+    max_bytes: u32,
+}
+
+impl InFlightBodyBudget {
+    fn new(max_bytes: u32) -> Self {
+        Self {
+            permits: std::sync::Arc::new(tokio::sync::Semaphore::new(max_bytes as usize)),
+            max_bytes,
+        }
+    }
+
+    fn try_reserve(&self, bytes: u64) -> Result<tokio::sync::OwnedSemaphorePermit, &'static str> {
+        let bytes = u32::try_from(bytes).map_err(|_| "upload exceeds aggregate byte budget")?;
+        if bytes > self.max_bytes {
+            return Err("upload exceeds aggregate byte budget");
+        }
+        self.permits
+            .clone()
+            .try_acquire_many_owned(bytes)
+            .map_err(|_| "iroh upload byte budget is exhausted")
+    }
+}
+
 /// Handle a single bidi stream (one request + response).
 #[instrument(name = "blossom.iroh.stream", skip_all)]
 async fn handle_stream(
@@ -97,19 +131,21 @@ async fn handle_stream(
     mut recv: iroh::endpoint::RecvStream,
     state: SharedState,
     receiver: &str,
+    body_budget: InFlightBodyBudget,
 ) {
     // Read the request JSON line.
     let mut buf = Vec::with_capacity(4096);
-    let mut tmp = [0u8; 4096];
+    let mut byte = [0u8; 1];
     loop {
-        match recv.read(&mut tmp).await {
+        match recv.read(&mut byte).await {
             Ok(Some(n)) => {
-                buf.extend_from_slice(&tmp[..n]);
+                debug_assert_eq!(n, 1);
+                buf.push(byte[0]);
                 if buf.len() > MAX_WIRE_HEADER {
                     warn!("iroh request header exceeds limit");
                     return;
                 }
-                if buf.contains(&b'\n') {
+                if byte[0] == b'\n' {
                     break;
                 }
             }
@@ -121,7 +157,7 @@ async fn handle_stream(
         }
     }
 
-    let (req, header_len) = match wire::decode_line::<Request>(&buf) {
+    let (req, _) = match wire::decode_line::<Request>(&buf) {
         Ok(v) => v,
         Err(e) => {
             let resp = Response {
@@ -137,63 +173,18 @@ async fn handle_stream(
         }
     };
 
-    let max_body = state
-        .lock()
-        .await
-        .requirements
-        .max_size
-        .unwrap_or(DEFAULT_MAX_IROH_BODY);
-    if req.body_len > max_body {
-        let resp = Response {
-            status: Status::Error,
-            body_len: 0,
-            content_type: String::new(),
-            error: format!("body exceeds maximum of {max_body} bytes"),
-            descriptor: None,
-        };
-        let _ = send.write_all(&wire::encode_response(&resp)).await;
-        let _ = send.finish();
+    if matches!(req.op, Op::Get | Op::Head | Op::Delete | Op::Upload)
+        && !crate::server::is_valid_sha256(&req.sha256)
+    {
+        reject_stream(&mut send, Status::Error, "invalid SHA256 hash").await;
         return;
     }
 
-    // Read remaining body bytes for UPLOAD only after validating the length.
-    let body = if req.op == Op::Upload && req.body_len > 0 {
-        let mut already_read = buf[header_len..].to_vec();
-        let body_len = match usize::try_from(req.body_len) {
-            Ok(len) => len,
-            Err(_) => return,
-        };
-        if already_read.len() > body_len {
-            return;
-        }
-        let remaining = body_len - already_read.len();
-        if remaining > 0 {
-            let mut rest = vec![0u8; remaining];
-            if let Err(e) = recv.read_exact(&mut rest).await {
-                warn!(error.message = %e, "failed to read upload body");
-                return;
-            }
-            already_read.extend_from_slice(&rest);
-        }
-        already_read
-    } else {
-        vec![]
-    };
-
-    // Verify auth if provided.
-    let auth_pubkey = if !req.auth.is_empty() {
+    let verified_auth = if !req.auth.is_empty() {
         match verify_auth(&req.auth, &req, receiver) {
-            Ok(pk) => Some(pk),
+            Ok(auth) => Some(auth),
             Err(e) => {
-                let resp = Response {
-                    status: Status::Unauthorized,
-                    body_len: 0,
-                    content_type: String::new(),
-                    error: e,
-                    descriptor: None,
-                };
-                let _ = send.write_all(&wire::encode_response(&resp)).await;
-                let _ = send.finish();
+                reject_stream(&mut send, Status::Unauthorized, &e).await;
                 return;
             }
         }
@@ -201,20 +192,99 @@ async fn handle_stream(
         None
     };
 
-    if matches!(req.op, Op::Get | Op::Head | Op::Delete | Op::Upload)
-        && !crate::server::is_valid_sha256(&req.sha256)
-    {
-        let resp = Response {
-            status: Status::Error,
-            body_len: 0,
-            content_type: String::new(),
-            error: "invalid SHA256 hash".into(),
-            descriptor: None,
+    let auth_pubkey = verified_auth.as_ref().map(|auth| auth.pubkey.clone());
+
+    let (_body_permit, body) = if req.op == Op::Upload {
+        let max_body = state
+            .lock()
+            .await
+            .requirements
+            .max_size
+            .unwrap_or(DEFAULT_MAX_IROH_BODY);
+        if req.body_len == 0 {
+            reject_stream(&mut send, Status::Error, "empty body").await;
+            return;
+        }
+        if req.body_len > max_body {
+            reject_stream(
+                &mut send,
+                Status::Error,
+                &format!("body exceeds maximum of {max_body} bytes"),
+            )
+            .await;
+            return;
+        }
+
+        let preflight = {
+            let s = state.lock().await;
+            preflight_upload(&s, &req, verified_auth.as_ref())
         };
-        let _ = send.write_all(&wire::encode_response(&resp)).await;
-        let _ = send.finish();
-        return;
-    }
+        if let Err(error) = preflight {
+            reject_stream(&mut send, error.status, &error.message).await;
+            return;
+        }
+
+        let permit = match body_budget.try_reserve(req.body_len) {
+            Ok(permit) => permit,
+            Err(error) => {
+                reject_stream(&mut send, Status::Error, error).await;
+                return;
+            }
+        };
+        if let Some(auth) = verified_auth.as_ref() {
+            if !commit_auth_event(auth) {
+                reject_stream(
+                    &mut send,
+                    Status::Unauthorized,
+                    "authorization event has already been used",
+                )
+                .await;
+                return;
+            }
+        }
+
+        let body_len = match usize::try_from(req.body_len) {
+            Ok(len) => len,
+            Err(_) => {
+                reject_stream(&mut send, Status::Error, "upload body is too large").await;
+                return;
+            }
+        };
+        let mut body = vec![0u8; body_len];
+        if let Err(error) = recv.read_exact(&mut body).await {
+            warn!(error.message = %error, "failed to read upload body");
+            return;
+        }
+        (Some(permit), body)
+    } else {
+        if request_auth_binding(&req).is_some() {
+            let auth = match verified_auth.as_ref() {
+                Some(auth) => auth,
+                None => {
+                    reject_stream(&mut send, Status::Unauthorized, "auth required").await;
+                    return;
+                }
+            };
+            let preflight = {
+                let s = state.lock().await;
+                preflight_mutation(&s, &req, auth)
+            };
+            if let Err(error) = preflight {
+                reject_stream(&mut send, error.status, &error.message).await;
+                return;
+            }
+            if !commit_auth_event(auth) {
+                reject_stream(
+                    &mut send,
+                    Status::Unauthorized,
+                    "authorization event has already been used",
+                )
+                .await;
+                return;
+            }
+        }
+        (None, Vec::new())
+    };
 
     // Dispatch by operation.
     let mut s = state.lock().await;
@@ -233,6 +303,115 @@ async fn handle_stream(
     }
 
     let _ = send.finish();
+}
+
+async fn reject_stream(send: &mut iroh::endpoint::SendStream, status: Status, error: &str) {
+    let response = Response {
+        status,
+        body_len: 0,
+        content_type: String::new(),
+        error: error.to_string(),
+        descriptor: None,
+    };
+    let _ = send.write_all(&wire::encode_response(&response)).await;
+    let _ = send.finish();
+}
+
+#[derive(Debug)]
+struct GateError {
+    status: Status,
+    message: String,
+}
+
+fn gate_error(status: Status, message: impl Into<String>) -> GateError {
+    GateError {
+        status,
+        message: message.into(),
+    }
+}
+
+fn preflight_upload(
+    state: &ServerState,
+    req: &Request,
+    auth: Option<&VerifiedAuth>,
+) -> Result<(), GateError> {
+    if state.requirements.require_auth && auth.is_none() {
+        return Err(gate_error(Status::Unauthorized, "auth required for upload"));
+    }
+    let principal = auth.map_or("anonymous", |auth| auth.pubkey.as_str());
+    if !state.access.is_allowed(principal, Action::Upload) {
+        return Err(gate_error(
+            Status::Forbidden,
+            "upload not allowed for this pubkey",
+        ));
+    }
+    let additional_bytes = if state
+        .database
+        .is_upload_owner(&req.sha256, principal)
+        .unwrap_or(false)
+    {
+        0
+    } else {
+        req.body_len
+    };
+    state
+        .database
+        .check_quota(principal, additional_bytes)
+        .map_err(|error| gate_error(Status::Forbidden, error.to_string()))?;
+    check_rate_limit(state, principal)
+}
+
+fn preflight_mutation(
+    state: &ServerState,
+    req: &Request,
+    auth: &VerifiedAuth,
+) -> Result<(), GateError> {
+    let allowed = match &req.op {
+        Op::Delete => {
+            let role = state.access.role(&auth.pubkey);
+            role != Role::Denied
+                && (role == Role::Admin
+                    || state
+                        .database
+                        .is_upload_owner(&req.sha256, &auth.pubkey)
+                        .unwrap_or(false))
+        }
+        Op::LockCreate | Op::LockDelete | Op::LockVerify => {
+            state.access.is_allowed(&auth.pubkey, Action::Lock)
+        }
+        _ => true,
+    };
+    if !allowed {
+        return Err(gate_error(
+            Status::Forbidden,
+            "operation not allowed for this pubkey",
+        ));
+    }
+    if req.op == Op::LockDelete {
+        if let Some(lock_db) = state.lock_db.as_ref() {
+            if let Ok(record) = lock_db.get_lock(&req.repo_id, &req.lock_id) {
+                let is_admin = state.access.role(&auth.pubkey) == Role::Admin;
+                if record.pubkey != auth.pubkey && !is_admin {
+                    return Err(gate_error(
+                        Status::Forbidden,
+                        "only the lock owner or an admin can unlock",
+                    ));
+                }
+            }
+        }
+    }
+    check_rate_limit(state, &auth.pubkey)
+}
+
+fn check_rate_limit(state: &ServerState, principal: &str) -> Result<(), GateError> {
+    if state
+        .rate_limiter
+        .as_ref()
+        .is_some_and(|limiter| !limiter.check(principal))
+    {
+        return Err(gate_error(Status::Error, "rate limit exceeded"));
+    }
+    Ok(())
 }
 
 fn parse_lfs_from_request(req: &Request) -> LfsContext {
@@ -260,7 +439,13 @@ fn parse_lfs_from_request(req: &Request) -> LfsContext {
 
 /// Verify transport-specific Blossom auth. NIP-98 is HTTP-only and is not
 /// accepted on the iroh protocol.
-fn verify_auth(auth_header: &str, req: &Request, receiver: &str) -> Result<String, String> {
+#[derive(Debug)]
+struct VerifiedAuth {
+    pubkey: String,
+    event_id: String,
+}
+
+fn verify_auth(auth_header: &str, req: &Request, receiver: &str) -> Result<VerifiedAuth, String> {
     let b64 = auth_header.strip_prefix("Nostr ").unwrap_or(auth_header);
 
     let json_bytes = base64url_decode(b64).map_err(|e| format!("invalid auth encoding: {e}"))?;
@@ -303,15 +488,10 @@ fn verify_auth(auth_header: &str, req: &Request, receiver: &str) -> Result<Strin
     if req.op == Op::Upload {
         verify_lfs_auth_binding(&event, req)?;
     }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    if !mark_auth_event_once(&event.id, now) {
-        return Err("authorization event has already been used".into());
-    }
-
-    Ok(event.pubkey)
+    Ok(VerifiedAuth {
+        pubkey: event.pubkey,
+        event_id: event.id,
+    })
 }
 
 pub(super) fn iroh_server_identity(id: &iroh::EndpointId) -> String {
@@ -378,19 +558,123 @@ fn verify_lfs_auth_binding(event: &NostrEvent, req: &Request) -> Result<(), Stri
     }
 }
 
-fn mark_auth_event_once(event_id: &str, now: u64) -> bool {
-    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u64>>> =
-        std::sync::OnceLock::new();
-    let mut seen = SEEN
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    seen.retain(|_, expires_at| *expires_at > now);
-    if seen.contains_key(event_id) || seen.len() >= 10_000 {
-        return false;
+#[derive(Debug)]
+struct ReplayEntry {
+    principal: String,
+    expires_at: u64,
+}
+
+#[derive(Debug)]
+struct ReplayCache {
+    entries: HashMap<String, ReplayEntry>,
+    order: VecDeque<String>,
+    per_principal: HashMap<String, usize>,
+    max_entries: usize,
+    max_per_principal: usize,
+}
+
+impl ReplayCache {
+    fn new(max_entries: usize, max_per_principal: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            per_principal: HashMap::new(),
+            max_entries,
+            max_per_principal,
+        }
     }
-    seen.insert(event_id.to_string(), now.saturating_add(120));
-    true
+
+    fn commit(&mut self, event_id: &str, principal: &str, now: u64) -> bool {
+        self.prune_expired(now);
+        if self.entries.contains_key(event_id) {
+            return false;
+        }
+
+        while self.per_principal.get(principal).copied().unwrap_or(0) >= self.max_per_principal {
+            if !self.evict_oldest_for(principal) {
+                break;
+            }
+        }
+        while self.entries.len() >= self.max_entries {
+            if !self.evict_oldest() {
+                break;
+            }
+        }
+
+        self.entries.insert(
+            event_id.to_string(),
+            ReplayEntry {
+                principal: principal.to_string(),
+                expires_at: now.saturating_add(120),
+            },
+        );
+        self.order.push_back(event_id.to_string());
+        *self.per_principal.entry(principal.to_string()).or_default() += 1;
+        true
+    }
+
+    fn prune_expired(&mut self, now: u64) {
+        while let Some(event_id) = self.order.front() {
+            let expired = self
+                .entries
+                .get(event_id)
+                .is_none_or(|entry| entry.expires_at <= now);
+            if !expired {
+                break;
+            }
+            self.evict_oldest();
+        }
+    }
+
+    fn evict_oldest(&mut self) -> bool {
+        let Some(event_id) = self.order.pop_front() else {
+            return false;
+        };
+        self.remove_entry(&event_id);
+        true
+    }
+
+    fn evict_oldest_for(&mut self, principal: &str) -> bool {
+        let Some(position) = self.order.iter().position(|event_id| {
+            self.entries
+                .get(event_id)
+                .is_some_and(|entry| entry.principal == principal)
+        }) else {
+            return false;
+        };
+        let event_id = self.order.remove(position).expect("position was found");
+        self.remove_entry(&event_id);
+        true
+    }
+
+    fn remove_entry(&mut self, event_id: &str) {
+        let Some(entry) = self.entries.remove(event_id) else {
+            return;
+        };
+        if let Some(count) = self.per_principal.get_mut(&entry.principal) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.per_principal.remove(&entry.principal);
+            }
+        }
+    }
+}
+
+fn commit_auth_event(auth: &VerifiedAuth) -> bool {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<ReplayCache>> = std::sync::OnceLock::new();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    SEEN.get_or_init(|| {
+        std::sync::Mutex::new(ReplayCache::new(
+            MAX_REPLAY_ENTRIES,
+            MAX_REPLAY_ENTRIES_PER_PRINCIPAL,
+        ))
+    })
+    .lock()
+    .unwrap_or_else(|poisoned| poisoned.into_inner())
+    .commit(&auth.event_id, &auth.pubkey, now)
 }
 
 async fn handle_get(send: &mut iroh::endpoint::SendStream, sha256: &str, state: &ServerState) {
@@ -1341,9 +1625,94 @@ mod auth_tests {
 
             assert!(verify_auth(&request.auth, &request, "iroh://server-b").is_err());
             assert_eq!(
-                verify_auth(&request.auth, &request, receiver_a).unwrap(),
+                verify_auth(&request.auth, &request, receiver_a)
+                    .unwrap()
+                    .pubkey,
                 signer.public_key_hex()
             );
         }
+    }
+
+    #[test]
+    fn replay_validation_and_commit_are_separate() {
+        let signer = Signer::generate();
+        let hash = crate::protocol::sha256_hex(b"deferred replay commitment");
+        let receiver = "iroh://server-replay";
+        let event = build_blossom_auth(&signer, "upload", Some(&hash), Some(receiver), "");
+        let request = Request {
+            op: Op::Upload,
+            sha256: hash,
+            auth: auth_header_value(&event),
+            ..Default::default()
+        };
+
+        let first = verify_auth(&request.auth, &request, receiver).unwrap();
+        let second = verify_auth(&request.auth, &request, receiver).unwrap();
+        assert_eq!(first.event_id, second.event_id);
+        assert!(commit_auth_event(&first));
+        assert!(!commit_auth_event(&second));
+    }
+
+    #[test]
+    fn replay_cache_evicts_without_global_fail_closed_dos() {
+        let mut cache = ReplayCache::new(3, 2);
+        assert!(cache.commit("alice-1", "alice", 1));
+        assert!(cache.commit("alice-2", "alice", 1));
+        assert!(cache.commit("alice-3", "alice", 1));
+        assert!(!cache.entries.contains_key("alice-1"));
+        assert!(cache.entries.contains_key("alice-3"));
+
+        assert!(cache.commit("bob-1", "bob", 1));
+        assert!(cache.commit("bob-2", "bob", 1));
+        assert!(cache.entries.len() <= 3);
+        assert!(cache.entries.contains_key("bob-2"));
+        assert!(!cache.commit("bob-2", "bob", 1));
+
+        assert!(cache.commit("bob-2", "bob", 122));
+    }
+
+    #[test]
+    fn aggregate_body_budget_is_hard_and_released_with_permit() {
+        let budget = InFlightBodyBudget::new(10);
+        let first = budget.try_reserve(7).unwrap();
+        assert!(budget.try_reserve(4).is_err());
+        assert!(budget.try_reserve(11).is_err());
+        drop(first);
+        assert!(budget.try_reserve(10).is_ok());
+    }
+
+    #[tokio::test]
+    async fn rate_rejection_happens_before_replay_commitment() {
+        let signer = Signer::generate();
+        let hash = crate::protocol::sha256_hex(b"rate limited body");
+        let receiver = "iroh://rate-limited-server";
+        let event = build_blossom_auth(&signer, "upload", Some(&hash), Some(receiver), "");
+        let request = Request {
+            op: Op::Upload,
+            sha256: hash,
+            auth: auth_header_value(&event),
+            body_len: 17,
+            ..Default::default()
+        };
+        let auth = verify_auth(&request.auth, &request, receiver).unwrap();
+        let server = crate::BlobServer::builder(
+            crate::storage::MemoryBackend::new(),
+            "iroh://rate-limited-server",
+        )
+        .require_auth()
+        .rate_limiter(crate::ratelimit::RateLimiter::new(
+            crate::ratelimit::RateLimitConfig {
+                max_tokens: 0,
+                refill_rate: 0.0,
+            },
+        ))
+        .build();
+        let state = server.shared_state();
+        let guard = state.lock().await;
+
+        let error = preflight_upload(&guard, &request, Some(&auth)).unwrap_err();
+        assert_eq!(error.message, "rate limit exceeded");
+        drop(guard);
+        assert!(commit_auth_event(&auth));
     }
 }
