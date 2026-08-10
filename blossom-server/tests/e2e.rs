@@ -6,7 +6,9 @@
 use std::collections::HashSet;
 
 use blossom_rs::access::Whitelist;
-use blossom_rs::auth::{auth_header_value, build_blossom_auth_for_request};
+use blossom_rs::auth::{
+    auth_header_value, build_blossom_auth_for_request, build_nip98_auth_with_payload,
+};
 use blossom_rs::db::{MemoryDatabase, SqliteDatabase};
 use blossom_rs::media::PassthroughProcessor;
 use blossom_rs::protocol::BlobDescriptor;
@@ -677,15 +679,21 @@ async fn test_nip98_auth_accepted() {
     let http = reqwest::Client::new();
     let signer = Signer::generate();
 
-    // Use NIP-98 auth (kind:27235) instead of Blossom auth.
-    let nip98_event =
-        blossom_rs::auth::build_nip98_auth(&signer, &format!("{}/upload", url), "PUT");
+    // Use body-bound NIP-98 auth (kind:27235) instead of Blossom auth.
+    let data = b"nip98 upload".to_vec();
+    let payload_hash = blossom_rs::protocol::sha256_hex(&data);
+    let nip98_event = build_nip98_auth_with_payload(
+        &signer,
+        &format!("{}/upload", url),
+        "PUT",
+        Some(&payload_hash),
+    );
     let auth_header = auth_header_value(&nip98_event);
 
     let resp = http
         .put(format!("{}/upload", url))
         .header("Authorization", &auth_header)
-        .body(b"nip98 upload".to_vec())
+        .body(data)
         .send()
         .await
         .unwrap();
