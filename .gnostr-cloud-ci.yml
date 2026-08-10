@@ -15,14 +15,6 @@
 # exports HOME=/tmp + CARGO_HOME=/tmp/cargo and prepends the cargo/tool
 # bin dirs to PATH. cargo, cargo-llvm-cov and gnostr-cloud-cli are all on
 # the image's default PATH; the repo is materialized at cwd = repo root.
-#
-# build.rs note: blossom-rs compiles a vendored xdelta3 C lib and runs
-# bindgen over it. bindgen drives libclang, which needs a `stdarg.h` from
-# the clang resource dir. If the image's clang lacks those builtin headers
-# (libclang present but the `clang` driver / resource headers absent), the
-# bindgen step fails with "fatal error: 'stdarg.h' file not found". The
-# `_prep_bindgen` snippet below makes the build robust by pointing
-# BINDGEN_EXTRA_CLANG_ARGS at gcc's stdarg.h when clang's own is missing.
 
 stages:
   - validate
@@ -86,24 +78,6 @@ jobs:
         set -euo pipefail
         export HOME=/tmp CARGO_HOME=/tmp/cargo
         export PATH="/tmp/cargo/bin:/usr/local/bin:$PATH"
-        # bindgen/libclang stdarg.h fallback (see header note).
-        # bindgen needs libclang.so at RUNTIME — ariel ships libclang-14.so under
-        # /usr/lib/<triple>, which clang-sys does NOT search by default, so point
-        # LIBCLANG_PATH at whatever dir actually holds it ("Unable to find libclang"
-        # otherwise, even with libclang-dev installed).
-        LIBCLANG_DIR="$(dirname "$(find /usr/lib /usr/lib64 -name 'libclang*.so*' 2>/dev/null | head -1)")"
-        if [ -n "$LIBCLANG_DIR" ] && [ "$LIBCLANG_DIR" != "." ]; then
-          export LIBCLANG_PATH="$LIBCLANG_DIR"
-          echo "bindgen: LIBCLANG_PATH=$LIBCLANG_DIR"
-        fi
-        if ! clang -print-resource-dir >/dev/null 2>&1 \
-           || [ ! -f "$(clang -print-resource-dir 2>/dev/null)/include/stdarg.h" ]; then
-          GCC_INC="$(dirname "$(find /usr/lib/gcc -name stdarg.h 2>/dev/null | head -1)")"
-          if [ -n "$GCC_INC" ]; then
-            export BINDGEN_EXTRA_CLANG_ARGS="-I${GCC_INC} ${BINDGEN_EXTRA_CLANG_ARGS:-}"
-            echo "bindgen: using gcc builtin headers at $GCC_INC"
-          fi
-        fi
         # --all-targets gives one full rustc pass over lib+bins+tests, so
         # it also catches test-construction breakage before it ships.
         cargo clippy --workspace --all-targets -- -D warnings
@@ -122,13 +96,6 @@ jobs:
         set -euo pipefail
         export HOME=/tmp CARGO_HOME=/tmp/cargo
         export PATH="/tmp/cargo/bin:/usr/local/bin:$PATH"
-        if ! clang -print-resource-dir >/dev/null 2>&1 \
-           || [ ! -f "$(clang -print-resource-dir 2>/dev/null)/include/stdarg.h" ]; then
-          GCC_INC="$(dirname "$(find /usr/lib/gcc -name stdarg.h 2>/dev/null | head -1)")"
-          if [ -n "$GCC_INC" ]; then
-            export BINDGEN_EXTRA_CLANG_ARGS="-I${GCC_INC} ${BINDGEN_EXTRA_CLANG_ARGS:-}"
-          fi
-        fi
         # blossom-rs is sqlite-backed; the lib + e2e + nip34 + lock/storage
         # suites run hermetically (255 tests, 0 failures on ariel). The
         # tests/iroh_integration.rs cases (test_iroh_*) need two iroh endpoints
@@ -197,8 +164,7 @@ jobs:
     #
     # The ariel runner is aarch64 (gVisor, no docker), so x86_64 is produced by
     # a NATIVE gcc cross-compile (cc crate picks $CC_x86_64_unknown_linux_gnu
-    # for the vendored xdelta3; bindgen retargets via --target + the x86_64
-    # libc headers). This needs the cross toolchain in the runner image:
+    # for the vendored xdelta3). This needs the cross toolchain in the runner image:
     #   x86_64-linux-gnu-gcc (gcc-x86-64-linux-gnu) + /usr/x86_64-linux-gnu
     #   headers (libc6-dev-amd64-cross) + the x86_64 rust target.
     # The x86_64 leg is best-effort: if the toolchain/target is absent it logs
@@ -218,30 +184,23 @@ jobs:
 
         REGISTRY="https://uranus.gnostr.cloud"
 
-        # bindgen/libclang stdarg.h fallback — blossom-rs (a build dep of both
-        # apps) compiles vendored xdelta3 via bindgen (see header note).
-        LIBCLANG_DIR="$(dirname "$(find /usr/lib /usr/lib64 -name 'libclang*.so*' 2>/dev/null | head -1)")"
-        if [ -n "$LIBCLANG_DIR" ] && [ "$LIBCLANG_DIR" != "." ]; then
-          export LIBCLANG_PATH="$LIBCLANG_DIR"
-        fi
-        GCC_INC="$(dirname "$(find /usr/lib/gcc -name stdarg.h 2>/dev/null | head -1)")"
-        NATIVE_BG=""
-        if ! clang -print-resource-dir >/dev/null 2>&1 \
-           || [ ! -f "$(clang -print-resource-dir 2>/dev/null)/include/stdarg.h" ]; then
-          [ -n "$GCC_INC" ] && NATIVE_BG="-I${GCC_INC}"
-        fi
-
         VERSION="$(cargo metadata --no-deps --format-version 1 \
           | python3 -c 'import json,sys; m=json.load(sys.stdin); print(next(p["version"] for p in m["packages"] if p["name"]=="blossom-rs"))')"
         HOST_TRIPLE="$(rustc -vV | awk '/^host:/ {print $2}')"
         STAGE="$(mktemp -d)"
+        export BLOSSOM_RELEASE_NSEC="$(openssl rand -hex 32)"
+        export BLOSSOM_TRUSTED_RELEASE_SIGNERS="$(cargo xtask release-signer-pubkey)"
+        cargo xtask source-merkle-tree --output "$STAGE/source-merkle-tree.json"
 
         publish_target() {
           # $1 = target triple, $2 = path to the release dir holding the bins
           local triple="$1" outdir="$2"
           for BIN in blossom-server blossom-cli; do
             test -x "$outdir/$BIN"
-            tar czf "$STAGE/$BIN-$triple.tar.gz" -C "$outdir" "$BIN"
+            cargo xtask sign-release-manifest --bin "$outdir/$BIN"
+            tar czf "$STAGE/$BIN-$triple.tar.gz" \
+              -C "$outdir" "$BIN" "$BIN.manifest.json" \
+              -C "$STAGE" source-merkle-tree.json
             env NOSTR_PRIVATE_KEY="$GNOSTR_CLOUD_RELEASE_NSEC" \
               gnostr-cloud-cli registry upload-binary \
                 blossom-rs "$VERSION" "$BIN-$triple" \
@@ -253,8 +212,7 @@ jobs:
 
         # ── Native target (aarch64 on ariel) ──────────────────────────────
         echo "release: blossom-rs@$VERSION native target=$HOST_TRIPLE"
-        BINDGEN_EXTRA_CLANG_ARGS="${NATIVE_BG} ${BINDGEN_EXTRA_CLANG_ARGS:-}" \
-          cargo build --release -p blossom-server -p blossom-cli
+        cargo build --release -p blossom-server -p blossom-cli
         publish_target "$HOST_TRIPLE" "target/release"
 
         # ── x86_64 cross target (best-effort) ─────────────────────────────
@@ -267,7 +225,6 @@ jobs:
               CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=x86_64-linux-gnu-gcc \
               CC_x86_64_unknown_linux_gnu=x86_64-linux-gnu-gcc \
               AR_x86_64_unknown_linux_gnu=x86_64-linux-gnu-ar \
-              BINDGEN_EXTRA_CLANG_ARGS="--target=${XT} -I/usr/x86_64-linux-gnu/include${GCC_INC:+ -I$GCC_INC} ${BINDGEN_EXTRA_CLANG_ARGS:-}" \
               cargo build --release --target "$XT" -p blossom-server -p blossom-cli; then
             publish_target "$XT" "target/$XT/release"
           else

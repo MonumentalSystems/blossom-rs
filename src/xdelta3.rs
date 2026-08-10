@@ -1,12 +1,31 @@
 //! Internal xdelta3 FFI bindings (VCDIFF binary delta encoding).
 
 mod binding {
-    #![allow(dead_code)]
-    #![allow(non_upper_case_globals)]
-    #![allow(non_camel_case_types)]
-    #![allow(non_snake_case)]
+    use std::ffi::{c_int, c_uint};
 
-    include!(concat!(env!("OUT_DIR"), "/xdelta3_bindings.rs"));
+    unsafe extern "C" {
+        pub fn xd3_encode_memory(
+            input: *const u8,
+            input_size: c_uint,
+            source: *const u8,
+            source_size: c_uint,
+            output_buffer: *mut u8,
+            output_size: *mut c_uint,
+            avail_output: c_uint,
+            flags: c_int,
+        ) -> c_int;
+
+        pub fn xd3_decode_memory(
+            input: *const u8,
+            input_size: c_uint,
+            source: *const u8,
+            source_size: c_uint,
+            output_buffer: *mut u8,
+            output_size: *mut c_uint,
+            avail_output: c_uint,
+            flags: c_int,
+        ) -> c_int;
+    }
 }
 
 /// Encode a binary delta from `src` (original) to `input` (new).
