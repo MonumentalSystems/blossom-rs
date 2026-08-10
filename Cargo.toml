@@ -12,6 +12,17 @@ readme = "README.md"
 repository = "https://github.com/MonumentalSystems/blossom-rs"
 keywords = ["blossom", "nostr", "blob", "storage", "bip340"]
 categories = ["web-programming", "cryptography"]
+include = [
+    "/Cargo.toml",
+    "/LICENSE",
+    "/README.md",
+    "/RELEASE_NOTES.md",
+    "/build.rs",
+    "/docs/**",
+    "/src/**",
+    "/tests/**",
+    "/vendor/xdelta3/**",
+]
 
 [features]
 default = ["server", "client", "filesystem", "iroh-transport", "pkarr-discovery", "otel", "db-sqlite"]

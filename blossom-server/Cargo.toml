@@ -9,6 +9,7 @@ readme = "README.md"
 repository = "https://github.com/MonumentalSystems/blossom-rs"
 keywords = ["blossom", "nostr", "server", "blob", "storage"]
 categories = ["command-line-utilities", "web-programming"]
+include = ["/Cargo.toml", "/LICENSE", "/README.md", "/build.rs", "/src/**", "/tests/**"]
 
 [dependencies]
 blossom-rs = { path = "..", version = "0.6.0", features = ["server", "filesystem", "s3", "db-sqlite", "db-postgres", "media", "iroh-transport", "pkarr-discovery"] }

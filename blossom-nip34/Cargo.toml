@@ -8,6 +8,7 @@ license = "MIT"
 repository = "https://github.com/MonumentalSystems/blossom-rs"
 keywords = ["nostr", "nip34", "git", "relay", "grasp"]
 categories = ["web-programming", "development-tools"]
+include = ["/Cargo.toml", "/LICENSE", "/README.md", "/src/**", "/tests/**"]
 
 [dependencies]
 # Nostr relay infrastructure (MIT)
