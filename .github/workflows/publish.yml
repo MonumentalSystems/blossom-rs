@@ -51,8 +51,11 @@ jobs:
           set -euo pipefail
           cargo package -p blossom-rs --locked
           cargo package -p blossom-nip34 --locked --no-verify
-          cargo package -p blossom-server --locked --no-verify
-          cargo package -p blossom-cli --locked --no-verify
+          # Cargo cannot fully package the binaries until their 0.6.0 library
+          # dependencies have reached the registry. Inspect their allowlisted
+          # payloads now; the publish jobs package them after index propagation.
+          cargo package -p blossom-server --list --locked
+          cargo package -p blossom-cli --list --locked
 
   publish-lib:
     needs: validate
@@ -126,6 +129,7 @@ jobs:
             done
             test "$found" = true || { echo "$crate $version did not reach crates.io" >&2; exit 1; }
           done
+      - run: cargo package -p blossom-server --locked --no-verify
       - name: Authenticate to crates.io
         id: auth
         uses: rust-lang/crates-io-auth-action@275b31c2bd0ae2dc5fc5b03747ab8c88d6e3b1c6 # v1
@@ -156,6 +160,7 @@ jobs:
             sleep 10
           done
           test "$found" = true || { echo "blossom-rs $version did not reach crates.io" >&2; exit 1; }
+      - run: cargo package -p blossom-cli --locked --no-verify
       - name: Authenticate to crates.io
         id: auth
         uses: rust-lang/crates-io-auth-action@275b31c2bd0ae2dc5fc5b03747ab8c88d6e3b1c6 # v1
