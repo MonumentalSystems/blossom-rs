@@ -188,8 +188,8 @@ impl LockDatabase for MemoryLockDatabase {
             .locks
             .values()
             .filter(|l| l.repo_id == repo)
-            .filter(|l| filters.path.as_ref().map_or(true, |p| l.path == *p))
-            .filter(|l| filters.id.as_ref().map_or(true, |id| l.id == *id))
+            .filter(|l| filters.path.as_ref().is_none_or(|p| l.path == *p))
+            .filter(|l| filters.id.as_ref().is_none_or(|id| l.id == *id))
             .cloned()
             .collect();
 

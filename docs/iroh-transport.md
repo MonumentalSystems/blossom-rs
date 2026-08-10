@@ -247,7 +247,6 @@ let (http_url, iroh_id) = resolve_blossom_endpoints(&pk).await?;
 
 Currently uses **pkarr relays** (HTTP-based) rather than direct Mainline DHT.
 The relays forward records to DHT peers, so records are still globally
-discoverable. Direct DHT support (`pkarr` `dht` feature) is blocked by a
-transitive `digest` crate version conflict between pkarr's `mainline` dep
-and iroh 0.97. This is a one-line fix once both crates align on the same
-`digest` pre-release version.
+discoverable. PKARR 8 supports direct DHT operation, but this library enables
+only the relay features used by its publisher and resolver to keep the optional
+dependency surface smaller.

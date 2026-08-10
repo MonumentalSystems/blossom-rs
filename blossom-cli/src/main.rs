@@ -7,7 +7,10 @@ use std::path::PathBuf;
 
 use std::sync::Arc;
 
-use blossom_rs::auth::{auth_header_value, build_blossom_auth_for_request, build_nip98_auth};
+use blossom_rs::auth::{
+    auth_header_value, build_blossom_auth_for_request, build_nip98_auth,
+    build_nip98_auth_with_payload,
+};
 use blossom_rs::client::multi::MultiTransportClient;
 use blossom_rs::traits::BlobClient;
 use blossom_rs::transport::IrohBlossomClient;
@@ -16,6 +19,21 @@ use clap::{Parser, Subcommand};
 
 fn nip98_header(signer: &dyn BlossomSigner, url: &str, method: &str) -> String {
     auth_header_value(&build_nip98_auth(signer, url, method))
+}
+
+fn nip98_payload_header(
+    signer: &dyn BlossomSigner,
+    url: &str,
+    method: &str,
+    body: &[u8],
+) -> String {
+    let hash = blossom_rs::protocol::sha256_hex(body);
+    auth_header_value(&build_nip98_auth_with_payload(
+        signer,
+        url,
+        method,
+        Some(&hash),
+    ))
 }
 
 #[derive(Parser)]
@@ -828,13 +846,17 @@ async fn run(args: Args) -> Result<(), String> {
                     }
                 }
                 RelayCommand::WhitelistAdd { pubkey } => {
+                    let url = format!("{}/relay/admin/whitelist", base);
+                    let body = serde_json::to_vec(&serde_json::json!({"pubkey": pubkey}))
+                        .map_err(|e| format!("serialize relay request: {e}"))?;
                     let resp = http
-                        .put(format!("{}/relay/admin/whitelist", base))
+                        .put(&url)
                         .header(
                             "Authorization",
-                            relay_header("/relay/admin/whitelist", "PUT"),
+                            nip98_payload_header(&signer, &url, "PUT", &body),
                         )
-                        .json(&serde_json::json!({"pubkey": pubkey}))
+                        .header("Content-Type", "application/json")
+                        .body(body)
                         .send()
                         .await
                         .map_err(|e| format!("request: {e}"))?;
@@ -848,13 +870,17 @@ async fn run(args: Args) -> Result<(), String> {
                     }
                 }
                 RelayCommand::WhitelistRemove { pubkey } => {
+                    let url = format!("{}/relay/admin/whitelist", base);
+                    let body = serde_json::to_vec(&serde_json::json!({"pubkey": pubkey}))
+                        .map_err(|e| format!("serialize relay request: {e}"))?;
                     let resp = http
-                        .delete(format!("{}/relay/admin/whitelist", base))
+                        .delete(&url)
                         .header(
                             "Authorization",
-                            relay_header("/relay/admin/whitelist", "DELETE"),
+                            nip98_payload_header(&signer, &url, "DELETE", &body),
                         )
-                        .json(&serde_json::json!({"pubkey": pubkey}))
+                        .header("Content-Type", "application/json")
+                        .body(body)
                         .send()
                         .await
                         .map_err(|e| format!("request: {e}"))?;
@@ -887,13 +913,17 @@ async fn run(args: Args) -> Result<(), String> {
                     }
                 }
                 RelayCommand::BlacklistAdd { pubkey } => {
+                    let url = format!("{}/relay/admin/blacklist", base);
+                    let body = serde_json::to_vec(&serde_json::json!({"pubkey": pubkey}))
+                        .map_err(|e| format!("serialize relay request: {e}"))?;
                     let resp = http
-                        .put(format!("{}/relay/admin/blacklist", base))
+                        .put(&url)
                         .header(
                             "Authorization",
-                            relay_header("/relay/admin/blacklist", "PUT"),
+                            nip98_payload_header(&signer, &url, "PUT", &body),
                         )
-                        .json(&serde_json::json!({"pubkey": pubkey}))
+                        .header("Content-Type", "application/json")
+                        .body(body)
                         .send()
                         .await
                         .map_err(|e| format!("request: {e}"))?;
@@ -907,13 +937,17 @@ async fn run(args: Args) -> Result<(), String> {
                     }
                 }
                 RelayCommand::BlacklistRemove { pubkey } => {
+                    let url = format!("{}/relay/admin/blacklist", base);
+                    let body = serde_json::to_vec(&serde_json::json!({"pubkey": pubkey}))
+                        .map_err(|e| format!("serialize relay request: {e}"))?;
                     let resp = http
-                        .delete(format!("{}/relay/admin/blacklist", base))
+                        .delete(&url)
                         .header(
                             "Authorization",
-                            relay_header("/relay/admin/blacklist", "DELETE"),
+                            nip98_payload_header(&signer, &url, "DELETE", &body),
                         )
-                        .json(&serde_json::json!({"pubkey": pubkey}))
+                        .header("Content-Type", "application/json")
+                        .body(body)
                         .send()
                         .await
                         .map_err(|e| format!("request: {e}"))?;
@@ -943,10 +977,17 @@ async fn run(args: Args) -> Result<(), String> {
                     }
                 }
                 RelayCommand::AdminAdd { pubkey } => {
+                    let url = format!("{}/relay/admin/admins", base);
+                    let body = serde_json::to_vec(&serde_json::json!({"pubkey": pubkey}))
+                        .map_err(|e| format!("serialize relay request: {e}"))?;
                     let resp = http
-                        .put(format!("{}/relay/admin/admins", base))
-                        .header("Authorization", relay_header("/relay/admin/admins", "PUT"))
-                        .json(&serde_json::json!({"pubkey": pubkey}))
+                        .put(&url)
+                        .header(
+                            "Authorization",
+                            nip98_payload_header(&signer, &url, "PUT", &body),
+                        )
+                        .header("Content-Type", "application/json")
+                        .body(body)
                         .send()
                         .await
                         .map_err(|e| format!("request: {e}"))?;

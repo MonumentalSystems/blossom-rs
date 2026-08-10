@@ -1,16 +1,18 @@
 [package]
 name = "blossom-nip34"
-version = "0.5.8"
+version = "0.6.0"
 edition = "2021"
+rust-version = "1.94.1"
 description = "NIP-34 Nostr relay + GRASP git server library for Blossom"
 license = "MIT"
 repository = "https://github.com/MonumentalSystems/blossom-rs"
 keywords = ["nostr", "nip34", "git", "relay", "grasp"]
 categories = ["web-programming", "development-tools"]
+include = ["/Cargo.toml", "/LICENSE", "/README.md", "/src/**", "/tests/**"]
 
 [dependencies]
 # Nostr relay infrastructure (MIT)
-nostr = { version = "0.44.7", default-features = false, features = ["std"] }
+nostr = { version = "0.44.8", default-features = false, features = ["std"] }
 nostr-database = "0.44"
 nostr-lmdb = "0.44"
 nostr-relay-builder = "0.44"
@@ -19,9 +21,8 @@ nostr-relay-builder = "0.44"
 axum = { version = "0.8", features = ["ws"] }
 hyper = { version = "1", features = ["http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
-tower-http = { version = "0.5", features = ["cors", "timeout", "trace"] }
-tower = { version = "0.5", features = ["limit"] }
-base64 = "0.22"
+tower-http = { version = "0.7", features = ["cors", "timeout", "trace"] }
+base64 = { version = "0.23.1", default-features = false, features = ["std"] }
 
 # Async
 tokio = { version = "1", features = ["process", "fs", "io-util", "macros"] }
@@ -39,9 +40,11 @@ sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio",
 # Utilities
 hex = "0.4"
 url = "2"
-sha2 = "0.10"
+sha2 = "0.11"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.13", features = ["json"] }
 tempfile = "3"
+uuid = { version = "1", features = ["v4"] }
+futures-core = "0.3"

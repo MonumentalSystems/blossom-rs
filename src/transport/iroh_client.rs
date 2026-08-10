@@ -10,7 +10,7 @@ use iroh::endpoint::{Connection, Endpoint};
 use iroh::{EndpointAddr, EndpointId};
 use tracing::{info, instrument};
 
-use super::iroh_transport::BLOSSOM_ALPN;
+use super::iroh_transport::{iroh_server_identity, BLOSSOM_ALPN};
 use super::wire::{self, Op, Request, Response, Status};
 use crate::auth::{
     auth_header_value, build_blossom_auth, build_blossom_auth_with_extra_tags, BlossomSigner,
@@ -82,8 +82,14 @@ impl IrohBlossomClient {
         content_type: &str,
     ) -> Result<BlobDescriptor, String> {
         let our_sha256 = sha256_hex(data);
-        let auth_event =
-            build_blossom_auth(self.signer.as_ref(), "upload", Some(&our_sha256), None, "");
+        let receiver = iroh_server_identity(&addr.id);
+        let auth_event = build_blossom_auth(
+            self.signer.as_ref(),
+            "upload",
+            Some(&our_sha256),
+            Some(&receiver),
+            "",
+        );
         let auth_header = auth_header_value(&auth_event);
 
         let conn = self.connect(addr).await?;
@@ -149,6 +155,7 @@ impl IrohBlossomClient {
         is_manifest: bool,
     ) -> Result<BlobDescriptor, String> {
         let our_sha256 = sha256_hex(data);
+        let receiver = iroh_server_identity(&addr.id);
         tracing::Span::current().record("blob.sha256", our_sha256.as_str());
 
         let mut extra_tags = vec![
@@ -167,7 +174,7 @@ impl IrohBlossomClient {
             self.signer.as_ref(),
             "upload",
             Some(&our_sha256),
-            None,
+            Some(&receiver),
             "",
             &extra_tags,
         );
@@ -312,7 +319,14 @@ impl IrohBlossomClient {
     /// Delete a blob on a remote peer (requires auth).
     #[instrument(name = "blossom.iroh.client.delete", skip_all, fields(blob.sha256 = %sha256))]
     pub async fn delete(&self, addr: EndpointAddr, sha256: &str) -> Result<bool, String> {
-        let auth_event = build_blossom_auth(self.signer.as_ref(), "delete", Some(sha256), None, "");
+        let receiver = iroh_server_identity(&addr.id);
+        let auth_event = build_blossom_auth(
+            self.signer.as_ref(),
+            "delete",
+            Some(sha256),
+            Some(&receiver),
+            "",
+        );
         let auth_header = auth_header_value(&auth_event);
 
         let conn = self.connect(addr).await?;
@@ -420,8 +434,14 @@ impl IrohBlossomClient {
         tracing::Span::current().record("blob.sha256", our_sha256.as_str());
         tracing::Span::current().record("blob.size", file_size);
 
-        let auth_event =
-            build_blossom_auth(self.signer.as_ref(), "upload", Some(&our_sha256), None, "");
+        let receiver = iroh_server_identity(&addr.id);
+        let auth_event = build_blossom_auth(
+            self.signer.as_ref(),
+            "upload",
+            Some(&our_sha256),
+            Some(&receiver),
+            "",
+        );
         let auth_header = auth_header_value(&auth_event);
 
         let conn = self.connect(addr).await?;
@@ -539,11 +559,12 @@ impl IrohBlossomClient {
         };
         let binding = super::iroh_transport::request_auth_binding(&req)
             .ok_or_else(|| "missing lock request binding".to_string())?;
+        let receiver = iroh_server_identity(&addr.id);
         req.auth = auth_header_value(&build_blossom_auth(
             self.signer.as_ref(),
             "lock",
             Some(&binding),
-            None,
+            Some(&receiver),
             "",
         ));
 
@@ -587,11 +608,12 @@ impl IrohBlossomClient {
         };
         let binding = super::iroh_transport::request_auth_binding(&req)
             .ok_or_else(|| "missing unlock request binding".to_string())?;
+        let receiver = iroh_server_identity(&addr.id);
         req.auth = auth_header_value(&build_blossom_auth(
             self.signer.as_ref(),
             "lock",
             Some(&binding),
-            None,
+            Some(&receiver),
             "",
         ));
 
@@ -682,11 +704,12 @@ impl IrohBlossomClient {
         };
         let binding = super::iroh_transport::request_auth_binding(&req)
             .ok_or_else(|| "missing lock verification binding".to_string())?;
+        let receiver = iroh_server_identity(&addr.id);
         req.auth = auth_header_value(&build_blossom_auth(
             self.signer.as_ref(),
             "lock",
             Some(&binding),
-            None,
+            Some(&receiver),
             "",
         ));
 

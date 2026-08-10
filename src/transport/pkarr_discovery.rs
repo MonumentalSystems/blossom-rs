@@ -115,7 +115,7 @@ impl PkarrPublisher {
     pub async fn publish(&self) -> Result<(), String> {
         let packet = self.build_packet()?;
         self.client
-            .publish(&packet, None)
+            .publish(&packet)
             .await
             .map_err(|e| format!("pkarr publish: {e}"))?;
 
@@ -169,9 +169,9 @@ pub async fn resolve_all_endpoints(
 ) -> Result<ResolvedEndpoints, String> {
     let client = Client::builder().build().expect("pkarr client");
     let packet = client
-        .resolve(public_key)
+        .resolve(public_key, pkarr::ResolvePolicy::CacheFirst)
         .await
-        .ok_or("no pkarr record found")?;
+        .map_err(|e| format!("pkarr resolve: {e}"))?;
 
     let mut endpoints = ResolvedEndpoints::default();
 

@@ -1,38 +1,39 @@
 [package]
 name = "blossom-server"
-version = "0.5.8"
+version = "0.6.0"
 edition = "2021"
+rust-version = "1.94.1"
 description = "Blossom blob storage API server — BUD-01/02/04/06, NIP-96, BIP-340 auth, SQLite metadata"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/MonumentalSystems/blossom-rs"
 keywords = ["blossom", "nostr", "server", "blob", "storage"]
 categories = ["command-line-utilities", "web-programming"]
+include = ["/Cargo.toml", "/LICENSE", "/README.md", "/build.rs", "/src/**", "/tests/**"]
 
 [dependencies]
-blossom-rs = { path = "..", version = "0.5.8", features = ["server", "filesystem", "s3", "db-sqlite", "db-postgres", "media", "iroh-transport", "pkarr-discovery"] }
-blossom-nip34 = { path = "../blossom-nip34", version = "0.5.8", optional = true }
+blossom-rs = { path = "..", version = "0.6.0", features = ["server", "filesystem", "s3", "db-sqlite", "db-postgres", "media", "iroh-transport", "pkarr-discovery"] }
+blossom-nip34 = { path = "../blossom-nip34", version = "0.6.0", optional = true }
 axum = "0.8"
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 clap = { version = "4", features = ["derive", "env"] }
 tokio = { version = "1", features = ["full"] }
-tower-http = { version = "0.6", features = ["cors"] }
+tower-http = { version = "0.7", features = ["cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 serde_json = "1.0"
 iroh = "1.0.3"
-rand = "0.9"
 
 [features]
 default = ["nip34"]
 nip34 = ["dep:blossom-nip34"]
 
 [build-dependencies]
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 serde_json = "1.0"
 
 [dev-dependencies]
-blossom-rs = { path = "..", version = "0.5.8", features = ["server", "client", "filesystem", "db-sqlite"] }
-reqwest = { version = "0.12", features = ["json"] }
+blossom-rs = { path = "..", version = "0.6.0", features = ["server", "client", "filesystem", "db-sqlite"] }
+reqwest = { version = "0.13", features = ["json"] }
 tempfile = "3"

@@ -7,9 +7,11 @@ pub mod command;
 pub mod pktline;
 pub mod validation;
 
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::body::{to_bytes, Body};
+use axum::extract::{OriginalUri, Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use nostr::nips::nip19::FromBech32;
@@ -52,15 +54,20 @@ pub fn git_router() -> axum::Router<Arc<Nip34State>> {
 
 /// Verify that the Authorization header contains a valid Nostr event
 /// signed by the expected npub. Returns the pubkey hex on success.
-fn verify_push_auth(
+struct VerifiedPushAuth {
+    pubkey: String,
+    event_id: String,
+    now: u64,
+}
+
+fn verify_push_auth_claims(
     headers: &HeaderMap,
     expected_npub: &str,
     repo_name: &str,
-    domain: &str,
+    expected_url: &str,
     method: &str,
-    path: &str,
     body_hash: Option<&str>,
-) -> Result<String, &'static str> {
+) -> Result<VerifiedPushAuth, &'static str> {
     let auth_value = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -134,8 +141,8 @@ fn verify_push_auth(
         return Err("push authorization is not bound to this operation");
     }
     let url = unique("u").ok_or("push authorization missing URL")?;
-    let parsed = url::Url::parse(&url).map_err(|_| "push authorization URL is invalid")?;
-    if parsed.path() != path || parsed.host_str() != Some(domain) {
+    url::Url::parse(&url).map_err(|_| "push authorization URL is invalid")?;
+    if url != expected_url {
         return Err("push authorization is for a different repository or server");
     }
     let expiration = unique("expiration")
@@ -156,32 +163,156 @@ fn verify_push_auth(
     if !nonce_present {
         return Err("push authorization is missing a nonce");
     }
-    if !mark_auth_event_once(&event.id.to_hex(), now) {
-        return Err("push authorization has already been used");
-    }
-
-    Ok(event.pubkey.to_hex())
+    Ok(VerifiedPushAuth {
+        pubkey: event.pubkey.to_hex(),
+        event_id: event.id.to_hex(),
+        now,
+    })
 }
 
-fn mark_auth_event_once(event_id: &str, now: u64) -> bool {
-    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u64>>> =
-        std::sync::OnceLock::new();
+fn verify_push_auth(
+    headers: &HeaderMap,
+    expected_npub: &str,
+    repo_name: &str,
+    expected_url: &str,
+    method: &str,
+    body_hash: Option<&str>,
+) -> Result<String, &'static str> {
+    let verified = verify_push_auth_claims(
+        headers,
+        expected_npub,
+        repo_name,
+        expected_url,
+        method,
+        body_hash,
+    )?;
+    if !mark_auth_event_once(&verified.pubkey, &verified.event_id, verified.now) {
+        return Err("push authorization has already been used");
+    }
+    Ok(verified.pubkey)
+}
+
+const REPLAY_CACHE_CAPACITY: usize = 10_000;
+const REPLAY_CACHE_PER_PRINCIPAL: usize = 256;
+
+struct ReplayEntry {
+    principal: String,
+    expires_at: u64,
+}
+
+struct ReplayCache {
+    entries: HashMap<String, ReplayEntry>,
+    insertion_order: VecDeque<String>,
+    by_principal: HashMap<String, VecDeque<String>>,
+    capacity: usize,
+    per_principal: usize,
+}
+
+impl ReplayCache {
+    fn new(capacity: usize, per_principal: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            insertion_order: VecDeque::new(),
+            by_principal: HashMap::new(),
+            capacity,
+            per_principal,
+        }
+    }
+
+    fn remove(&mut self, event_id: &str) {
+        let Some(entry) = self.entries.remove(event_id) else {
+            return;
+        };
+        if let Some(ids) = self.by_principal.get_mut(&entry.principal) {
+            ids.retain(|id| id != event_id);
+            if ids.is_empty() {
+                self.by_principal.remove(&entry.principal);
+            }
+        }
+    }
+
+    fn prune_expired(&mut self, now: u64) {
+        while let Some(event_id) = self.insertion_order.front().cloned() {
+            match self.entries.get(&event_id) {
+                None => {
+                    self.insertion_order.pop_front();
+                }
+                Some(entry) if entry.expires_at <= now => {
+                    self.insertion_order.pop_front();
+                    self.remove(&event_id);
+                }
+                Some(_) => break,
+            }
+        }
+    }
+
+    fn check_and_insert(
+        &mut self,
+        principal: &str,
+        event_id: &str,
+        now: u64,
+        expires_at: u64,
+    ) -> bool {
+        self.prune_expired(now);
+        if self.entries.contains_key(event_id) {
+            return false;
+        }
+        while self
+            .by_principal
+            .get(principal)
+            .is_some_and(|ids| ids.len() >= self.per_principal)
+        {
+            let oldest = self
+                .by_principal
+                .get_mut(principal)
+                .and_then(VecDeque::pop_front);
+            if let Some(oldest) = oldest {
+                self.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+        while self.entries.len() >= self.capacity {
+            let Some(oldest) = self.insertion_order.pop_front() else {
+                break;
+            };
+            self.remove(&oldest);
+        }
+        self.entries.insert(
+            event_id.to_string(),
+            ReplayEntry {
+                principal: principal.to_string(),
+                expires_at,
+            },
+        );
+        self.insertion_order.push_back(event_id.to_string());
+        self.by_principal
+            .entry(principal.to_string())
+            .or_default()
+            .push_back(event_id.to_string());
+        true
+    }
+}
+
+fn mark_auth_event_once(principal: &str, event_id: &str, now: u64) -> bool {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<ReplayCache>> = std::sync::OnceLock::new();
     let mut seen = SEEN
-        .get_or_init(Default::default)
+        .get_or_init(|| {
+            std::sync::Mutex::new(ReplayCache::new(
+                REPLAY_CACHE_CAPACITY,
+                REPLAY_CACHE_PER_PRINCIPAL,
+            ))
+        })
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    seen.retain(|_, expires_at| *expires_at > now);
-    if seen.contains_key(event_id) || seen.len() >= 10_000 {
-        return false;
-    }
-    seen.insert(event_id.to_string(), now.saturating_add(120));
-    true
+    seen.check_and_insert(principal, event_id, now, now.saturating_add(120))
 }
 
 /// GET /{npub}/{repo}/info/refs?service=git-upload-pack
 async fn info_refs(
     State(state): State<Arc<Nip34State>>,
     Path((npub, repo)): Path<(String, String)>,
+    OriginalUri(original_uri): OriginalUri,
     headers: HeaderMap,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
@@ -203,9 +334,12 @@ async fn info_refs(
             &headers,
             &npub,
             repo_name,
-            &state.config.domain,
+            &format!(
+                "{}{}",
+                state.config.server_url.trim_end_matches('/'),
+                original_uri
+            ),
             "GET",
-            &format!("/{npub}/{repo}/info/refs"),
             None,
         )
         .is_err()
@@ -246,12 +380,28 @@ async fn info_refs(
 async fn upload_pack(
     State(state): State<Arc<Nip34State>>,
     Path((npub, repo)): Path<(String, String)>,
-    body: axum::body::Bytes,
+    body: Body,
 ) -> impl IntoResponse {
     let repo_name = repo.trim_end_matches(".git");
     let repo_path = match ensure_repo(&state, &npub, repo_name).await {
         Some(p) => p,
         None => return (StatusCode::NOT_FOUND, "repository not found").into_response(),
+    };
+    let _body_permit = match GIT_BODY_BUFFER_LIMIT.try_acquire() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "git body capacity exhausted",
+            )
+                .into_response()
+        }
+    };
+    let body = match to_bytes(body, 256 * 1024 * 1024).await {
+        Ok(body) => body,
+        Err(_) => {
+            return (StatusCode::PAYLOAD_TOO_LARGE, "git request body too large").into_response()
+        }
     };
 
     let git_cmd = command::GitCommand::new(&state.config.git_path, &repo_path);
@@ -279,18 +429,44 @@ async fn upload_pack(
 async fn receive_pack(
     State(state): State<Arc<Nip34State>>,
     Path((npub, repo)): Path<(String, String)>,
+    OriginalUri(original_uri): OriginalUri,
     headers: HeaderMap,
-    body: axum::body::Bytes,
+    body: Body,
 ) -> impl IntoResponse {
     let repo_name = repo.trim_end_matches(".git");
+    let expected_url = format!(
+        "{}{}",
+        state.config.server_url.trim_end_matches('/'),
+        original_uri
+    );
+    if let Err(error) =
+        verify_push_auth_claims(&headers, &npub, repo_name, &expected_url, "POST", None)
+    {
+        return (StatusCode::UNAUTHORIZED, error).into_response();
+    }
+    let _body_permit = match GIT_BODY_BUFFER_LIMIT.try_acquire() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "git body capacity exhausted",
+            )
+                .into_response()
+        }
+    };
+    let body = match to_bytes(body, 256 * 1024 * 1024).await {
+        Ok(body) => body,
+        Err(_) => {
+            return (StatusCode::PAYLOAD_TOO_LARGE, "git request body too large").into_response()
+        }
+    };
     let body_hash = hex::encode(Sha256::digest(&body));
     if let Err(error) = verify_push_auth(
         &headers,
         &npub,
         repo_name,
-        &state.config.domain,
+        &expected_url,
         "POST",
-        &format!("/{npub}/{repo}/git-receive-pack"),
         Some(&body_hash),
     ) {
         return (StatusCode::UNAUTHORIZED, error).into_response();
@@ -367,9 +543,93 @@ async fn receive_pack(
     }
 }
 
+// A Git pack may consume the full 256 MiB endpoint limit. Keep the permit for
+// the subprocess lifetime so aggregate buffered pack input remains bounded.
+static GIT_BODY_BUFFER_LIMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::convert::Infallible;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll};
+
+    struct PendingBody {
+        polled: Arc<AtomicBool>,
+    }
+
+    impl futures_core::Stream for PendingBody {
+        type Item = Result<axum::body::Bytes, Infallible>;
+
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            self.polled.store(true, Ordering::SeqCst);
+            Poll::Pending
+        }
+    }
+
+    #[test]
+    fn replay_cache_saturation_does_not_reject_authorized_traffic() {
+        let mut cache = ReplayCache::new(3, 2);
+        assert!(cache.check_and_insert("attacker", "a1", 1, 100));
+        assert!(cache.check_and_insert("attacker", "a2", 1, 100));
+        assert!(cache.check_and_insert("attacker", "a3", 1, 100));
+        assert!(cache.check_and_insert("other-attacker", "b1", 1, 100));
+        assert!(cache.check_and_insert("authorized", "good", 1, 100));
+        assert!(!cache.check_and_insert("authorized", "good", 1, 100));
+    }
+
+    #[tokio::test]
+    async fn receive_pack_denial_does_not_read_request_body() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = crate::Nip34Config {
+            lmdb_path: temp.path().join("lmdb"),
+            repos_path: temp.path().join("repos"),
+            ..Default::default()
+        };
+        let state = Arc::new(crate::Nip34State::new(config).await.unwrap());
+        let polled = Arc::new(AtomicBool::new(false));
+        let body = Body::from_stream(PendingBody {
+            polled: polled.clone(),
+        });
+        let response = receive_pack(
+            State(state),
+            Path(("00".repeat(32), "repo".to_string())),
+            OriginalUri("/00/repo/git-receive-pack".parse().unwrap()),
+            HeaderMap::new(),
+            body,
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(!polled.load(Ordering::SeqCst));
+    }
+
+    fn push_headers(keys: &nostr::Keys, url: &str, repo: &str, body_hash: &str) -> HeaderMap {
+        use nostr::prelude::*;
+        let expiration = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 60;
+        let event = EventBuilder::new(Kind::Custom(24242), "")
+            .tags([
+                Tag::custom(TagKind::custom("t"), ["git-push"]),
+                Tag::custom(TagKind::custom("repo"), [repo]),
+                Tag::custom(TagKind::custom("method"), ["POST"]),
+                Tag::custom(TagKind::custom("u"), [url]),
+                Tag::custom(TagKind::custom("x"), [body_hash]),
+                Tag::custom(TagKind::custom("nonce"), [uuid::Uuid::new_v4().to_string()]),
+                Tag::custom(TagKind::custom("expiration"), [expiration.to_string()]),
+            ])
+            .sign_with_keys(keys)
+            .unwrap();
+        let json = serde_json::to_vec(&event).unwrap();
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &json);
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", format!("Nostr {b64}").parse().unwrap());
+        headers
+    }
 
     #[test]
     fn test_verify_push_auth_missing_header() {
@@ -378,9 +638,8 @@ mod tests {
             &headers,
             "npub1test",
             "repo",
-            "localhost",
+            "http://localhost/repo",
             "POST",
-            "/repo",
             None
         )
         .is_err());
@@ -394,9 +653,8 @@ mod tests {
             &headers,
             "npub1test",
             "repo",
-            "localhost",
+            "http://localhost/repo",
             "POST",
-            "/repo",
             None
         )
         .is_err());
@@ -423,9 +681,8 @@ mod tests {
             &headers,
             &npub,
             "repo",
-            "localhost",
+            &format!("http://localhost/{npub}/repo/git-receive-pack"),
             "POST",
-            &format!("/{npub}/repo/git-receive-pack"),
             None,
         )
         .is_err());
@@ -437,10 +694,47 @@ mod tests {
             &headers,
             &other_npub,
             "repo",
-            "localhost",
+            "http://localhost/repo",
             "POST",
-            "/repo",
             None,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn push_auth_requires_exact_canonical_url_and_body() {
+        use nostr::prelude::*;
+        let keys = Keys::generate();
+        let npub = keys.public_key().to_bech32().unwrap();
+        let expected = format!("https://git.example:8443/{npub}/repo/git-receive-pack?tenant=a");
+        let body_hash = hex::encode(Sha256::digest(b"pack-a"));
+
+        let headers = push_headers(&keys, &expected, "repo", &body_hash);
+        assert!(
+            verify_push_auth(&headers, &npub, "repo", &expected, "POST", Some(&body_hash),).is_ok()
+        );
+
+        for changed in [
+            expected.replacen("https://", "http://", 1),
+            expected.replace(":8443", ":9443"),
+            expected.replace("tenant=a", "tenant=b"),
+        ] {
+            let headers = push_headers(&keys, &changed, "repo", &body_hash);
+            assert!(
+                verify_push_auth(&headers, &npub, "repo", &expected, "POST", Some(&body_hash),)
+                    .is_err()
+            );
+        }
+
+        let headers = push_headers(&keys, &expected, "repo", &body_hash);
+        let swapped_hash = hex::encode(Sha256::digest(b"pack-b"));
+        assert!(verify_push_auth(
+            &headers,
+            &npub,
+            "repo",
+            &expected,
+            "POST",
+            Some(&swapped_hash),
         )
         .is_err());
     }

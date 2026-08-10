@@ -426,6 +426,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.enable_relay {
         let nip34_config = blossom_nip34::Nip34Config {
             domain: args.nip34_domain.clone(),
+            server_url: args.base_url.trim_end_matches('/').to_string(),
             lmdb_path: args.nip34_lmdb_path.clone(),
             repos_path: args.nip34_repos_path.clone(),
             admin_pubkeys: args
@@ -497,7 +498,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let router = IrohRouter::builder(endpoint)
             .accept(
                 BLOSSOM_ALPN,
-                StdArc::new(BlossomProtocol::new(state.clone())),
+                StdArc::new(BlossomProtocol::new(state.clone(), node_id)),
             )
             .spawn();
 

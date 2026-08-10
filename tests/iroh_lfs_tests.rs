@@ -33,7 +33,7 @@ async fn spawn_iroh_lfs_server() -> (EndpointAddr, Router) {
     let addr = endpoint.addr();
 
     let router = Router::builder(endpoint)
-        .accept(BLOSSOM_ALPN, Arc::new(BlossomProtocol::new(state)))
+        .accept(BLOSSOM_ALPN, Arc::new(BlossomProtocol::new(state, addr.id)))
         .spawn();
 
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;

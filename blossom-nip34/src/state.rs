@@ -25,7 +25,23 @@ pub struct Nip34State {
 
 impl Nip34State {
     /// Create a new NIP-34 state, initializing the LMDB database and relay.
-    pub async fn new(config: Nip34Config) -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn new(mut config: Nip34Config) -> Result<Self, Box<dyn std::error::Error>> {
+        let public_url = url::Url::parse(&config.server_url)
+            .map_err(|error| format!("invalid NIP-34 server_url: {error}"))?;
+        if !matches!(public_url.scheme(), "http" | "https")
+            || public_url.host_str().is_none()
+            || !public_url.username().is_empty()
+            || public_url.password().is_some()
+            || public_url.query().is_some()
+            || public_url.fragment().is_some()
+        {
+            return Err(
+                "NIP-34 server_url must be an HTTP(S) URL without credentials, query, or fragment"
+                    .into(),
+            );
+        }
+        config.server_url = public_url.as_str().trim_end_matches('/').to_string();
+
         // Ensure repos directory exists
         tokio::fs::create_dir_all(&config.repos_path).await?;
 

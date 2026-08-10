@@ -1,7 +1,6 @@
 //! BIP-340 Schnorr signing trait and default implementation.
 
-use secp256k1::rand::rngs::OsRng;
-use secp256k1::{Keypair, Message, Secp256k1, SecretKey, XOnlyPublicKey};
+use secp256k1::{Keypair, Secp256k1, SecretKey, XOnlyPublicKey};
 
 /// Trait for BIP-340 Schnorr signing used in Blossom auth events.
 ///
@@ -29,7 +28,7 @@ impl Signer {
     /// Generate a fresh random keypair.
     pub fn generate() -> Self {
         let secp = Secp256k1::new();
-        let keypair = Keypair::new(&secp, &mut OsRng);
+        let keypair = Keypair::new(&secp, &mut secp256k1::rand::rng());
         let (xonly, _parity) = keypair.x_only_public_key();
         Signer {
             secret_key: keypair.secret_key(),
@@ -40,7 +39,11 @@ impl Signer {
     /// Reconstruct from a hex-encoded secret key.
     pub fn from_secret_hex(nsec: &str) -> Result<Self, String> {
         let bytes = hex::decode(nsec).map_err(|e| format!("invalid hex: {e}"))?;
-        let sk = SecretKey::from_slice(&bytes).map_err(|e| format!("invalid secret key: {e}"))?;
+        let bytes: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| "invalid secret key length".to_string())?;
+        let sk =
+            SecretKey::from_byte_array(bytes).map_err(|e| format!("invalid secret key: {e}"))?;
         let secp = Secp256k1::new();
         let keypair = Keypair::from_secret_key(&secp, &sk);
         let (xonly, _parity) = keypair.x_only_public_key();
@@ -65,24 +68,25 @@ impl Signer {
             Ok(b) if b.len() == 32 => b,
             _ => return false,
         };
-        let xonly = match XOnlyPublicKey::from_slice(&pub_bytes) {
-            Ok(k) => k,
+        let pub_bytes: [u8; 32] = match pub_bytes.try_into() {
+            Ok(bytes) => bytes,
             Err(_) => return false,
         };
-        let msg = match Message::from_digest_slice(message) {
-            Ok(m) => m,
+        let xonly = match XOnlyPublicKey::from_byte_array(pub_bytes) {
+            Ok(k) => k,
             Err(_) => return false,
         };
         let sig_bytes = match hex::decode(sig_hex) {
             Ok(b) if b.len() == 64 => b,
             _ => return false,
         };
-        let sig = match secp256k1::schnorr::Signature::from_slice(&sig_bytes) {
-            Ok(s) => s,
+        let sig_bytes: [u8; 64] = match sig_bytes.try_into() {
+            Ok(bytes) => bytes,
             Err(_) => return false,
         };
+        let sig = secp256k1::schnorr::Signature::from_byte_array(sig_bytes);
 
-        secp.verify_schnorr(&sig, &msg, &xonly).is_ok()
+        secp.verify_schnorr(&sig, message, &xonly).is_ok()
     }
 }
 
@@ -94,10 +98,8 @@ impl BlossomSigner for Signer {
     fn sign_schnorr(&self, message: &[u8; 32]) -> String {
         let secp = Secp256k1::new();
         let keypair = Keypair::from_secret_key(&secp, &self.secret_key);
-        let msg =
-            Message::from_digest_slice(message).expect("32-byte message always valid for Message");
-        let sig = secp.sign_schnorr_no_aux_rand(&msg, &keypair);
-        hex::encode(sig.serialize())
+        let sig = secp.sign_schnorr_no_aux_rand(message, &keypair);
+        hex::encode(sig.to_byte_array())
     }
 }
 

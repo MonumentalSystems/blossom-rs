@@ -1,5 +1,77 @@
 # Release Notes
 
+## v0.6.0 (unreleased)
+
+Version 0.6.0 is the first crates.io release planned after 0.5.6. It includes
+the hardening work that was merged after the 0.5.8 repository tag.
+
+### Security
+
+- Nostr authorization events now use canonical NIP-01 IDs, short freshness
+  windows, unique request-binding tags, nonces, and replay protection.
+- HTTP authorization is bound to the server, URL, method, action, and blob hash
+  where applicable.
+- NIP-98 JSON mutations bind the exact request bytes, Iroh mutations bind the
+  receiving node identity, and replay caches cannot be globally exhausted by
+  one signer.
+- Request bodies are authenticated and authorized before buffering, with hard
+  aggregate memory and processor concurrency budgets across HTTP, Git, media,
+  mirror, and Iroh upload paths.
+- Upload, deletion, ownership, multi-owner quota accounting, and database
+  mutations were hardened to avoid unauthorized access and inconsistent state.
+- Mirror requests validate resolved addresses and redirects, reject credentials
+  in URLs, and enforce response size and time limits.
+- Git repository creation and pushes now require owner authorization, and Git
+  subprocesses have bounded execution, environment, and output.
+- Filesystem storage validates content-addressed paths and uses atomic writes.
+- S3 preserves caller-supplied content hashes for compressed and delta LFS
+  objects, and verifies remote deletion before removing its local index.
+- Server and CLI defaults now favor loopback listeners, authenticated uploads,
+  and encrypted transport for signed credentials.
+
+### Breaking changes
+
+- `BlobDatabase` implementations must provide the new ownership and quota
+  mutation methods.
+- `blossom_nip34::relay_admin_router` now requires shared NIP-34 state.
+- `RelayPolicy::with_config` requires rate-limit configuration.
+- Previously reusable or loosely bound authorization events are rejected.
+  Clients must sign a fresh event for the exact request.
+- The standalone server requires explicit opt-ins for public plaintext
+  listeners, anonymous uploads, CORS, and relay exposure.
+- Database schemas are migrated for transactional ownership and quota updates.
+- Public dependency APIs move to Iroh 1.x and SQLx 0.9.
+- The minimum supported Rust version is now 1.94.1, matching the requirements
+  of the default SQLx/Iroh dependency graph and the S3 feature set.
+
+### Dependencies
+
+- Updated the direct Reqwest, SHA-2, secp256k1, Rand, Tower HTTP, Bech32,
+  Base64, EXIF, PKARR, and OpenTelemetry requirements to their current stable
+  release lines.
+- Removed consumer-time bindgen and libclang requirements by replacing the
+  generated xdelta3 surface with audited declarations for the two used C APIs.
+- Removed unused `axum-extra`, Candle, and direct NIP-34 Tower dependencies,
+  reducing duplicate compatibility lines and optional supply-chain surface.
+- Replaced the PKARR release candidate dependency with the stable 8.x line.
+- Kept the Nostr family on 0.44 because `nostr-relay-builder` does not yet have
+  a stable 0.45 release; partially upgrading that tightly coupled family would
+  create incompatible public types.
+
+### Upgrade notes
+
+- Back up SQLite or PostgreSQL metadata before starting 0.6.0 for the first
+  time.
+- Review listener, anonymous-upload, relay, CORS, TLS, and trusted-signer
+  settings before deployment.
+- Update clients and integrations to generate request-bound authorization
+  events rather than reusing events across endpoints or bodies.
+- Operators using S3, LFS, Iroh, NIP-96, media processing, Git hosting, or
+  mirroring should run the corresponding integration tests before production
+  rollout.
+
+---
+
 ## v0.5.2
 
 ### Bug Fixes

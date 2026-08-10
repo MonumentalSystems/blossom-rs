@@ -7,7 +7,7 @@
 //! - `DELETE /n96/:sha256` — file deletion
 
 use axum::{
-    body::Bytes,
+    body::Body,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
@@ -112,30 +112,53 @@ async fn handle_nip96_info(State(state): State<SharedState>) -> impl IntoRespons
 async fn handle_nip96_upload(
     State(state): State<SharedState>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> impl IntoResponse {
-    let data = body.to_vec();
+    let event = match extract_auth_event(&headers) {
+        Ok(event) => event,
+        Err(e) => {
+            return (StatusCode::UNAUTHORIZED, error_json(&e.to_string()));
+        }
+    };
+    let body_limit = {
+        let s = state.lock().await;
+        if let Err(error) =
+            super::verify_auth_event_claims(&event, "upload", &s.base_url, "/n96", "POST", None)
+        {
+            return (StatusCode::UNAUTHORIZED, error_json(&error.to_string()));
+        }
+        if !s.access.is_allowed(&event.pubkey, Action::Upload) {
+            return (StatusCode::FORBIDDEN, error_json("upload not allowed"));
+        }
+        if let Some(ref limiter) = s.rate_limiter {
+            if !limiter.check(&event.pubkey) {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    error_json("rate limit exceeded"),
+                );
+            }
+        }
+        s.body_limit
+    };
+    let body = match super::read_body_limited(body, body_limit, super::declared_body_len(&headers))
+        .await
+    {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let (data, _body_permit) = body.into_parts();
     if data.is_empty() {
         return (StatusCode::BAD_REQUEST, error_json("empty body"));
     }
     let sha256 = crate::protocol::sha256_hex(&data);
     let base_url = state.lock().await.base_url.clone();
-
-    // NIP-96 requires NIP-98 auth (kind:27235) or Blossom auth (kind:24242).
-    // We support Blossom auth for simplicity.
-    let pubkey = match extract_auth_event(&headers) {
-        Ok(event) => {
-            if let Err(e) =
-                verify_auth_event(&event, "upload", &base_url, "/n96", "POST", Some(&sha256))
-            {
-                return (StatusCode::UNAUTHORIZED, error_json(&e.to_string()));
-            }
-            event.pubkey
-        }
-        Err(e) => {
-            return (StatusCode::UNAUTHORIZED, error_json(&e.to_string()));
-        }
-    };
+    if let Err(error) =
+        super::verify_auth_event_claims(&event, "upload", &base_url, "/n96", "POST", Some(&sha256))
+            .and_then(|_| super::mark_auth_event_once(&event))
+    {
+        return (StatusCode::UNAUTHORIZED, error_json(&error.to_string()));
+    }
+    let pubkey = event.pubkey;
 
     let mut s = state.lock().await;
     let content_type =
@@ -155,11 +178,6 @@ async fn handle_nip96_upload(
                 error_json(&format!("exceeds max size of {} bytes", max)),
             );
         }
-    }
-
-    // Access control.
-    if !s.access.is_allowed(&pubkey, Action::Upload) {
-        return (StatusCode::FORBIDDEN, error_json("upload not allowed"));
     }
 
     // Quota check.
@@ -404,6 +422,11 @@ mod tests {
     use super::*;
     use crate::server::BlobServer;
     use crate::storage::MemoryBackend;
+    use std::convert::Infallible;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
 
     async fn spawn_nip96_server() -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -416,6 +439,19 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, app).await.ok() });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         url
+    }
+
+    struct PendingBody {
+        polled: Arc<AtomicBool>,
+    }
+
+    impl futures_core::Stream for PendingBody {
+        type Item = Result<axum::body::Bytes, Infallible>;
+
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            self.polled.store(true, Ordering::SeqCst);
+            Poll::Pending
+        }
     }
 
     fn request_auth(
@@ -453,6 +489,20 @@ mod tests {
         let info: Nip96Info = resp.json().await.unwrap();
         assert!(info.api_url.contains("/n96"));
         assert!(info.supported_nips.contains(&96));
+    }
+
+    #[tokio::test]
+    async fn nip96_denial_does_not_read_request_body() {
+        let server = BlobServer::new(MemoryBackend::new(), "http://localhost:3000");
+        let polled = Arc::new(AtomicBool::new(false));
+        let body = Body::from_stream(PendingBody {
+            polled: polled.clone(),
+        });
+        let response = handle_nip96_upload(State(server.shared_state()), HeaderMap::new(), body)
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(!polled.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
@@ -591,8 +641,7 @@ mod tests {
         let http = reqwest::Client::new();
         let signer = crate::auth::Signer::generate();
 
-        let auth_event = crate::auth::build_blossom_auth(&signer, "upload", None, None, "");
-        let auth_header = crate::auth::auth_header_value(&auth_event);
+        let auth_header = request_auth(&signer, &url, "/n96", "POST", "upload", None);
 
         let resp = http
             .post(format!("{}/n96", url))

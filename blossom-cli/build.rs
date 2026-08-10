@@ -5,24 +5,24 @@ use std::process::Command;
 
 fn main() {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("manifest dir"));
-    let workspace_root = manifest_dir
-        .parent()
-        .expect("blossom-server should live in workspace")
-        .to_path_buf();
+    // Hash only this package's shipped sources. In a crates.io extraction the
+    // parent of CARGO_MANIFEST_DIR is the shared registry cache, not the
+    // blossom workspace; walking it would be expensive and machine-dependent.
+    let package_root = manifest_dir.clone();
     let target = std::env::var("TARGET").unwrap_or_else(|_| "unknown-target".to_string());
 
-    let files = discover_source_files(&workspace_root).expect("source file discovery should work");
+    let files = discover_source_files(&package_root).expect("source file discovery should work");
     for relative in &files {
         println!(
             "cargo:rerun-if-changed={}",
-            workspace_root.join(relative).display()
+            package_root.join(relative).display()
         );
     }
 
     let entries = files
         .iter()
         .map(|relative| {
-            let absolute = workspace_root.join(relative);
+            let absolute = package_root.join(relative);
             let hash = hash_file(&absolute).expect("source file should hash");
             serde_json::json!({
                 "path": relative.to_string_lossy().replace('\\', "/"),

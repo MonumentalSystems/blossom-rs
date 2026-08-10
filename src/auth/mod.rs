@@ -6,7 +6,10 @@
 pub mod nip98;
 mod signer;
 
-pub use nip98::{build_nip98_auth, verify_nip98_auth};
+pub use nip98::{
+    build_nip98_auth, build_nip98_auth_with_payload, verify_nip98_auth,
+    verify_nip98_auth_with_payload,
+};
 pub use signer::{BlossomSigner, Signer};
 
 use crate::protocol::{base64url_encode, compute_event_id, NostrEvent};

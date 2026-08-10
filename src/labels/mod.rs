@@ -101,9 +101,9 @@ impl MediaLabeler for BlockAllLabeler {
     }
 }
 
-// TODO: VitLabeler — local Vision Transformer inference via Candle
-// Requires: candle-core, candle-nn, candle-transformers
-// Should implement MediaLabeler with a pre-trained image classification model.
+// TODO: VitLabeler — local Vision Transformer inference.
+// A downstream implementation can use its preferred inference engine with a
+// pre-trained image classification model.
 
 // TODO: LlmLabeler — remote API-based classification (OpenAI-compatible)
 // Requires: reqwest, serde_json

@@ -38,6 +38,15 @@ pub enum MediaError {
 ///
 /// Implementations handle image/video conversion, thumbnail generation,
 /// metadata extraction, and privacy validation.
+///
+/// The server runs [`MediaProcessor::process`] on a blocking worker and applies
+/// a request deadline. Rust cannot safely terminate an arbitrary running
+/// thread, so the deadline cancels work that has not started but an invocation
+/// already in progress continues to consume one of the server's bounded
+/// processing slots until it returns. This fail-closed behavior prevents
+/// timed-out work from growing without bound. Implementations should enforce
+/// their own input, allocation, and codec limits and must not block
+/// indefinitely, because stuck processors can exhaust media capacity.
 pub trait MediaProcessor: Send + Sync {
     /// Process a media file. Returns the processed result with metadata.
     fn process(&self, data: &[u8], mime_type: &str) -> Result<MediaResult, MediaError>;
