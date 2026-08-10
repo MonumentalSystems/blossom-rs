@@ -610,23 +610,57 @@ pub(crate) fn verify_auth_event(
     mark_auth_event_once(event)
 }
 
-static BODY_BUFFER_LIMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(16);
+const MAX_BUFFERED_BODY_BYTES: usize = 256 * 1024 * 1024;
+const BODY_BUFFER_UNIT_BYTES: usize = 1024 * 1024;
+static BODY_BUFFER_BUDGET: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(MAX_BUFFERED_BODY_BYTES / BODY_BUFFER_UNIT_BYTES);
+
+struct BufferedBody {
+    data: Vec<u8>,
+    permit: tokio::sync::SemaphorePermit<'static>,
+}
+
+impl BufferedBody {
+    fn into_parts(self) -> (Vec<u8>, tokio::sync::SemaphorePermit<'static>) {
+        (self.data, self.permit)
+    }
+}
 
 async fn read_body_limited(
     body: Body,
     limit: usize,
-) -> Result<Bytes, (StatusCode, Json<serde_json::Value>)> {
-    let _permit = BODY_BUFFER_LIMIT.try_acquire().map_err(|_| {
+) -> Result<BufferedBody, (StatusCode, Json<serde_json::Value>)> {
+    if limit > MAX_BUFFERED_BODY_BYTES {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            error_json("configured request body limit exceeds the safe buffered ceiling"),
+        ));
+    }
+    let permits = limit
+        .max(1)
+        .div_ceil(BODY_BUFFER_UNIT_BYTES)
+        .try_into()
+        .map_err(|_| {
+            (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                error_json("request body limit is too large"),
+            )
+        })?;
+    let permit = BODY_BUFFER_BUDGET.try_acquire_many(permits).map_err(|_| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             error_json("request body capacity exhausted"),
         )
     })?;
-    to_bytes(body, limit).await.map_err(|_| {
+    let bytes = to_bytes(body, limit).await.map_err(|_| {
         (
             StatusCode::PAYLOAD_TOO_LARGE,
             error_json("request body exceeds configured limit"),
         )
+    })?;
+    Ok(BufferedBody {
+        data: bytes.to_vec(),
+        permit,
     })
 }
 
@@ -842,13 +876,13 @@ async fn handle_upload(
                 return (StatusCode::UNAUTHORIZED, error_json(&error.to_string()));
             }
             let allowed = s.access.is_allowed(&event.pubkey, Action::Upload);
-            if s.requirements.require_auth && !allowed {
+            if !allowed {
                 return (
                     StatusCode::FORBIDDEN,
                     error_json("upload not allowed for this pubkey"),
                 );
             }
-            allowed.then(|| event.pubkey.clone())
+            Some(event.pubkey.clone())
         } else {
             None
         };
@@ -869,7 +903,7 @@ async fn handle_upload(
         Ok(body) => body,
         Err(response) => return response,
     };
-    let data = body.to_vec();
+    let (data, _body_permit) = body.into_parts();
     tracing::Span::current().record("blob.size", data.len() as u64);
     if data.is_empty() {
         warn!("upload rejected: empty body");
@@ -1419,6 +1453,7 @@ async fn handle_mirror(
         Ok(body) => body,
         Err(response) => return response,
     };
+    let (body, body_permit) = body.into_parts();
     let req: MirrorRequest = match serde_json::from_slice(&body) {
         Ok(req) => req,
         Err(error) => {
@@ -1439,8 +1474,48 @@ async fn handle_mirror(
 
     let base_url = state.lock().await.base_url.clone();
     let source_hash = crate::protocol::sha256_hex(req.url.as_bytes());
-    static MIRROR_FETCH_LIMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
-    let _fetch_permit = match MIRROR_FETCH_LIMIT.try_acquire() {
+    let payload_hash = crate::protocol::sha256_hex(&body);
+    let expected_hash = if event.kind == 27235 {
+        &payload_hash
+    } else {
+        &source_hash
+    };
+    if let Err(error) = verify_auth_event_claims(
+        &event,
+        "upload",
+        &base_url,
+        "/mirror",
+        "PUT",
+        Some(expected_hash),
+    )
+    .and_then(|_| mark_auth_event_once(&event))
+    {
+        return (StatusCode::UNAUTHORIZED, error_json(&error.to_string()));
+    }
+    let pubkey = event.pubkey;
+
+    drop(body_permit);
+    let max_mirror_size = state
+        .lock()
+        .await
+        .requirements
+        .max_size
+        .unwrap_or(256 * 1024 * 1024);
+    let mirror_permits: u32 = match usize::try_from(max_mirror_size)
+        .ok()
+        .filter(|size| *size <= MAX_BUFFERED_BODY_BYTES)
+        .map(|size| size.max(1).div_ceil(BODY_BUFFER_UNIT_BYTES))
+        .and_then(|permits| permits.try_into().ok())
+    {
+        Some(permits) => permits,
+        None => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                error_json("configured mirror size exceeds the safe buffered ceiling"),
+            );
+        }
+    };
+    let _fetch_permit = match BODY_BUFFER_BUDGET.try_acquire_many(mirror_permits) {
         Ok(permit) => permit,
         Err(_) => {
             return (
@@ -1449,26 +1524,6 @@ async fn handle_mirror(
             );
         }
     };
-    if let Err(error) = verify_auth_event_claims(
-        &event,
-        "upload",
-        &base_url,
-        "/mirror",
-        "PUT",
-        Some(&source_hash),
-    )
-    .and_then(|_| mark_auth_event_once(&event))
-    {
-        return (StatusCode::UNAUTHORIZED, error_json(&error.to_string()));
-    }
-    let pubkey = event.pubkey;
-
-    let max_mirror_size = state
-        .lock()
-        .await
-        .requirements
-        .max_size
-        .unwrap_or(256 * 1024 * 1024);
     let data = match fetch_mirror_blob(&req.url, max_mirror_size).await {
         Ok(data) => data,
         Err(error) => return (StatusCode::BAD_GATEWAY, error_json(&error)),
@@ -1679,7 +1734,7 @@ async fn handle_media_upload(
         Ok(body) => body,
         Err(response) => return response,
     };
-    let data = body.to_vec();
+    let (data, _body_permit) = body.into_parts();
     tracing::Span::current().record("blob.size", data.len() as u64);
     if data.is_empty() {
         return (StatusCode::BAD_REQUEST, error_json("empty body"));
@@ -2061,6 +2116,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn denied_optional_upload_auth_cannot_fall_back_to_anonymous() {
+        use std::collections::HashSet;
+
+        let server = BlobServer::builder(MemoryBackend::new(), "http://localhost:3000")
+            .access_control(crate::access::Whitelist::new(HashSet::new()))
+            .build();
+        let signer = crate::auth::Signer::generate();
+        let auth = request_auth(
+            &signer,
+            "http://localhost:3000",
+            "/upload",
+            "PUT",
+            "upload",
+            None,
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", auth.parse().unwrap());
+        let (body, polled) = pending_body();
+
+        let response = handle_upload(State(server.shared_state()), headers, body)
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(!polled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
     async fn mirror_denial_happens_before_outbound_fetch() {
         use std::collections::HashSet;
 
@@ -2089,6 +2172,47 @@ mod tests {
         // 403 response, without polling the body that contains the URL,
         // proves access control ran before parsing or fetching it.
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(!polled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn nip98_mirror_auth_binds_exact_json_body() {
+        let server = BlobServer::new(MemoryBackend::new(), "http://localhost:3000");
+        let signer = crate::auth::Signer::generate();
+        let signed_body = br#"{"url":"http://127.0.0.1:1/signed"}"#;
+        let swapped_body = br#"{"url":"http://127.0.0.1:1/swapped"}"#;
+        let payload_hash = crate::protocol::sha256_hex(signed_body);
+        let event = crate::auth::build_nip98_auth_with_payload(
+            &signer,
+            "http://localhost:3000/mirror",
+            "PUT",
+            Some(&payload_hash),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            crate::auth::auth_header_value(&event).parse().unwrap(),
+        );
+
+        let response = handle_mirror(
+            State(server.shared_state()),
+            headers,
+            Body::from(swapped_body.as_slice()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn body_limits_above_buffer_budget_are_rejected_without_polling() {
+        let (body, polled) = pending_body();
+        let response = match read_body_limited(body, MAX_BUFFERED_BODY_BYTES + 1).await {
+            Ok(_) => panic!("oversized buffer limit unexpectedly accepted"),
+            Err(response) => response,
+        };
+        assert_eq!(response.0, StatusCode::PAYLOAD_TOO_LARGE);
         assert!(!polled.load(Ordering::SeqCst));
     }
 

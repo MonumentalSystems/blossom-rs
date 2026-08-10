@@ -144,7 +144,7 @@ async fn handle_nip96_upload(
         Ok(body) => body,
         Err(response) => return response,
     };
-    let data = body.to_vec();
+    let (data, _body_permit) = body.into_parts();
     if data.is_empty() {
         return (StatusCode::BAD_REQUEST, error_json("empty body"));
     }

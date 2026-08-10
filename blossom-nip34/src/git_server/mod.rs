@@ -543,7 +543,9 @@ async fn receive_pack(
     }
 }
 
-static GIT_BODY_BUFFER_LIMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
+// A Git pack may consume the full 256 MiB endpoint limit. Keep the permit for
+// the subprocess lifetime so aggregate buffered pack input remains bounded.
+static GIT_BODY_BUFFER_LIMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 
 #[cfg(test)]
 mod tests {
