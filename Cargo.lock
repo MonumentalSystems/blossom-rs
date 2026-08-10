@@ -1063,6 +1063,7 @@ version = "0.6.0"
 dependencies = [
  "axum",
  "base64 0.23.1",
+ "futures-core",
  "hex",
  "hyper",
  "hyper-util",
@@ -1095,6 +1096,7 @@ dependencies = [
  "blurhash",
  "cc",
  "dashmap",
+ "futures-core",
  "hex",
  "image",
  "iroh",

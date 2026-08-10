@@ -16,6 +16,7 @@ pub mod admin;
 pub mod locks;
 pub mod nip96;
 
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use crate::access::{AccessControl, Action, OpenAccess, Role};
@@ -32,7 +33,7 @@ use crate::stats::StatsAccumulator;
 use crate::storage::BlobBackend;
 use crate::webhooks::{self, EventType, NoopNotifier, WebhookNotifier};
 use axum::{
-    body::Bytes,
+    body::{to_bytes, Body, Bytes},
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
@@ -72,6 +73,7 @@ pub struct ServerState {
     pub(crate) media_processor: Option<Arc<dyn MediaProcessor>>,
     pub(crate) base_url: String,
     pub(crate) requirements: UploadRequirements,
+    pub(crate) body_limit: usize,
     pub lock_db: Option<Box<dyn LockDatabase>>,
     pub lfs_version_db: Option<Box<dyn LfsVersionDatabase>>,
 }
@@ -233,6 +235,7 @@ impl BlobServerBuilder {
             media_processor: self.media_processor,
             base_url: self.base_url,
             requirements: self.requirements,
+            body_limit: self.body_limit,
             lock_db: self.lock_db,
             lfs_version_db: self.lfs_version_db,
         }));
@@ -427,7 +430,7 @@ fn extract_auth_event(headers: &HeaderMap) -> Result<NostrEvent, AuthError> {
 }
 
 /// Verify an auth event, accepting either kind:24242 (Blossom) or kind:27235 (NIP-98).
-pub(crate) fn verify_auth_event(
+fn verify_auth_event_claims(
     event: &NostrEvent,
     expected_action: &str,
     base_url: &str,
@@ -455,28 +458,176 @@ pub(crate) fn verify_auth_event(
                 .flatten(),
         ),
         other => Err(AuthError::WrongKind(other)),
-    }?;
+    }
+}
 
-    static SEEN_AUTH_EVENTS: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, u64>>,
-    > = std::sync::OnceLock::new();
+const REPLAY_CACHE_CAPACITY: usize = 10_000;
+const REPLAY_CACHE_PER_PRINCIPAL: usize = 256;
+
+#[derive(Debug)]
+struct ReplayEntry {
+    principal: String,
+    expires_at: u64,
+}
+
+#[derive(Debug)]
+struct ReplayCache {
+    entries: HashMap<String, ReplayEntry>,
+    insertion_order: VecDeque<String>,
+    by_principal: HashMap<String, VecDeque<String>>,
+    capacity: usize,
+    per_principal: usize,
+}
+
+impl ReplayCache {
+    fn new(capacity: usize, per_principal: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            insertion_order: VecDeque::new(),
+            by_principal: HashMap::new(),
+            capacity,
+            per_principal,
+        }
+    }
+
+    fn remove(&mut self, event_id: &str) {
+        let Some(entry) = self.entries.remove(event_id) else {
+            return;
+        };
+        if let Some(ids) = self.by_principal.get_mut(&entry.principal) {
+            ids.retain(|id| id != event_id);
+            if ids.is_empty() {
+                self.by_principal.remove(&entry.principal);
+            }
+        }
+    }
+
+    fn prune_expired(&mut self, now: u64) {
+        while let Some(event_id) = self.insertion_order.front().cloned() {
+            match self.entries.get(&event_id) {
+                None => {
+                    self.insertion_order.pop_front();
+                }
+                Some(entry) if entry.expires_at <= now => {
+                    self.insertion_order.pop_front();
+                    self.remove(&event_id);
+                }
+                Some(_) => break,
+            }
+        }
+    }
+
+    fn check_and_insert(
+        &mut self,
+        principal: &str,
+        event_id: &str,
+        now: u64,
+        expires_at: u64,
+    ) -> bool {
+        self.prune_expired(now);
+        if self.entries.contains_key(event_id) {
+            return false;
+        }
+
+        while self
+            .by_principal
+            .get(principal)
+            .is_some_and(|ids| ids.len() >= self.per_principal)
+        {
+            let oldest = self
+                .by_principal
+                .get_mut(principal)
+                .and_then(VecDeque::pop_front);
+            if let Some(oldest) = oldest {
+                self.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+
+        while self.entries.len() >= self.capacity {
+            let Some(oldest) = self.insertion_order.pop_front() else {
+                break;
+            };
+            self.remove(&oldest);
+        }
+
+        self.entries.insert(
+            event_id.to_string(),
+            ReplayEntry {
+                principal: principal.to_string(),
+                expires_at,
+            },
+        );
+        self.insertion_order.push_back(event_id.to_string());
+        self.by_principal
+            .entry(principal.to_string())
+            .or_default()
+            .push_back(event_id.to_string());
+        true
+    }
+}
+
+fn mark_auth_event_once(event: &NostrEvent) -> Result<(), AuthError> {
+    static SEEN_AUTH_EVENTS: std::sync::OnceLock<std::sync::Mutex<ReplayCache>> =
+        std::sync::OnceLock::new();
+
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
     let mut seen = SEEN_AUTH_EVENTS
-        .get_or_init(Default::default)
+        .get_or_init(|| {
+            std::sync::Mutex::new(ReplayCache::new(
+                REPLAY_CACHE_CAPACITY,
+                REPLAY_CACHE_PER_PRINCIPAL,
+            ))
+        })
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    seen.retain(|_, expires_at| *expires_at > now);
-    if seen.contains_key(&event.id) {
+    if !seen.check_and_insert(&event.pubkey, &event.id, now, now.saturating_add(120)) {
         return Err(AuthError::Replay);
     }
-    if seen.len() >= 10_000 {
-        return Err(AuthError::Replay);
-    }
-    seen.insert(event.id.clone(), now.saturating_add(120));
     Ok(())
+}
+
+pub(crate) fn verify_auth_event(
+    event: &NostrEvent,
+    expected_action: &str,
+    base_url: &str,
+    path: &str,
+    method: &str,
+    expected_hash: Option<&str>,
+) -> Result<(), AuthError> {
+    verify_auth_event_claims(
+        event,
+        expected_action,
+        base_url,
+        path,
+        method,
+        expected_hash,
+    )?;
+    mark_auth_event_once(event)
+}
+
+static BODY_BUFFER_LIMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(16);
+
+async fn read_body_limited(
+    body: Body,
+    limit: usize,
+) -> Result<Bytes, (StatusCode, Json<serde_json::Value>)> {
+    let _permit = BODY_BUFFER_LIMIT.try_acquire().map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_json("request body capacity exhausted"),
+        )
+    })?;
+    to_bytes(body, limit).await.map_err(|_| {
+        (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            error_json("request body exceeds configured limit"),
+        )
+    })
 }
 
 fn error_json(msg: &str) -> Json<serde_json::Value> {
@@ -662,8 +813,62 @@ async fn fetch_mirror_blob(source: &str, max_bytes: u64) -> Result<Vec<u8>, Stri
 async fn handle_upload(
     State(state): State<SharedState>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> impl IntoResponse {
+    let auth_event = if headers.contains_key("authorization") {
+        match extract_auth_event(&headers) {
+            Ok(event) => Some(event),
+            Err(error) => {
+                return (StatusCode::UNAUTHORIZED, error_json(&error.to_string()));
+            }
+        }
+    } else {
+        None
+    };
+
+    let (pubkey, body_limit) = {
+        let s = state.lock().await;
+        if s.requirements.require_auth && auth_event.is_none() {
+            return (
+                StatusCode::UNAUTHORIZED,
+                error_json(&AuthError::InvalidSignature.to_string()),
+            );
+        }
+
+        let pubkey = if let Some(event) = auth_event.as_ref() {
+            if let Err(error) =
+                verify_auth_event_claims(event, "upload", &s.base_url, "/upload", "PUT", None)
+            {
+                return (StatusCode::UNAUTHORIZED, error_json(&error.to_string()));
+            }
+            let allowed = s.access.is_allowed(&event.pubkey, Action::Upload);
+            if s.requirements.require_auth && !allowed {
+                return (
+                    StatusCode::FORBIDDEN,
+                    error_json("upload not allowed for this pubkey"),
+                );
+            }
+            allowed.then(|| event.pubkey.clone())
+        } else {
+            None
+        };
+
+        if let Some(ref limiter) = s.rate_limiter {
+            let key = pubkey.as_deref().unwrap_or("anonymous");
+            if !limiter.check(key) {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    error_json("rate limit exceeded"),
+                );
+            }
+        }
+        (pubkey, s.body_limit)
+    };
+
+    let body = match read_body_limited(body, body_limit).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
     let data = body.to_vec();
     tracing::Span::current().record("blob.size", data.len() as u64);
     if data.is_empty() {
@@ -671,9 +876,26 @@ async fn handle_upload(
         return (StatusCode::BAD_REQUEST, error_json("empty body"));
     }
 
-    let mut s = state.lock().await;
+    let original_sha256 = crate::protocol::sha256_hex(&data);
+    let original_size = data.len() as u64;
 
-    // BUD-06: Check upload requirements.
+    if let (Some(event), Some(_)) = (auth_event.as_ref(), pubkey.as_ref()) {
+        let base_url = state.lock().await.base_url.clone();
+        if let Err(error) = verify_auth_event_claims(
+            event,
+            "upload",
+            &base_url,
+            "/upload",
+            "PUT",
+            Some(&original_sha256),
+        )
+        .and_then(|_| mark_auth_event_once(event))
+        {
+            return (StatusCode::UNAUTHORIZED, error_json(&error.to_string()));
+        }
+    }
+
+    let mut s = state.lock().await;
     if let Some(max) = s.requirements.max_size {
         if data.len() as u64 > max {
             return (
@@ -683,118 +905,20 @@ async fn handle_upload(
         }
     }
 
-    // Compute the content identity before auth so authorization is bound to
-    // the exact bytes supplied in this request.
-    let original_sha256 = crate::protocol::sha256_hex(&data);
-    let original_size = data.len() as u64;
-
-    // Auth check.
-    let pubkey = if s.requirements.require_auth {
-        match extract_auth_event(&headers) {
-            Ok(event) => {
-                if let Err(e) = verify_auth_event(
-                    &event,
-                    "upload",
-                    &s.base_url,
-                    "/upload",
-                    "PUT",
-                    Some(&original_sha256),
-                ) {
-                    return (StatusCode::UNAUTHORIZED, error_json(&e.to_string()));
-                }
-                // Access control check.
-                if !s.access.is_allowed(&event.pubkey, Action::Upload) {
-                    return (
-                        StatusCode::FORBIDDEN,
-                        error_json("upload not allowed for this pubkey"),
-                    );
-                }
-                // Quota check.
-                let additional_bytes = if s
-                    .database
-                    .is_upload_owner(&original_sha256, &event.pubkey)
-                    .unwrap_or(false)
-                {
-                    0
-                } else {
-                    data.len() as u64
-                };
-                if let Err(DbError::QuotaExceeded {
-                    used,
-                    requested,
-                    limit,
-                }) = s.database.check_quota(&event.pubkey, additional_bytes)
-                {
-                    return (
-                        StatusCode::INSUFFICIENT_STORAGE,
-                        error_json(&format!(
-                            "quota exceeded: used {} + requested {} > limit {}",
-                            used, requested, limit
-                        )),
-                    );
-                }
-                Some(event.pubkey.clone())
-            }
-            Err(e) => {
-                return (StatusCode::UNAUTHORIZED, error_json(&e.to_string()));
-            }
-        }
-    } else {
-        // Optional auth still has to be valid before it can assign ownership.
-        if headers.contains_key("authorization") {
-            match extract_auth_event(&headers) {
-                Ok(event) => {
-                    if let Err(error) = verify_auth_event(
-                        &event,
-                        "upload",
-                        &s.base_url,
-                        "/upload",
-                        "PUT",
-                        Some(&original_sha256),
-                    ) {
-                        return (StatusCode::UNAUTHORIZED, error_json(&error.to_string()));
-                    }
-                    if s.access.is_allowed(&event.pubkey, Action::Upload) {
-                        let additional_bytes = if s
-                            .database
-                            .is_upload_owner(&original_sha256, &event.pubkey)
-                            .unwrap_or(false)
-                        {
-                            0
-                        } else {
-                            data.len() as u64
-                        };
-                        if let Err(error) = s.database.check_quota(&event.pubkey, additional_bytes)
-                        {
-                            return (
-                                StatusCode::INSUFFICIENT_STORAGE,
-                                error_json(&error.to_string()),
-                            );
-                        }
-                        Some(event.pubkey)
-                    } else {
-                        // On an explicitly anonymous server, a valid signature
-                        // from a non-member does not confer ownership or quota.
-                        None
-                    }
-                }
-                Err(error) => {
-                    return (StatusCode::UNAUTHORIZED, error_json(&error.to_string()));
-                }
-            }
+    if let Some(ref owner) = pubkey {
+        let additional_bytes = if s
+            .database
+            .is_upload_owner(&original_sha256, owner)
+            .unwrap_or(false)
+        {
+            0
         } else {
-            None
-        }
-    };
-
-    // Only verified identities may receive their own bucket. Invalid or
-    // anonymous requests share the bounded anonymous bucket.
-    if let Some(ref limiter) = s.rate_limiter {
-        let key = pubkey.as_deref().unwrap_or("anonymous");
-        if !limiter.check(key) {
+            data.len() as u64
+        };
+        if let Err(error) = s.database.check_quota(owner, additional_bytes) {
             return (
-                StatusCode::TOO_MANY_REQUESTS,
-                error_json("rate limit exceeded"),
+                StatusCode::INSUFFICIENT_STORAGE,
+                error_json(&error.to_string()),
             );
         }
     }
@@ -1260,8 +1384,50 @@ struct MirrorRequest {
 async fn handle_mirror(
     State(state): State<SharedState>,
     headers: HeaderMap,
-    Json(req): Json<MirrorRequest>,
+    body: Body,
 ) -> impl IntoResponse {
+    let event = match extract_auth_event(&headers) {
+        Ok(event) => event,
+        Err(error) => {
+            return (StatusCode::UNAUTHORIZED, error_json(&error.to_string()));
+        }
+    };
+    let body_limit = {
+        let s = state.lock().await;
+        if let Err(error) =
+            verify_auth_event_claims(&event, "upload", &s.base_url, "/mirror", "PUT", None)
+        {
+            return (StatusCode::UNAUTHORIZED, error_json(&error.to_string()));
+        }
+        if !s.access.is_allowed(&event.pubkey, Action::Mirror) {
+            return (
+                StatusCode::FORBIDDEN,
+                error_json("mirror not allowed for this pubkey"),
+            );
+        }
+        if let Some(ref limiter) = s.rate_limiter {
+            if !limiter.check(&event.pubkey) {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    error_json("rate limit exceeded"),
+                );
+            }
+        }
+        s.body_limit.min(64 * 1024)
+    };
+    let body = match read_body_limited(body, body_limit).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let req: MirrorRequest = match serde_json::from_slice(&body) {
+        Ok(req) => req,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                error_json(&format!("invalid mirror request: {error}")),
+            );
+        }
+    };
     let log_target = reqwest::Url::parse(&req.url)
         .ok()
         .and_then(|url| {
@@ -1271,27 +1437,31 @@ async fn handle_mirror(
         .unwrap_or_else(|| "invalid-url".into());
     tracing::Span::current().record("mirror.source_url", log_target.as_str());
 
-    // Mirror requires auth.
     let base_url = state.lock().await.base_url.clone();
-    let pubkey = match extract_auth_event(&headers) {
-        Ok(event) => {
-            let source_hash = crate::protocol::sha256_hex(req.url.as_bytes());
-            if let Err(e) = verify_auth_event(
-                &event,
-                "upload",
-                &base_url,
-                "/mirror",
-                "PUT",
-                Some(&source_hash),
-            ) {
-                return (StatusCode::UNAUTHORIZED, error_json(&e.to_string()));
-            }
-            event.pubkey
-        }
-        Err(e) => {
-            return (StatusCode::UNAUTHORIZED, error_json(&e.to_string()));
+    let source_hash = crate::protocol::sha256_hex(req.url.as_bytes());
+    static MIRROR_FETCH_LIMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
+    let _fetch_permit = match MIRROR_FETCH_LIMIT.try_acquire() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                error_json("mirror fetch capacity exhausted"),
+            );
         }
     };
+    if let Err(error) = verify_auth_event_claims(
+        &event,
+        "upload",
+        &base_url,
+        "/mirror",
+        "PUT",
+        Some(&source_hash),
+    )
+    .and_then(|_| mark_auth_event_once(&event))
+    {
+        return (StatusCode::UNAUTHORIZED, error_json(&error.to_string()));
+    }
+    let pubkey = event.pubkey;
 
     let max_mirror_size = state
         .lock()
@@ -1328,14 +1498,6 @@ async fn handle_mirror(
                 error_json(&format!("mirrored blob exceeds max size of {} bytes", max)),
             );
         }
-    }
-
-    // Access control.
-    if !s.access.is_allowed(&pubkey, Action::Mirror) {
-        return (
-            StatusCode::FORBIDDEN,
-            error_json("mirror not allowed for this pubkey"),
-        );
     }
 
     // Quota check.
@@ -1414,66 +1576,44 @@ async fn handle_mirror(
 async fn handle_media_upload(
     State(state): State<SharedState>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> impl IntoResponse {
-    let data = body.to_vec();
-    tracing::Span::current().record("blob.size", data.len() as u64);
-    if data.is_empty() {
-        return (StatusCode::BAD_REQUEST, error_json("empty body"));
-    }
-
-    let s = state.lock().await;
-    let upload_sha256 = crate::protocol::sha256_hex(&data);
-
-    // Media processor required.
-    let processor = match s.media_processor.clone() {
-        Some(p) => p,
-        None => {
+    let event = match extract_auth_event(&headers) {
+        Ok(event) => event,
+        Err(error) => {
+            return (StatusCode::UNAUTHORIZED, error_json(&error.to_string()));
+        }
+    };
+    let (processor, body_limit) = {
+        let s = state.lock().await;
+        if let Err(error) =
+            verify_auth_event_claims(&event, "upload", &s.base_url, "/media", "PUT", None)
+        {
+            return (StatusCode::UNAUTHORIZED, error_json(&error.to_string()));
+        }
+        if !s.access.is_allowed(&event.pubkey, Action::Upload) {
+            return (
+                StatusCode::FORBIDDEN,
+                error_json("upload not allowed for this pubkey"),
+            );
+        }
+        if let Some(ref limiter) = s.rate_limiter {
+            if !limiter.check(&event.pubkey) {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    error_json("rate limit exceeded"),
+                );
+            }
+        }
+        let Some(processor) = s.media_processor.clone() else {
             return (
                 StatusCode::NOT_IMPLEMENTED,
                 error_json("media processing not enabled on this server"),
             );
-        }
+        };
+        (processor, s.body_limit)
     };
 
-    // Auth required for media uploads.
-    let pubkey = match extract_auth_event(&headers) {
-        Ok(event) => {
-            if let Err(e) = verify_auth_event(
-                &event,
-                "upload",
-                &s.base_url,
-                "/media",
-                "PUT",
-                Some(&upload_sha256),
-            ) {
-                return (StatusCode::UNAUTHORIZED, error_json(&e.to_string()));
-            }
-            if !s.access.is_allowed(&event.pubkey, Action::Upload) {
-                return (
-                    StatusCode::FORBIDDEN,
-                    error_json("upload not allowed for this pubkey"),
-                );
-            }
-            event.pubkey
-        }
-        Err(e) => {
-            return (StatusCode::UNAUTHORIZED, error_json(&e.to_string()));
-        }
-    };
-
-    // Detect MIME type from content (simple heuristic).
-    let mime = detect_mime(&data);
-    if !mime_allowed(&s.requirements, &mime) {
-        return (
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            error_json("content type is not allowed"),
-        );
-    }
-    drop(s);
-
-    // Process CPU-heavy, attacker-controlled media outside the shared state
-    // lock and within a hard execution deadline.
     static MEDIA_PROCESS_LIMIT: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
         std::sync::OnceLock::new();
     let permit = match MEDIA_PROCESS_LIMIT
@@ -1486,9 +1626,47 @@ async fn handle_media_upload(
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 error_json("media processing capacity exhausted"),
-            )
+            );
         }
     };
+    let body = match read_body_limited(body, body_limit).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let data = body.to_vec();
+    tracing::Span::current().record("blob.size", data.len() as u64);
+    if data.is_empty() {
+        return (StatusCode::BAD_REQUEST, error_json("empty body"));
+    }
+    let upload_sha256 = crate::protocol::sha256_hex(&data);
+    let base_url = state.lock().await.base_url.clone();
+    if let Err(error) = verify_auth_event_claims(
+        &event,
+        "upload",
+        &base_url,
+        "/media",
+        "PUT",
+        Some(&upload_sha256),
+    )
+    .and_then(|_| mark_auth_event_once(&event))
+    {
+        return (StatusCode::UNAUTHORIZED, error_json(&error.to_string()));
+    }
+    let pubkey = event.pubkey;
+
+    // Detect MIME type from content (simple heuristic).
+    let mime = detect_mime(&data);
+    let s = state.lock().await;
+    if !mime_allowed(&s.requirements, &mime) {
+        return (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            error_json("content type is not allowed"),
+        );
+    }
+    drop(s);
+
+    // Process CPU-heavy, attacker-controlled media outside the shared state
+    // lock and within a hard execution deadline.
     let process_data = data.clone();
     let process_mime = mime.clone();
     let task = tokio::task::spawn_blocking(move || {
@@ -1727,6 +1905,10 @@ mod tests {
     use super::*;
     use crate::protocol::BlobDescriptor;
     use crate::storage::MemoryBackend;
+    use std::convert::Infallible;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll};
 
     fn test_server() -> BlobServer {
         BlobServer::new(MemoryBackend::new(), "http://localhost:3000")
@@ -1741,6 +1923,27 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, app).await.ok() });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         url
+    }
+
+    struct PendingBody {
+        polled: Arc<AtomicBool>,
+    }
+
+    impl futures_core::Stream for PendingBody {
+        type Item = Result<Bytes, Infallible>;
+
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            self.polled.store(true, Ordering::SeqCst);
+            Poll::Pending
+        }
+    }
+
+    fn pending_body() -> (Body, Arc<AtomicBool>) {
+        let polled = Arc::new(AtomicBool::new(false));
+        let body = Body::from_stream(PendingBody {
+            polled: polled.clone(),
+        });
+        (body, polled)
     }
 
     fn request_auth(
@@ -1761,6 +1964,78 @@ mod tests {
             "",
         );
         crate::auth::auth_header_value(&event)
+    }
+
+    #[test]
+    fn replay_cache_saturation_does_not_reject_new_principals() {
+        let mut cache = ReplayCache::new(3, 2);
+        assert!(cache.check_and_insert("attacker", "a1", 1, 100));
+        assert!(cache.check_and_insert("attacker", "a2", 1, 100));
+        assert!(cache.check_and_insert("attacker", "a3", 1, 100));
+        assert!(cache.check_and_insert("other-attacker", "b1", 1, 100));
+
+        assert!(cache.check_and_insert("authorized", "good-1", 1, 100));
+        assert!(!cache.check_and_insert("authorized", "good-1", 1, 100));
+        assert!(cache.check_and_insert("authorized", "good-2", 1, 100));
+    }
+
+    #[tokio::test]
+    async fn denied_large_body_routes_respond_without_reading_body() {
+        let server = BlobServer::new_with_auth(MemoryBackend::new(), "http://localhost:3000");
+        let state = server.shared_state();
+
+        let (body, polled) = pending_body();
+        let response = handle_upload(State(state.clone()), HeaderMap::new(), body)
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(!polled.load(Ordering::SeqCst));
+
+        let (body, polled) = pending_body();
+        let response = handle_media_upload(State(state.clone()), HeaderMap::new(), body)
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(!polled.load(Ordering::SeqCst));
+
+        let (body, polled) = pending_body();
+        let response = handle_mirror(State(state), HeaderMap::new(), body)
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(!polled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn mirror_denial_happens_before_outbound_fetch() {
+        use std::collections::HashSet;
+
+        let server = BlobServer::builder(MemoryBackend::new(), "http://localhost:3000")
+            .access_control(crate::access::Whitelist::new(HashSet::new()))
+            .build();
+        let signer = crate::auth::Signer::generate();
+        let source_url = "http://127.0.0.1:1/blob";
+        let source_hash = crate::protocol::sha256_hex(source_url.as_bytes());
+        let auth = request_auth(
+            &signer,
+            "http://localhost:3000",
+            "/mirror",
+            "PUT",
+            "upload",
+            Some(&source_hash),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", auth.parse().unwrap());
+        let (body, polled) = pending_body();
+        let response = handle_mirror(State(server.shared_state()), headers, body)
+            .await
+            .into_response();
+
+        // A fetch attempt would reach SSRF validation and return 502. The
+        // 403 response, without polling the body that contains the URL,
+        // proves access control ran before parsing or fetching it.
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(!polled.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
