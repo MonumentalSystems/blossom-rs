@@ -1572,6 +1572,50 @@ async fn handle_mirror(
 // BUD-05: Media upload (server-side processing)
 // ---------------------------------------------------------------------------
 
+const MEDIA_PROCESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const MEDIA_PROCESS_CONCURRENCY: usize = 4;
+
+enum MediaProcessTaskError {
+    Processing(crate::media::MediaError),
+    Worker(tokio::task::JoinError),
+    TimedOut,
+}
+
+/// Run a processor while keeping every started invocation capacity-accounted.
+///
+/// `spawn_blocking` tasks that have started cannot be forcibly terminated.
+/// Aborting the handle prevents queued tasks from starting; a running task may
+/// finish after the request deadline. The permit is owned by the blocking
+/// closure so that such work remains within the hard concurrency cap until it
+/// actually exits. A processor that never returns therefore fails closed by
+/// consuming a slot rather than allowing unbounded detached work.
+async fn process_media_with_deadline(
+    processor: Arc<dyn MediaProcessor>,
+    data: Vec<u8>,
+    mime: String,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    timeout: std::time::Duration,
+) -> Result<crate::media::MediaResult, MediaProcessTaskError> {
+    let mut task = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        processor.process(&data, &mime)
+    });
+    let outcome = tokio::time::timeout(timeout, &mut task).await;
+
+    if outcome.is_err() {
+        // This cancels work that is still queued. Tokio documents that a
+        // blocking task already in progress continues until its closure exits.
+        task.abort();
+    }
+
+    match outcome {
+        Ok(Ok(Ok(result))) => Ok(result),
+        Ok(Ok(Err(error))) => Err(MediaProcessTaskError::Processing(error)),
+        Ok(Err(error)) => Err(MediaProcessTaskError::Worker(error)),
+        Err(_) => Err(MediaProcessTaskError::TimedOut),
+    }
+}
+
 #[instrument(name = "blossom.media_upload", skip_all, fields(blob.size, blob.sha256, auth.pubkey))]
 async fn handle_media_upload(
     State(state): State<SharedState>,
@@ -1614,10 +1658,12 @@ async fn handle_media_upload(
         (processor, s.body_limit)
     };
 
+    // The deadline bounds request latency, while the semaphore bounds actual
+    // processing concurrency until each blocking invocation exits.
     static MEDIA_PROCESS_LIMIT: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
         std::sync::OnceLock::new();
     let permit = match MEDIA_PROCESS_LIMIT
-        .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(4)))
+        .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(MEDIA_PROCESS_CONCURRENCY)))
         .clone()
         .try_acquire_owned()
     {
@@ -1669,25 +1715,33 @@ async fn handle_media_upload(
     // lock and within a hard execution deadline.
     let process_data = data.clone();
     let process_mime = mime.clone();
-    let task = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        processor.process(&process_data, &process_mime)
-    });
-    let result = match tokio::time::timeout(std::time::Duration::from_secs(30), task).await {
-        Ok(Ok(Ok(result))) => result,
-        Ok(Ok(Err(error))) => {
+    let result = match process_media_with_deadline(
+        processor,
+        process_data,
+        process_mime,
+        permit,
+        MEDIA_PROCESS_TIMEOUT,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(MediaProcessTaskError::Processing(error)) => {
             return (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 error_json(&format!("media processing failed: {error}")),
             );
         }
-        Ok(Err(error)) => {
+        Err(MediaProcessTaskError::Worker(error)) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 error_json(&format!("media worker failed: {error}")),
             );
         }
-        Err(_) => {
+        Err(MediaProcessTaskError::TimedOut) => {
+            tracing::warn!(
+                media.timeout_seconds = MEDIA_PROCESS_TIMEOUT.as_secs(),
+                "media processing timed out; running work remains capacity-accounted until exit"
+            );
             return (
                 StatusCode::REQUEST_TIMEOUT,
                 error_json("media processing timed out"),
@@ -2036,6 +2090,148 @@ mod tests {
         // proves access control ran before parsing or fetching it.
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert!(!polled.load(Ordering::SeqCst));
+    }
+
+    struct BlockingMediaState {
+        release: std::sync::atomic::AtomicBool,
+        started: std::sync::atomic::AtomicUsize,
+        active: std::sync::atomic::AtomicUsize,
+        max_active: std::sync::atomic::AtomicUsize,
+    }
+
+    struct BlockingMediaProcessor {
+        state: Arc<BlockingMediaState>,
+    }
+
+    impl MediaProcessor for BlockingMediaProcessor {
+        fn process(
+            &self,
+            data: &[u8],
+            mime_type: &str,
+        ) -> Result<crate::media::MediaResult, crate::media::MediaError> {
+            self.state
+                .started
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let active = self
+                .state
+                .active
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            self.state
+                .max_active
+                .fetch_max(active, std::sync::atomic::Ordering::SeqCst);
+            while !self.state.release.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::park_timeout(std::time::Duration::from_millis(5));
+            }
+            self.state
+                .active
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::media::MediaResult {
+                data: data.to_vec(),
+                mime_type: mime_type.to_string(),
+                width: None,
+                height: None,
+                blurhash: None,
+                thumbnail: None,
+                phash: None,
+            })
+        }
+
+        fn validate_exif(&self, _data: &[u8]) -> Result<(), crate::media::MediaError> {
+            Ok(())
+        }
+
+        fn perceptual_hash(&self, _data: &[u8]) -> Result<u64, crate::media::MediaError> {
+            Err(crate::media::MediaError::UnsupportedType("test".into()))
+        }
+
+        fn blurhash(&self, _data: &[u8]) -> Result<String, crate::media::MediaError> {
+            Err(crate::media::MediaError::UnsupportedType("test".into()))
+        }
+
+        fn thumbnail(
+            &self,
+            _data: &[u8],
+            _max_width: u32,
+            _max_height: u32,
+        ) -> Result<Vec<u8>, crate::media::MediaError> {
+            Err(crate::media::MediaError::UnsupportedType("test".into()))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn timed_out_media_workers_remain_within_hard_cap_across_retries() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(MEDIA_PROCESS_CONCURRENCY));
+        let state = Arc::new(BlockingMediaState {
+            release: std::sync::atomic::AtomicBool::new(false),
+            started: std::sync::atomic::AtomicUsize::new(0),
+            active: std::sync::atomic::AtomicUsize::new(0),
+            max_active: std::sync::atomic::AtomicUsize::new(0),
+        });
+
+        for round in 1..=2 {
+            state
+                .release
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            let mut requests = Vec::new();
+            for _ in 0..MEDIA_PROCESS_CONCURRENCY {
+                let permit = semaphore.clone().try_acquire_owned().unwrap();
+                let processor: Arc<dyn MediaProcessor> = Arc::new(BlockingMediaProcessor {
+                    state: state.clone(),
+                });
+                requests.push(tokio::spawn(process_media_with_deadline(
+                    processor,
+                    b"slow".to_vec(),
+                    "image/png".into(),
+                    permit,
+                    std::time::Duration::from_millis(100),
+                )));
+            }
+
+            for request in requests {
+                assert!(matches!(
+                    request.await.unwrap(),
+                    Err(MediaProcessTaskError::TimedOut)
+                ));
+            }
+
+            // All workers remain blocked after their request deadlines and
+            // continue to own the four permits. Repeated attacker requests are
+            // rejected before they can create more underlying work.
+            assert_eq!(
+                state.started.load(std::sync::atomic::Ordering::SeqCst),
+                round * MEDIA_PROCESS_CONCURRENCY
+            );
+            assert_eq!(
+                state.active.load(std::sync::atomic::Ordering::SeqCst),
+                MEDIA_PROCESS_CONCURRENCY
+            );
+            assert_eq!(semaphore.available_permits(), 0);
+            for _ in 0..(MEDIA_PROCESS_CONCURRENCY * 3) {
+                assert!(semaphore.clone().try_acquire_owned().is_err());
+            }
+            assert_eq!(
+                state.max_active.load(std::sync::atomic::Ordering::SeqCst),
+                MEDIA_PROCESS_CONCURRENCY
+            );
+
+            state
+                .release
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while semaphore.available_permits() != MEDIA_PROCESS_CONCURRENCY {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(state.active.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+
+        assert_eq!(
+            state.max_active.load(std::sync::atomic::Ordering::SeqCst),
+            MEDIA_PROCESS_CONCURRENCY
+        );
     }
 
     #[tokio::test]
