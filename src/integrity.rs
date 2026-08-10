@@ -601,13 +601,17 @@ fn merkle_proof(leaves: &[[u8; 32]], index: usize) -> Vec<([u8; 32], bool)> {
     let mut hashes = leaves.to_vec();
     let mut idx = index;
     while hashes.len() > 1 {
-        let sibling_idx = if idx % 2 == 0 { idx + 1 } else { idx - 1 };
+        let sibling_idx = if idx.is_multiple_of(2) {
+            idx + 1
+        } else {
+            idx - 1
+        };
         let sibling = if sibling_idx < hashes.len() {
             hashes[sibling_idx]
         } else {
             hashes[idx]
         };
-        let is_right = idx % 2 == 0;
+        let is_right = idx.is_multiple_of(2);
         proof.push((sibling, is_right));
         let mut next = Vec::with_capacity(hashes.len().div_ceil(2));
         for chunk in hashes.chunks(2) {
