@@ -1,6 +1,6 @@
 //! BIP-340 Schnorr signing trait and default implementation.
 
-use secp256k1::{Keypair, Message, Secp256k1, SecretKey, XOnlyPublicKey};
+use secp256k1::{Keypair, Secp256k1, SecretKey, XOnlyPublicKey};
 
 /// Trait for BIP-340 Schnorr signing used in Blossom auth events.
 ///
@@ -68,21 +68,28 @@ impl Signer {
             Ok(b) if b.len() == 32 => b,
             _ => return false,
         };
-        let xonly = match XOnlyPublicKey::from_slice(&pub_bytes) {
+        let pub_bytes: [u8; 32] = match pub_bytes.try_into() {
+            Ok(bytes) => bytes,
+            Err(_) => return false,
+        };
+        let xonly = match XOnlyPublicKey::from_byte_array(pub_bytes) {
             Ok(k) => k,
             Err(_) => return false,
         };
-        let msg = Message::from_digest(*message);
         let sig_bytes = match hex::decode(sig_hex) {
             Ok(b) if b.len() == 64 => b,
             _ => return false,
         };
-        let sig = match secp256k1::schnorr::Signature::from_slice(&sig_bytes) {
+        let sig_bytes: [u8; 64] = match sig_bytes.try_into() {
+            Ok(bytes) => bytes,
+            Err(_) => return false,
+        };
+        let sig = match secp256k1::schnorr::Signature::from_byte_array(sig_bytes) {
             Ok(s) => s,
             Err(_) => return false,
         };
 
-        secp.verify_schnorr(&sig, &msg, &xonly).is_ok()
+        secp.verify_schnorr(&sig, message, &xonly).is_ok()
     }
 }
 
@@ -94,9 +101,8 @@ impl BlossomSigner for Signer {
     fn sign_schnorr(&self, message: &[u8; 32]) -> String {
         let secp = Secp256k1::new();
         let keypair = Keypair::from_secret_key(&secp, &self.secret_key);
-        let msg = Message::from_digest(*message);
-        let sig = secp.sign_schnorr_no_aux_rand(&msg, &keypair);
-        hex::encode(sig.serialize())
+        let sig = secp.sign_schnorr_no_aux_rand(message, &keypair);
+        hex::encode(sig.to_byte_array())
     }
 }
 
