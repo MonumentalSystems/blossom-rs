@@ -741,6 +741,22 @@ fn detect_mime(data: &[u8]) -> String {
     .to_string()
 }
 
+/// Resolve the Content-Type to serve for a stored blob.
+///
+/// Prefers the type recorded at upload time; falls back to magic byte
+/// detection for blobs present in storage but missing a metadata row.
+fn stored_content_type(db: &dyn BlobDatabase, sha256: &str, data: Option<&[u8]>) -> String {
+    let recorded = db
+        .get_upload(sha256)
+        .ok()
+        .map(|r| r.mime_type)
+        .filter(|m| !m.is_empty() && m != "application/octet-stream");
+    match recorded {
+        Some(mime) => mime,
+        None => data.map_or_else(|| "application/octet-stream".to_string(), detect_mime),
+    }
+}
+
 pub(crate) fn mime_allowed(requirements: &UploadRequirements, mime: &str) -> bool {
     let normalized = mime
         .split(';')
@@ -1198,9 +1214,10 @@ async fn handle_get_blob(
             };
             let size = data.len() as u64;
             s.stats.record_access(&sha256, size);
+            let content_type = stored_content_type(&*s.database, &sha256, Some(&data));
             (
                 StatusCode::OK,
-                [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+                [(axum::http::header::CONTENT_TYPE, content_type)],
                 data,
             )
                 .into_response()
@@ -1238,7 +1255,7 @@ async fn handle_head_blob(
                     (axum::http::header::CONTENT_LENGTH, size.to_string()),
                     (
                         axum::http::header::CONTENT_TYPE,
-                        "application/octet-stream".to_string(),
+                        stored_content_type(&*s.database, &sha256, None),
                     ),
                 ],
             )
@@ -1989,12 +2006,15 @@ async fn s3_get(
     let hash_key = key.trim_end_matches(".blob").to_string();
     let s = state.lock().await;
     match s.backend.get(&hash_key) {
-        Some(data) => (
-            StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
-            data,
-        )
-            .into_response(),
+        Some(data) => {
+            let content_type = stored_content_type(&*s.database, &hash_key, Some(&data));
+            (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, content_type)],
+                data,
+            )
+                .into_response()
+        }
         None => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -2411,6 +2431,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_serves_stored_content_type() {
+        let url = spawn_server(test_server()).await;
+        let http = reqwest::Client::new();
+
+        // Minimal JPEG magic bytes; the upload path records image/jpeg.
+        let data = [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F'];
+        let resp = http
+            .put(format!("{}/upload", url))
+            .body(data.to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let desc: BlobDescriptor = resp.json().await.unwrap();
+
+        // Bare hash, no extension — must still report the stored type.
+        let resp = http
+            .get(format!("{}/{}", url, desc.sha256))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers().get(reqwest::header::CONTENT_TYPE).unwrap(),
+            "image/jpeg"
+        );
+
+        let resp = http
+            .head(format!("{}/{}", url, desc.sha256))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers().get(reqwest::header::CONTENT_TYPE).unwrap(),
+            "image/jpeg"
+        );
+    }
+
+    #[tokio::test]
     async fn test_head_nonexistent() {
         let url = spawn_server(test_server()).await;
         let http = reqwest::Client::new();
@@ -2698,14 +2758,25 @@ mod tests {
             Some(&source_hash),
         );
 
-        let resp = http
-            .put(format!("{}/mirror", url))
-            .header("Authorization", &auth_header)
-            .json(&serde_json::json!({"url": source_url}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 502);
+        // BODY_BUFFER_BUDGET is process-wide, and a mirror reserves permits for
+        // the full configured mirror size, so a concurrent test holding the
+        // budget yields a transient 503 before the fetch is ever attempted.
+        let mut status = StatusCode::SERVICE_UNAVAILABLE;
+        for _ in 0..20 {
+            status = http
+                .put(format!("{}/mirror", url))
+                .header("Authorization", &auth_header)
+                .json(&serde_json::json!({"url": source_url}))
+                .send()
+                .await
+                .unwrap()
+                .status();
+            if status != StatusCode::SERVICE_UNAVAILABLE {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(status, 502);
     }
 
     #[tokio::test]

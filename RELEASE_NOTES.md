@@ -1,6 +1,24 @@
 # Release Notes
 
-## v0.6.0 (unreleased)
+## v0.6.1
+
+### Fixed
+
+- Blob downloads now serve the stored MIME type instead of always reporting
+  `application/octet-stream`. `GET` and `HEAD` on a bare hash, and the
+  S3-compatible object route, return the type recorded at upload time, falling
+  back to magic-byte detection for blobs with no metadata row. (#34)
+
+### Internal
+
+- Pinned GitHub Actions bumped: `actions/cache`, `actions/upload-artifact`,
+  `taiki-e/install-action`, and `actions/attest-build-provenance`.
+- The publish workflow identifies itself when polling crates.io, which now
+  rejects the default `curl` User-Agent.
+- `test_mirror_bad_remote_url` no longer fails when a concurrent test holds the
+  process-wide body buffer budget.
+
+## v0.6.0
 
 Version 0.6.0 is the first crates.io release planned after 0.5.6. It includes
 the hardening work that was merged after the 0.5.8 repository tag.
