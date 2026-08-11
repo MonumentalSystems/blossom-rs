@@ -90,7 +90,7 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           found=false
           for _ in $(seq 1 30); do
-            if curl --fail --silent --show-error "https://crates.io/api/v1/crates/blossom-rs/$version" >/dev/null; then
+            if curl --fail --silent --show-error --user-agent "blossom-rs-release-ci (github.com/MonumentalSystems/blossom-rs)" "https://crates.io/api/v1/crates/blossom-rs/$version" >/dev/null; then
               found=true
               break
             fi
@@ -121,7 +121,7 @@ jobs:
           for crate in blossom-rs blossom-nip34; do
             found=false
             for _ in $(seq 1 30); do
-              if curl --fail --silent --show-error "https://crates.io/api/v1/crates/$crate/$version" >/dev/null; then
+              if curl --fail --silent --show-error --user-agent "blossom-rs-release-ci (github.com/MonumentalSystems/blossom-rs)" "https://crates.io/api/v1/crates/$crate/$version" >/dev/null; then
                 found=true
                 break
               fi
@@ -153,7 +153,7 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           found=false
           for _ in $(seq 1 30); do
-            if curl --fail --silent --show-error "https://crates.io/api/v1/crates/blossom-rs/$version" >/dev/null; then
+            if curl --fail --silent --show-error --user-agent "blossom-rs-release-ci (github.com/MonumentalSystems/blossom-rs)" "https://crates.io/api/v1/crates/blossom-rs/$version" >/dev/null; then
               found=true
               break
             fi
