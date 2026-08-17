@@ -69,7 +69,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
       - name: Authenticate to crates.io
         id: auth
-        uses: rust-lang/crates-io-auth-action@275b31c2bd0ae2dc5fc5b03747ab8c88d6e3b1c6 # v1
+        uses: rust-lang/crates-io-auth-action@f14f407dad32919804d8e0550a5e471a82249cee # v1
       - run: cargo publish -p blossom-rs --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
@@ -99,7 +99,7 @@ jobs:
           test "$found" = true || { echo "blossom-rs $version did not reach crates.io" >&2; exit 1; }
       - name: Authenticate to crates.io
         id: auth
-        uses: rust-lang/crates-io-auth-action@275b31c2bd0ae2dc5fc5b03747ab8c88d6e3b1c6 # v1
+        uses: rust-lang/crates-io-auth-action@f14f407dad32919804d8e0550a5e471a82249cee # v1
       - run: cargo publish -p blossom-nip34 --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
@@ -132,7 +132,7 @@ jobs:
       - run: cargo package -p blossom-server --locked --no-verify
       - name: Authenticate to crates.io
         id: auth
-        uses: rust-lang/crates-io-auth-action@275b31c2bd0ae2dc5fc5b03747ab8c88d6e3b1c6 # v1
+        uses: rust-lang/crates-io-auth-action@f14f407dad32919804d8e0550a5e471a82249cee # v1
       - run: cargo publish -p blossom-server --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
@@ -163,7 +163,7 @@ jobs:
       - run: cargo package -p blossom-cli --locked --no-verify
       - name: Authenticate to crates.io
         id: auth
-        uses: rust-lang/crates-io-auth-action@275b31c2bd0ae2dc5fc5b03747ab8c88d6e3b1c6 # v1
+        uses: rust-lang/crates-io-auth-action@f14f407dad32919804d8e0550a5e471a82249cee # v1
       - run: cargo publish -p blossom-cli --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
