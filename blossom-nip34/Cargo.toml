@@ -12,7 +12,7 @@ include = ["/Cargo.toml", "/LICENSE", "/README.md", "/src/**", "/tests/**"]
 
 [dependencies]
 # Nostr relay infrastructure (MIT)
-nostr = { version = "0.44.8", default-features = false, features = ["std"] }
+nostr = { version = "0.45.3", default-features = false, features = ["std"] }
 nostr-database = "0.44"
 nostr-lmdb = "0.44"
 nostr-relay-builder = "0.44"
