@@ -120,7 +120,7 @@ jobs:
       run: xcode-select -p
 
     - name: Install cross
-      uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad # v2
+      uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2
       with:
         tool: cross
 
