@@ -59,7 +59,7 @@ otel = ["dep:tracing-opentelemetry", "dep:opentelemetry", "dep:opentelemetry_sdk
 [dependencies]
 # Crypto
 secp256k1 = { version = "0.31.1", features = ["rand", "global-context"] }
-sha2 = "0.11"
+sha2 = "0.11.0-rc.2"
 hex = "0.4"
 bech32 = "0.12"
 
@@ -109,13 +109,13 @@ opentelemetry_sdk = { version = "0.32.1", optional = true }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "grpc-tonic"], optional = true }
 
 # P2P transport (optional)
-iroh = { version = "1.0.3", optional = true }
+iroh = { version = "^1", optional = true }
 anyhow = { version = "1", optional = true }
 
 # PKARR discovery (optional)
 # The current publisher and resolver use PKARR's relay client, so direct
 # Mainline DHT support is not enabled in the library dependency surface.
-pkarr = { version = "8", default-features = false, features = ["relays", "signed_packet"], optional = true }
+pkarr = { version = "^8.1", default-features = false, features = ["relays", "signed_packet"], optional = true }
 
 # Statistics
 dashmap = "6"

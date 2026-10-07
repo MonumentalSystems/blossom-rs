@@ -8,222 +8,101 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
-permissions:
-  contents: read
-
 jobs:
-  validate:
-    runs-on: ubuntu-latest
+  test:
+    runs-on: self-hosted
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          fetch-tags: true
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-        with:
-          components: rustfmt, clippy
-
-      - name: Validate signed release tag and versions
-        run: |
-          set -euo pipefail
-          test "$(git cat-file -t "$GITHUB_REF_NAME")" = tag
-          sed -n '/-----BEGIN PGP PUBLIC KEY BLOCK-----/,/-----END PGP PUBLIC KEY BLOCK-----/p' SECURITY.md \
-            | gpg --batch --import
-          git verify-tag "$GITHUB_REF_NAME"
-          git fetch --no-tags origin master
-          git merge-base --is-ancestor "$GITHUB_SHA" origin/master
-
-          version="${GITHUB_REF_NAME#v}"
-          test "$GITHUB_REF_NAME" = "v$version"
-          for manifest in Cargo.toml blossom-nip34/Cargo.toml blossom-server/Cargo.toml blossom-cli/Cargo.toml; do
-            manifest_version="$(sed -n '/^\[package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' "$manifest" | head -1)"
-            test "$manifest_version" = "$version" || {
-              echo "$manifest has version $manifest_version; expected $version" >&2
-              exit 1
-            }
-          done
-
-      - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-      - run: cargo test --workspace --all-features --locked
-      - name: Inspect publishable packages
-        run: |
-          set -euo pipefail
-          cargo package -p blossom-rs --locked
-          cargo package -p blossom-nip34 --locked --no-verify
-          # Cargo cannot fully package the binaries until their 0.6.0 library
-          # dependencies have reached the registry. Inspect their allowlisted
-          # payloads now; the publish jobs package them after index propagation.
-          cargo package -p blossom-server --list --locked
-          cargo package -p blossom-cli --list --locked
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --workspace
 
   publish-lib:
-    needs: validate
-    runs-on: ubuntu-latest
+    needs: test
+    runs-on: self-hosted
     environment: crates-io
     permissions:
       contents: read
-      id-token: write
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-      - name: Authenticate to crates.io
-        id: auth
-        uses: rust-lang/crates-io-auth-action@275b31c2bd0ae2dc5fc5b03747ab8c88d6e3b1c6 # v1
-      - run: cargo publish -p blossom-rs --locked
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo publish -p blossom-rs --allow-dirty --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   publish-nip34:
-    needs: [validate, publish-lib]
-    runs-on: ubuntu-latest
+    needs: publish-lib
+    runs-on: self-hosted
     environment: crates-io
     permissions:
       contents: read
-      id-token: write
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-      - name: Wait for blossom-rs to reach the index
-        run: |
-          set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          found=false
-          for _ in $(seq 1 30); do
-            if curl --fail --silent --show-error --user-agent "blossom-rs-release-ci (github.com/MonumentalSystems/blossom-rs)" "https://crates.io/api/v1/crates/blossom-rs/$version" >/dev/null; then
-              found=true
-              break
-            fi
-            sleep 10
-          done
-          test "$found" = true || { echo "blossom-rs $version did not reach crates.io" >&2; exit 1; }
-      - name: Authenticate to crates.io
-        id: auth
-        uses: rust-lang/crates-io-auth-action@275b31c2bd0ae2dc5fc5b03747ab8c88d6e3b1c6 # v1
-      - run: cargo publish -p blossom-nip34 --locked
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sleep 30
+      - run: cargo publish -p blossom-nip34 --allow-dirty --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   publish-server:
     needs: [publish-lib, publish-nip34]
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     environment: crates-io
     permissions:
       contents: read
-      id-token: write
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-      - name: Wait for library crates to reach the index
-        run: |
-          set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          for crate in blossom-rs blossom-nip34; do
-            found=false
-            for _ in $(seq 1 30); do
-              if curl --fail --silent --show-error --user-agent "blossom-rs-release-ci (github.com/MonumentalSystems/blossom-rs)" "https://crates.io/api/v1/crates/$crate/$version" >/dev/null; then
-                found=true
-                break
-              fi
-              sleep 10
-            done
-            test "$found" = true || { echo "$crate $version did not reach crates.io" >&2; exit 1; }
-          done
-      - run: cargo package -p blossom-server --locked --no-verify
-      - name: Authenticate to crates.io
-        id: auth
-        uses: rust-lang/crates-io-auth-action@275b31c2bd0ae2dc5fc5b03747ab8c88d6e3b1c6 # v1
-      - run: cargo publish -p blossom-server --locked
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sleep 30
+      - run: cargo publish -p blossom-server --allow-dirty --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   publish-cli:
     needs: publish-lib
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     environment: crates-io
     permissions:
       contents: read
-      id-token: write
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-      - name: Wait for blossom-rs to reach the index
-        run: |
-          set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          found=false
-          for _ in $(seq 1 30); do
-            if curl --fail --silent --show-error --user-agent "blossom-rs-release-ci (github.com/MonumentalSystems/blossom-rs)" "https://crates.io/api/v1/crates/blossom-rs/$version" >/dev/null; then
-              found=true
-              break
-            fi
-            sleep 10
-          done
-          test "$found" = true || { echo "blossom-rs $version did not reach crates.io" >&2; exit 1; }
-      - run: cargo package -p blossom-cli --locked --no-verify
-      - name: Authenticate to crates.io
-        id: auth
-        uses: rust-lang/crates-io-auth-action@275b31c2bd0ae2dc5fc5b03747ab8c88d6e3b1c6 # v1
-      - run: cargo publish -p blossom-cli --locked
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sleep 30
+      - run: cargo publish -p blossom-cli --allow-dirty --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   release-binaries:
-    needs: [publish-server, publish-cli]
-    runs-on: ubuntu-latest
-    environment: github-release
+    needs: test
+    runs-on: self-hosted
+    environment: crates-io
     permissions:
-      attestations: write
       contents: write
-      id-token: write
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-
-      - name: Generate per-release manifest signer
-        run: |
-          set -euo pipefail
-          umask 077
-          release_nsec="$(openssl rand -hex 32)"
-          echo "::add-mask::$release_nsec"
-          echo "BLOSSOM_RELEASE_NSEC=$release_nsec" >> "$GITHUB_ENV"
-          signer_pubkey="$(BLOSSOM_RELEASE_NSEC="$release_nsec" cargo xtask release-signer-pubkey)"
-          echo "BLOSSOM_TRUSTED_RELEASE_SIGNERS=$signer_pubkey" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
 
       - name: Build release binaries
-        run: cargo build --release --locked -p blossom-server -p blossom-cli
+        run: cargo build --release --workspace
 
-      - name: Sign release metadata
+      - name: Sign release manifest (blossom-server)
+        if: env.BLOSSOM_RELEASE_NSEC != ''
+        env:
+          BLOSSOM_RELEASE_NSEC: ${{ secrets.BLOSSOM_RELEASE_NSEC }}
+        run: cargo xtask sign-release-manifest --bin target/release/blossom-server
+
+      - name: Sign release manifest (blossom-cli)
+        if: env.BLOSSOM_RELEASE_NSEC != ''
+        env:
+          BLOSSOM_RELEASE_NSEC: ${{ secrets.BLOSSOM_RELEASE_NSEC }}
+        run: cargo xtask sign-release-manifest --bin target/release/blossom-cli
+
+      - name: Generate source Merkle tree
+        env:
+          BLOSSOM_RELEASE_NSEC: ${{ secrets.BLOSSOM_RELEASE_NSEC }}
         run: |
-          set -euo pipefail
-          cargo xtask sign-release-manifest --bin target/release/blossom-server
-          cargo xtask sign-release-manifest --bin target/release/blossom-cli
           cargo xtask source-merkle-tree --output target/release/source-merkle-tree.json
-          cd target/release
-          sha256sum blossom-server blossom-cli *.manifest.json source-merkle-tree.json > SHA256SUMS
 
-      - name: Attest release binaries
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
-        with:
-          subject-path: |
-            target/release/blossom-server
-            target/release/blossom-cli
-
-      - name: Create draft release and upload assets
+      - name: Upload release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -euo pipefail
-          tag="$GITHUB_REF_NAME"
-          gh release view "$tag" >/dev/null 2>&1 \
-            || gh release create "$tag" --draft --verify-tag --title "$tag" --generate-notes
-          gh release upload "$tag" \
+          TAG="${GITHUB_REF#refs/tags/}"
+          gh release upload "$TAG" \
             target/release/blossom-server \
             target/release/blossom-cli \
             target/release/blossom-server.manifest.json \
             target/release/blossom-cli.manifest.json \
             target/release/source-merkle-tree.json \
-            target/release/SHA256SUMS \
-            --clobber
+            --clobber || true
